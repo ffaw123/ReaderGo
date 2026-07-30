@@ -2,13 +2,26 @@
 
 基于 LLM 的异步视频理解服务基础设施。当前版本提供用户认证、视频任务创建、Kafka Worker 骨架与 PostgreSQL/pgvector 数据模型。
 
+## 当前视频理解链路
+
+第一版只使用带时间戳的语音转写与关键帧画面描述作为证据：
+
+```text
+视频 URL → 下载与存储 → 音频提取与语音转写
+        → 镜头切分与代表帧提取 → 视觉理解
+        → 时间轴对齐 → 摘要与向量索引 → 视频问答
+```
+
+视频片段的检索文本由 `transcript + visual_caption` 构成。画面文字识别不在当前处理链路中。
+
 ## 文件地形图
 
 ```text
 ReaderGo/
 │
 ├── README.md                 ← 项目说明、启动方式与当前文件地图
-├── 设计方案_v1.md             ← 视频理解 Agent 的产品与技术设计依据
+├── docs/
+│   └── 设计方案_v1.md         ← 视频理解 Agent 的产品与技术设计依据
 ├── go.mod / go.sum           ← Go 模块定义与锁定的依赖版本
 ├── .env.example              ← 本地运行所需环境变量示例（不要提交真实密钥）
 ├── docker-compose.yml        ← 本地 PostgreSQL、Redis、Kafka、MinIO 编排

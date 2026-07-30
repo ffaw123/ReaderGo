@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"log"
 	"readergo/internal/api"
 	"readergo/internal/auth"
 	"readergo/internal/config"
 	"readergo/internal/db"
 	"readergo/internal/queue"
+	"readergo/internal/storage"
+	"time"
 )
 
 func main() {
@@ -26,6 +29,13 @@ func main() {
 		log.Fatal(e)
 	}
 	defer q.Close()
+	uploads, e := storage.NewMultipartStore(c.MinIOEndpoint, c.MinIOAccessKey, c.MinIOSecretKey, c.MinIOBucket, c.MinIOSecure, time.Duration(c.UploadURLTTLMinutes)*time.Minute)
+	if e != nil {
+		log.Fatal(e)
+	}
+	if e = uploads.EnsureBucket(context.Background()); e != nil {
+		log.Fatal(e)
+	}
 	// HTTP 服务仅处理同步请求；耗时视频处理通过 Kafka 交给 Worker。
-	log.Fatal(api.New(d, auth.New(c.JWTSecret, c.JWTTTLHours), q).Router().Run(c.HTTPAddr))
+	log.Fatal(api.New(d, auth.New(c.JWTSecret, c.JWTTTLHours), q, uploads, int64(c.UploadPartSizeMiB)*1024*1024).Router().Run(c.HTTPAddr))
 }

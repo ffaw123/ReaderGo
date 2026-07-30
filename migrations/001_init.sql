@@ -49,7 +49,7 @@ CREATE TABLE video_summaries (
   content text NOT NULL, 
   created_at timestamptz NOT NULL DEFAULT now()
 );
--- video_segments 是带时间戳的 RAG 最小证据单元。
+-- video_segments 是带时间戳的 RAG 最小证据单元，融合语音转写与画面描述。
 CREATE TABLE video_segments (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 
   tenant_id uuid NOT NULL REFERENCES users(id), 
@@ -57,7 +57,6 @@ CREATE TABLE video_segments (
   start_ms bigint NOT NULL, 
   end_ms bigint NOT NULL, 
   transcript text NOT NULL DEFAULT '', 
-  ocr_text text NOT NULL DEFAULT '', 
   visual_caption text NOT NULL DEFAULT '', 
   retrieval_text text NOT NULL DEFAULT '', 
   created_at timestamptz NOT NULL DEFAULT now()

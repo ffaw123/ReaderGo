@@ -14,16 +14,37 @@ import (
 type Config struct {
 	HTTPAddr, DatabaseURL, KafkaBrokers, JWTSecret string
 	JWTTTLHours                                    int
+	MinIOEndpoint, MinIOAccessKey, MinIOSecretKey  string
+	MinIOBucket                                    string
+	MinIOSecure                                    bool
+	// UploadPartSizeMiB 限制为 16-64 MiB，以平衡重试成本和请求数量。
+	UploadPartSizeMiB, UploadURLTTLMinutes int
 }
 
 // Load 优先加载本地 .env，再校验生产环境必填配置。
 func Load() (Config, error) {
 	_ = godotenv.Load()
-	c := Config{HTTPAddr: value("HTTP_ADDR", ":8080"), DatabaseURL: os.Getenv("DATABASE_URL"), KafkaBrokers: value("KAFKA_BROKERS", "localhost:9092"), JWTSecret: os.Getenv("JWT_SECRET"), JWTTTLHours: intValue("JWT_TTL_HOURS", 24)}
-	if c.DatabaseURL == "" || len(c.JWTSecret) < 32 {
-		return Config{}, fmt.Errorf("DATABASE_URL and a JWT_SECRET of at least 32 characters are required")
+	c := Config{HTTPAddr: value("HTTP_ADDR", ":8080"), DatabaseURL: os.Getenv("DATABASE_URL"), KafkaBrokers: value("KAFKA_BROKERS", "localhost:9092"), JWTSecret: os.Getenv("JWT_SECRET"), JWTTTLHours: intValue("JWT_TTL_HOURS", 24), MinIOEndpoint: os.Getenv("MINIO_ENDPOINT"), MinIOAccessKey: os.Getenv("MINIO_ACCESS_KEY"), MinIOSecretKey: os.Getenv("MINIO_SECRET_KEY"), MinIOBucket: value("MINIO_BUCKET", "videos"), MinIOSecure: boolValue("MINIO_SECURE", false), UploadPartSizeMiB: intValue("UPLOAD_PART_SIZE_MIB", 32), UploadURLTTLMinutes: intValue("UPLOAD_URL_TTL_MINUTES", 15)}
+	if c.DatabaseURL == "" || len(c.JWTSecret) < 32 || c.MinIOEndpoint == "" || c.MinIOAccessKey == "" || c.MinIOSecretKey == "" {
+		return Config{}, fmt.Errorf("DATABASE_URL, MinIO credentials, and a JWT_SECRET of at least 32 characters are required")
+	}
+	if c.UploadPartSizeMiB < 16 || c.UploadPartSizeMiB > 64 {
+		return Config{}, fmt.Errorf("UPLOAD_PART_SIZE_MIB must be between 16 and 64")
+	}
+	// 预签名 URL 的过期时间远短于上传会话，客户端可在失效后重新申请同一分片的 URL。
+	if c.UploadURLTTLMinutes < 1 || c.UploadURLTTLMinutes > 60 {
+		return Config{}, fmt.Errorf("UPLOAD_URL_TTL_MINUTES must be between 1 and 60")
 	}
 	return c, nil
+}
+
+func boolValue(k string, fallback bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return fallback
+	}
+	b, e := strconv.ParseBool(v)
+	return e == nil && b
 }
 
 // Brokers 将逗号分隔的环境变量转换为 Sarama 所需的 Broker 地址列表。

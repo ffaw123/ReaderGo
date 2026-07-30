@@ -12,7 +12,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// Processor 隔离下载、FFmpeg、ASR/OCR/视觉、Embedding 与 LLM 等供应商实现。
+// Processor 隔离下载、FFmpeg、语音转写、视觉理解、Embedding 与 LLM 等供应商实现。
 // 实现必须幂等，因为 Kafka 可能重复投递同一个任务。
 type Processor interface {
 	Process(context.Context, queue.VideoJobMessage) error
