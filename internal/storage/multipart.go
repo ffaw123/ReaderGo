@@ -20,6 +20,13 @@ type MultipartStore struct {
 	urlTTL time.Duration
 }
 
+// CompletedPart 是浏览器直传成功后返回的不可伪造分片 ETag。
+// 只有服务端使用保存的 upload ID 调用 Complete，浏览器无法自行拼接对象。
+type CompletedPart struct {
+	PartNumber int
+	ETag       string
+}
+
 // NewMultipartStore 只创建客户端；EnsureBucket 在启动阶段执行存储桶可用性检查。
 func NewMultipartStore(endpoint, accessKey, secretKey, bucket string, secure bool, urlTTL time.Duration) (*MultipartStore, error) {
 	// Access Key 和 Secret Key 仅保留在 API 服务端；浏览器只能获得预签名 URL。
@@ -47,6 +54,16 @@ func (s *MultipartStore) Create(ctx context.Context, objectKey, contentType stri
 // Abort 在 API 无法创建可用上传会话时清理未完成分片。
 func (s *MultipartStore) Abort(ctx context.Context, objectKey, uploadID string) error {
 	return s.client.AbortMultipartUpload(ctx, s.bucket, objectKey, uploadID)
+}
+
+// Complete 校验通过后的全部分片写入一个最终对象，并关闭 multipart upload。
+func (s *MultipartStore) Complete(ctx context.Context, objectKey, uploadID string, parts []CompletedPart) error {
+	completed := make([]minio.CompletePart, len(parts))
+	for i, part := range parts {
+		completed[i] = minio.CompletePart{PartNumber: part.PartNumber, ETag: part.ETag}
+	}
+	_, err := s.client.CompleteMultipartUpload(ctx, s.bucket, objectKey, uploadID, completed, minio.PutObjectOptions{})
+	return err
 }
 
 // PresignedPartURL 仅允许对指定对象、upload ID 和 part number 发起一次 PUT。

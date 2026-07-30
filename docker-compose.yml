@@ -41,6 +41,16 @@ services:
       MINIO_ROOT_PASSWORD: readergo-secret
     ports: ["9000:9000", "9001:9001"]
     volumes: ["minio_data:/data"]
+  # 为浏览器直传分片配置 CORS，并暴露完成 multipart upload 必需的 ETag。
+  minio-init:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      until mc alias set readergo http://minio:9000 readergo readergo-secret; do sleep 1; done;
+      mc mb --ignore-existing readergo/videos;
+      mc cors set readergo/videos /config/cors.json
+    volumes: ["./docker/minio-cors.json:/config/cors.json:ro"]
 volumes:
   postgres_data:
   minio_data:

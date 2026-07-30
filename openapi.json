@@ -76,7 +76,7 @@
           "id":            { "type": "string", "format": "uuid" },
           "source_url":    { "type": "string", "format": "uri" },
           "title":         { "type": "string" },
-          "status":        { "type": "string", "enum": ["created","downloading","processing","summary_ready","indexing","ready","failed"] },
+          "status":        { "type": "string", "enum": ["uploading","uploaded","created","downloading","processing","summary_ready","indexing","ready","failed"] },
           "duration_ms":   { "type": "integer", "format": "int64" },
           "object_key":    { "type": "string" },
           "error_message": { "type": "string" },
@@ -109,6 +109,25 @@
         "properties": {
           "video":  { "$ref": "#/components/schemas/Video" },
           "job_id": { "type": "string", "format": "uuid", "description": "后台处理任务 ID，可用于追踪进度" }
+        }
+      },
+      "CompletedUploadPart": {
+        "type": "object",
+        "required": ["part_number", "etag"],
+        "properties": {
+          "part_number": { "type": "integer", "minimum": 1 },
+          "etag": { "type": "string", "description": "对象存储 PUT 响应头返回的 ETag" }
+        }
+      },
+      "CompleteUploadRequest": {
+        "type": "object",
+        "required": ["parts"],
+        "properties": {
+          "parts": {
+            "type": "array",
+            "description": "必须包含全部且不重复的分片。",
+            "items": { "$ref": "#/components/schemas/CompletedUploadPart" }
+          }
         }
       },
       "VideoStatusResponse": {
@@ -273,6 +292,62 @@
           },
           "401": {
             "description": "邮箱或密码错误",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/uploads/{id}/complete": {
+      "post": {
+        "tags": ["Videos"],
+        "summary": "完成本地分片上传并创建处理任务",
+        "description": "客户端上传全部分片后，提交每个分片的 ETag。服务端完成 MinIO Multipart Upload，并将视频处理任务投递至 Kafka。",
+        "operationId": "completeUpload",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "上传会话 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CompleteUploadRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "对象上传已完成，处理任务已入队",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateVideoResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "分片数量、编号或 ETag 无效",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "上传会话不存在或不属于当前用户",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "上传会话已完成、取消或过期",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "502": {
+            "description": "对象存储无法完成 multipart upload",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": {
+            "description": "对象已完成但处理任务暂未成功入队",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
         }

@@ -50,6 +50,17 @@ type uploadPartsRequest struct {
 	PartNumbers []int `json:"part_numbers" binding:"required,min=1,max=16"`
 }
 
+// completedUploadPart 是浏览器上传成功后从对象存储响应头读取的 ETag。
+type completedUploadPart struct {
+	PartNumber int    `json:"part_number" binding:"required"`
+	ETag       string `json:"etag" binding:"required,max=256"`
+}
+
+// completeUploadRequest 必须包含全部且仅包含该会话的分片。
+type completeUploadRequest struct {
+	Parts []completedUploadPart `json:"parts" binding:"required,min=1,max=10000"`
+}
+
 // uploadPartURL 描述一个仅可上传指定分片、且有短期有效期的直传地址。
 type uploadPartURL struct {
 	PartNumber int       `json:"part_number"`
@@ -152,6 +163,95 @@ func (s *Server) uploadPartURLs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"upload_id": session.ID, "parts": parts})
 }
 
+// completeUpload 将 MinIO 中的全部已上传分片提交为最终对象，并创建视频处理任务。
+func (s *Server) completeUpload(c *gin.Context) {
+	var in completeUploadRequest
+	if c.ShouldBindJSON(&in) != nil {
+		bad(c, "parts with part_number and etag are required")
+		return
+	}
+
+	var session model.UploadSession
+	if e := s.db.Where("id = ? AND tenant_id = ?", c.Param("id"), auth.UserID(c)).First(&session).Error; e != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "upload session not found"})
+		return
+	}
+	if session.Status != "uploading" || time.Now().After(session.ExpiresAt) {
+		c.JSON(http.StatusConflict, gin.H{"error": "upload session is not active"})
+		return
+	}
+	if len(in.Parts) != session.PartCount {
+		bad(c, "all upload parts must be completed exactly once")
+		return
+	}
+
+	// S3 CompleteMultipartUpload 要求分片按编号有序，并且不允许缺片或重复。
+	parts := make([]storage.CompletedPart, session.PartCount)
+	seen := make(map[int]struct{}, session.PartCount)
+	for _, part := range in.Parts {
+		if part.PartNumber < 1 || part.PartNumber > session.PartCount {
+			bad(c, "part number is outside the upload range")
+			return
+		}
+		if _, duplicate := seen[part.PartNumber]; duplicate {
+			bad(c, "parts must not contain duplicates")
+			return
+		}
+		etag := strings.Trim(strings.TrimSpace(part.ETag), "\"")
+		if etag == "" {
+			bad(c, "part etag must not be empty")
+			return
+		}
+		seen[part.PartNumber] = struct{}{}
+		parts[part.PartNumber-1] = storage.CompletedPart{PartNumber: part.PartNumber, ETag: etag}
+	}
+
+	if e := s.uploads.Complete(c.Request.Context(), session.ObjectKey, session.UploadID, parts); e != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "could not complete object upload"})
+		return
+	}
+
+	// 只有对象已完成后才创建任务，Worker 才能读取完整视频而不是临时分片。
+	var video model.Video
+	job := model.ProcessingJob{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: "process_video", Status: "pending", Attempt: 1}
+	if e := s.db.Transaction(func(tx *gorm.DB) error {
+		if e := tx.Where("id = ? AND tenant_id = ?", session.ID, auth.UserID(c)).First(&session).Error; e != nil {
+			return e
+		}
+		if session.Status != "uploading" {
+			return fmt.Errorf("upload session is not active")
+		}
+		if e := tx.Where("id = ? AND tenant_id = ?", session.VideoID, auth.UserID(c)).First(&video).Error; e != nil {
+			return e
+		}
+		if e := tx.Model(&session).Update("status", "completed").Error; e != nil {
+			return e
+		}
+		if e := tx.Model(&video).Updates(map[string]any{"status": "created", "error_message": ""}).Error; e != nil {
+			return e
+		}
+		return tx.Create(&job).Error
+	}); e != nil {
+		fail(c, e)
+		return
+	}
+
+	if e := s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID, TaskType: job.TaskType, Attempt: job.Attempt}); e != nil {
+		_ = s.db.Transaction(func(tx *gorm.DB) error {
+			if e := tx.Model(&job).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error; e != nil {
+				return e
+			}
+			return tx.Model(&video).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error
+		})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not queue processing job"})
+		return
+	}
+
+	video.Status = "created"
+	video.ErrorMessage = ""
+	c.JSON(http.StatusCreated, gin.H{"video": video, "job_id": job.ID})
+}
+
 func (s *Server) presignParts(ctx context.Context, session model.UploadSession, numbers []int) ([]uploadPartURL, error) {
 	// 保持请求中的编号顺序，前端可直接将响应映射到自己的上传队列。
 	parts := make([]uploadPartURL, 0, len(numbers))
@@ -194,6 +294,7 @@ func (s *Server) Router() *gin.Engine {
 	p.POST("/videos", s.createVideo)
 	p.POST("/uploads", s.createUpload)
 	p.POST("/uploads/:id/parts", s.uploadPartURLs)
+	p.POST("/uploads/:id/complete", s.completeUpload)
 	p.GET("/videos/:id", s.getVideo) // 这里的id是指视频id
 	p.GET("/videos/:id/status", s.videoStatus)
 	p.GET("/videos/:id/summary", s.summary)
@@ -329,7 +430,15 @@ func (s *Server) videoStatus(c *gin.Context) {
 		return
 	}
 	var j model.ProcessingJob
-	s.db.Where("video_id = ?", v.ID).Order("created_at DESC").First(&j)
+	result := s.db.Where("video_id = ?", v.ID).Order("created_at DESC").Limit(1).Find(&j)
+	if result.Error != nil {
+		fail(c, result.Error)
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "job": nil})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "job": j})
 }
 

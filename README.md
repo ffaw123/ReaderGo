@@ -47,6 +47,8 @@ ReaderGo/
 
 ## 启动
 
+### 启动后端
+
 ```powershell
 Copy-Item .env.example .env
 docker compose up -d
@@ -55,6 +57,29 @@ go run ./cmd/api
 ```
 
 另开终端启动消费者：`go run ./cmd/worker`。
+
+### 启动前端
+
+前端使用 Vue 3 + Vite，代码位于 `web/` 目录。请确保 Node.js 18 或更高版本已经安装，然后另开终端执行：
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+浏览器访问终端中显示的地址，默认是 `http://localhost:5173`。开发服务器会将 `/api` 和 `/healthz` 请求代理到默认运行在 `http://localhost:8080` 的后端服务。
+
+如果后端尚未启动，可以在登录页面点击“预览完整工作台”，使用示例数据体验前端界面。
+
+需要生成生产版本时执行：
+
+```powershell
+cd web
+npm run build
+```
+
+构建产物会输出到 `web/dist/`。如需让生产环境中的前端与后端分开部署，可复制 `web/.env.example` 为 `web/.env.production`，并通过 `VITE_API_BASE_URL` 配置后端 API 地址。
 
 接口前缀为 `/api`。先调用 `POST /api/auth/register`，再以返回的 Bearer Token 调用视频接口。
 
