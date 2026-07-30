@@ -1,0 +1,69 @@
+package model
+
+import "time"
+
+// User 同时表示登录身份和第一版中的租户隔离边界。
+type User struct {
+	ID           string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	Email        string    `gorm:"uniqueIndex;not null" json:"email"`
+	PasswordHash string    `json:"-"`
+	DisplayName  string    `json:"display_name"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// Video 记录提交的视频来源及其异步处理生命周期。
+// TenantID 永不序列化，调用方不能获知或伪造资源归属。
+type Video struct {
+	ID           string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID     string    `gorm:"type:uuid;not null;index" json:"-"`
+	SourceURL    string    `json:"source_url"`
+	Title        string    `json:"title"`
+	Status       string    `json:"status"`
+	DurationMS   int64     `json:"duration_ms"`
+	ObjectKey    string    `json:"object_key"`
+	ErrorMessage string    `json:"error_message,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// ProcessingJob 记录由 Kafka 分发的处理任务及其重试次数。
+type ProcessingJob struct {
+	ID           string `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID     string `gorm:"type:uuid;not null"`
+	VideoID      string `gorm:"type:uuid;not null"`
+	TaskType     string
+	Attempt      int
+	Status       string
+	ErrorMessage string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// VideoSummary 保存一个视频唯一的最终 LLM 摘要。
+type VideoSummary struct {
+	ID        string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
+	VideoID   string    `gorm:"type:uuid;uniqueIndex" json:"video_id"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Conversation 将一段多轮问答限定在单个视频范围内。
+type Conversation struct {
+	ID        string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID  string    `gorm:"type:uuid;not null" json:"-"`
+	VideoID   string    `gorm:"type:uuid;not null" json:"video_id"`
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Message 保存用户问题与未来的助手回答，并以 JSON 保存时间戳引用。
+type Message struct {
+	ID             string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	ConversationID string    `gorm:"type:uuid;not null" json:"conversation_id"`
+	Role           string    `json:"role"`
+	Content        string    `json:"content"`
+	Citations      []byte    `gorm:"type:jsonb" json:"citations"`
+	CreatedAt      time.Time `json:"created_at"`
+}

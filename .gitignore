@@ -1,0 +1,31 @@
+# ── 环境变量（含密钥，禁止提交）──
+.env
+
+# ── 设计方案（不纳入版本控制）──
+设计方案_v1.md
+
+# ── Go ──
+*.exe
+*.test
+*.out
+vendor/
+*.prof
+
+# ── IDE / Editor ──
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Docker ──
+docker-compose.override.yml
+
+# ── Temp / Logs ──
+*.log
+tmp/
+temp/

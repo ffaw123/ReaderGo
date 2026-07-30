@@ -1,0 +1,540 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "ReaderGo API",
+    "description": "基于 LLM 的异步视频理解服务 — 用户认证、视频管理、AI 对话问答。\n\n**认证方式**：除 `/healthz` 和 `/api/auth/*` 外，所有接口需在 Header 中携带 `Authorization: Bearer <token>`。",
+    "version": "1.0.0",
+    "contact": {
+      "name": "ReaderGo"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "本地开发环境"
+    }
+  ],
+  "tags": [
+    { "name": "Health", "description": "健康检查" },
+    { "name": "Auth", "description": "注册与登录" },
+    { "name": "Videos", "description": "视频提交与查询" },
+    { "name": "Conversations", "description": "AI 对话与消息" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string", "description": "人类可读的错误描述" }
+        }
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "id":          { "type": "string", "format": "uuid", "description": "用户唯一标识" },
+          "email":       { "type": "string", "format": "email", "description": "登录邮箱" },
+          "display_name":{ "type": "string", "description": "显示名称" },
+          "created_at":  { "type": "string", "format": "date-time", "description": "注册时间" },
+          "updated_at":  { "type": "string", "format": "date-time", "description": "最后更新时间" }
+        }
+      },
+      "RegisterRequest": {
+        "type": "object",
+        "required": ["email", "password"],
+        "properties": {
+          "email":        { "type": "string", "format": "email", "description": "邮箱" },
+          "password":     { "type": "string", "minLength": 8, "maxLength": 128, "description": "密码，最少 8 位" },
+          "display_name": { "type": "string", "description": "显示名称（可选）" }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": ["email", "password"],
+        "properties": {
+          "email":    { "type": "string", "format": "email", "description": "邮箱" },
+          "password": { "type": "string", "minLength": 8, "maxLength": 128, "description": "密码" }
+        }
+      },
+      "AuthResponse": {
+        "type": "object",
+        "properties": {
+          "access_token": { "type": "string", "description": "JWT 访问令牌，后续请求需以 Bearer 方式携带" },
+          "token_type":   { "type": "string", "description": "固定为 \"Bearer\"" },
+          "user":         { "$ref": "#/components/schemas/User" }
+        }
+      },
+      "Video": {
+        "type": "object",
+        "properties": {
+          "id":            { "type": "string", "format": "uuid" },
+          "source_url":    { "type": "string", "format": "uri" },
+          "title":         { "type": "string" },
+          "status":        { "type": "string", "enum": ["created","downloading","processing","summary_ready","indexing","ready","failed"] },
+          "duration_ms":   { "type": "integer", "format": "int64" },
+          "object_key":    { "type": "string" },
+          "error_message": { "type": "string" },
+          "created_at":    { "type": "string", "format": "date-time" },
+          "updated_at":    { "type": "string", "format": "date-time" }
+        }
+      },
+      "ProcessingJob": {
+        "type": "object",
+        "properties": {
+          "id":            { "type": "string", "format": "uuid" },
+          "task_type":     { "type": "string" },
+          "attempt":       { "type": "integer" },
+          "status":        { "type": "string", "enum": ["pending","running","succeeded","failed"] },
+          "error_message": { "type": "string" },
+          "created_at":    { "type": "string", "format": "date-time" },
+          "updated_at":    { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateVideoRequest": {
+        "type": "object",
+        "required": ["source_url"],
+        "properties": {
+          "source_url": { "type": "string", "format": "uri", "description": "视频 URL（仅支持 http/https）" },
+          "title":      { "type": "string", "description": "视频标题（可选）" }
+        }
+      },
+      "CreateVideoResponse": {
+        "type": "object",
+        "properties": {
+          "video":  { "$ref": "#/components/schemas/Video" },
+          "job_id": { "type": "string", "format": "uuid", "description": "后台处理任务 ID，可用于追踪进度" }
+        }
+      },
+      "VideoStatusResponse": {
+        "type": "object",
+        "properties": {
+          "video_id":       { "type": "string", "format": "uuid" },
+          "status":         { "type": "string" },
+          "error_message":  { "type": "string" },
+          "job":            { "$ref": "#/components/schemas/ProcessingJob" }
+        }
+      },
+      "VideoSummary": {
+        "type": "object",
+        "properties": {
+          "id":         { "type": "string", "format": "uuid" },
+          "video_id":   { "type": "string", "format": "uuid" },
+          "content":    { "type": "string", "description": "LLM 生成的视频摘要文本" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Conversation": {
+        "type": "object",
+        "properties": {
+          "id":         { "type": "string", "format": "uuid" },
+          "video_id":   { "type": "string", "format": "uuid" },
+          "title":      { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateConversationRequest": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string", "description": "会话标题（可选）" }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "id":              { "type": "string", "format": "uuid" },
+          "conversation_id": { "type": "string", "format": "uuid" },
+          "role":            { "type": "string", "enum": ["user","assistant","system"] },
+          "content":         { "type": "string" },
+          "citations":       { "type": "array", "items": { "type": "object" }, "description": "引用来源 JSON 数组" },
+          "created_at":      { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateMessageRequest": {
+        "type": "object",
+        "required": ["content"],
+        "properties": {
+          "content": { "type": "string", "maxLength": 10000, "description": "用户问题内容，最长 10000 字符" }
+        }
+      },
+      "MessageListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Message" }
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "健康检查",
+        "description": "无鉴权，可用于确认服务正在监听端口。",
+        "operationId": "healthCheck",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "服务正常",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "ok" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/register": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "注册账户",
+        "description": "创建新用户并立即返回 JWT 访问令牌。邮箱全局唯一，重复注册会返回 409。",
+        "operationId": "register",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RegisterRequest" },
+              "example": {
+                "email": "test@example.com",
+                "password": "12345678",
+                "display_name": "Test User"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "注册成功，返回 Token 和用户信息",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuthResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "邮箱已被注册",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "登录",
+        "description": "邮箱 + 密码登录，成功返回 JWT Token。出于安全考虑，无论用户不存在还是密码错误都返回相同的 401 提示。",
+        "operationId": "login",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LoginRequest" },
+              "example": {
+                "email": "test@example.com",
+                "password": "12345678"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "登录成功",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuthResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": {
+            "description": "邮箱或密码错误",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/videos": {
+      "post": {
+        "tags": ["Videos"],
+        "summary": "提交视频处理任务",
+        "description": "提交一个视频 URL 进行异步处理。系统创建视频记录和处理任务后，通过 Kafka 分发给 Worker。",
+        "operationId": "createVideo",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateVideoRequest" },
+              "example": {
+                "source_url": "https://example.com/video.mp4",
+                "title": "My Video"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "视频已创建，任务已入队",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateVideoResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "参数错误（URL 不合法或非 http(s) 协议）",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": {
+            "description": "未认证",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": {
+            "description": "消息队列不可用，任务未入队",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/videos/{id}": {
+      "get": {
+        "tags": ["Videos"],
+        "summary": "获取视频详情",
+        "description": "返回当前用户拥有的指定视频元数据。仅能访问自己提交的视频。",
+        "operationId": "getVideo",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "视频 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "视频详情",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Video" }
+              }
+            }
+          },
+          "401": {
+            "description": "未认证",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "视频不存在或不属于当前用户",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/videos/{id}/status": {
+      "get": {
+        "tags": ["Videos"],
+        "summary": "查询视频处理状态",
+        "description": "同时返回视频的处理状态和最近一次处理任务的详情，适合前端轮询。",
+        "operationId": "getVideoStatus",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "视频 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "视频状态和最近的任务",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/VideoStatusResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "视频不存在",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/videos/{id}/summary": {
+      "get": {
+        "tags": ["Videos"],
+        "summary": "获取视频 AI 摘要",
+        "description": "返回 LLM 对视频生成的摘要。仅当视频处理完成且摘要已写入后才返回内容。",
+        "operationId": "getVideoSummary",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "视频 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "视频摘要",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/VideoSummary" }
+              }
+            }
+          },
+          "404": {
+            "description": "视频不存在或摘要尚未生成",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/videos/{id}/conversations": {
+      "post": {
+        "tags": ["Conversations"],
+        "summary": "创建视频对话",
+        "description": "在指定视频下创建 AI 对话会话。对话只能建立在用户自己拥有的视频上。",
+        "operationId": "createConversation",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "视频 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateConversationRequest" },
+              "example": { "title": "关于这个视频的讨论" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "对话已创建",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Conversation" }
+              }
+            }
+          },
+          "404": {
+            "description": "视频不存在",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/conversations/{id}/messages": {
+      "get": {
+        "tags": ["Conversations"],
+        "summary": "获取对话消息历史",
+        "description": "按创建时间正序返回指定对话中的所有消息。",
+        "operationId": "listMessages",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "对话 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "消息列表",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessageListResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "对话不存在",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Conversations"],
+        "summary": "发送用户消息",
+        "description": "在指定对话中发送一条用户消息。后续 RAG Worker 将生成 assistant 回复与引用。",
+        "operationId": "createMessage",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "对话 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateMessageRequest" },
+              "example": { "content": "这个视频讲的是什么？" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "消息已保存",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Message" }
+              }
+            }
+          },
+          "400": {
+            "description": "content 为空或超过 10000 字符",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "对话不存在",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    }
+  }
+}

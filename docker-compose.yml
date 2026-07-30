@@ -1,0 +1,46 @@
+services:
+  # 带 pgvector 扩展的主数据存储。
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: readergo
+      POSTGRES_USER: readergo
+      POSTGRES_PASSWORD: readergo
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data", "./migrations:/docker-entrypoint-initdb.d:ro"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U readergo -d readergo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    # 预留给进度缓存、限流、会话和分布式锁。
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+  kafka:
+    # 单节点 KRaft 模式仅用于本地开发，生产环境应部署高可用集群。
+    image: apache/kafka:3.9.0
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+  minio:
+    # 兼容 S3 的对象存储，用于原视频、音频、帧和短片段。
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: readergo
+      MINIO_ROOT_PASSWORD: readergo-secret
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio_data:/data"]
+volumes:
+  postgres_data:
+  minio_data:
