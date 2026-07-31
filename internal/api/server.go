@@ -97,7 +97,7 @@ func (s *Server) createUpload(c *gin.Context) {
 	// uploadID 是完成 Multipart Upload 所必需的秘密服务端状态，绝不返回给客户端。
 	uploadID, e := s.uploads.Create(c.Request.Context(), objectKey, in.ContentType)
 	if e != nil {
-		// MinIO 初始化失败时移除刚插入的视频，避免留下不可恢复的 uploading 记录。
+		// MinIO 初始化失败时移除刚插入的视频，此时session还未创建，直接删除视频（最好和会话配对）
 		_ = s.db.Delete(&v).Error
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not initialize object upload"})
 		return
@@ -114,10 +114,10 @@ func (s *Server) createUpload(c *gin.Context) {
 	// 仅返回首批 URL，客户端用 /parts 接口按需续取其余 URL。
 	parts, e := s.presignParts(c.Request.Context(), session, firstPartNumbers(partCount))
 	if e != nil {
-		// URL 无法交付时该会话无法被客户端使用，数据库和对象存储均需清理。
-		_ = s.uploads.Abort(c.Request.Context(), objectKey, uploadID)
-		_ = s.db.Delete(&session).Error
-		_ = s.db.Delete(&v).Error
+		if cancelErr := s.cancelUpload(c.Request.Context(), session); cancelErr != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not cancel object upload"})
+			return
+		}
 		fail(c, e)
 		return
 	}
@@ -157,10 +157,42 @@ func (s *Server) uploadPartURLs(c *gin.Context) {
 	}
 	parts, e := s.presignParts(c.Request.Context(), session, in.PartNumbers)
 	if e != nil {
+		if cancelErr := s.cancelUpload(c.Request.Context(), session); cancelErr != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not cancel object upload"})
+			return
+		}
 		fail(c, e)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"upload_id": session.ID, "parts": parts})
+}
+
+// 这个函数会将前面上传的分片也直接清除，不能用于用户手动暂停（未实现）。
+// cancelUpload 中止对象存储 multipart upload，并保留数据库记录供审计与清理。
+// 只允许将仍在上传的会话转换为 cancelled，避免覆盖已完成或其他终态。
+func (s *Server) cancelUpload(ctx context.Context, session model.UploadSession) error {
+	abortErr := s.uploads.Abort(ctx, session.ObjectKey, session.UploadID)
+	stateErr := s.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.UploadSession{}).
+			Where("id = ? AND tenant_id = ? AND status = ?", session.ID, session.TenantID, "uploading").
+			Update("status", "cancelled")
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("upload session is not active")
+		}
+		return tx.Model(&model.Video{}).
+			Where("id = ? AND tenant_id = ?", session.VideoID, session.TenantID).
+			Updates(map[string]any{
+				"status":        "failed",
+				"error_message": "could not issue upload URLs",
+			}).Error
+	})
+	if stateErr != nil {
+		return stateErr
+	}
+	return abortErr
 }
 
 // completeUpload 将 MinIO 中的全部已上传分片提交为最终对象，并创建视频处理任务。
@@ -275,7 +307,7 @@ func firstPartNumbers(partCount int) []int {
 	return numbers
 }
 
-// New 使用数据库、鉴权服务和消息生产者创建 API 服务。
+// New 使用数据库、鉴权服务、消息生产者和视频上传创建 API 服务。
 func New(db *gorm.DB, authService *auth.Service, jobs *queue.Producer, uploads *storage.MultipartStore, partSize int64) *Server {
 	return &Server{db: db, auth: authService, jobs: jobs, uploads: uploads, partSize: partSize}
 }
