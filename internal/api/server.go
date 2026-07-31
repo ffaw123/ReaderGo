@@ -114,7 +114,7 @@ func (s *Server) createUpload(c *gin.Context) {
 	// 仅返回首批 URL，客户端用 /parts 接口按需续取其余 URL。
 	parts, e := s.presignParts(c.Request.Context(), session, firstPartNumbers(partCount))
 	if e != nil {
-		if cancelErr := s.cancelUpload(c.Request.Context(), session); cancelErr != nil {
+		if cancelErr := s.cancelUpload(c.Request.Context(), session, "could not issue upload URLs"); cancelErr != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not cancel object upload"})
 			return
 		}
@@ -157,7 +157,7 @@ func (s *Server) uploadPartURLs(c *gin.Context) {
 	}
 	parts, e := s.presignParts(c.Request.Context(), session, in.PartNumbers)
 	if e != nil {
-		if cancelErr := s.cancelUpload(c.Request.Context(), session); cancelErr != nil {
+		if cancelErr := s.cancelUpload(c.Request.Context(), session, "could not issue upload URLs"); cancelErr != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not cancel object upload"})
 			return
 		}
@@ -170,7 +170,7 @@ func (s *Server) uploadPartURLs(c *gin.Context) {
 // 这个函数会将前面上传的分片也直接清除，不能用于用户手动暂停（未实现）。
 // cancelUpload 中止对象存储 multipart upload，并保留数据库记录供审计与清理。
 // 只允许将仍在上传的会话转换为 cancelled，避免覆盖已完成或其他终态。
-func (s *Server) cancelUpload(ctx context.Context, session model.UploadSession) error {
+func (s *Server) cancelUpload(ctx context.Context, session model.UploadSession, reason string) error {
 	abortErr := s.uploads.Abort(ctx, session.ObjectKey, session.UploadID)
 	stateErr := s.db.Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&model.UploadSession{}).
@@ -186,7 +186,7 @@ func (s *Server) cancelUpload(ctx context.Context, session model.UploadSession) 
 			Where("id = ? AND tenant_id = ?", session.VideoID, session.TenantID).
 			Updates(map[string]any{
 				"status":        "failed",
-				"error_message": "could not issue upload URLs",
+				"error_message": reason,
 			}).Error
 	})
 	if stateErr != nil {
@@ -239,6 +239,7 @@ func (s *Server) completeUpload(c *gin.Context) {
 	}
 
 	if e := s.uploads.Complete(c.Request.Context(), session.ObjectKey, session.UploadID, parts); e != nil {
+		_ = s.cancelUpload(c.Request.Context(), session, "could not complete object upload")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "could not complete object upload"})
 		return
 	}

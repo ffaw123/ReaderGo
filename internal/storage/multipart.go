@@ -21,9 +21,9 @@ type MultipartStore struct {
 }
 
 const (
-	// maxPresignRetries 不包含首次请求；失败后最多额外重试 3 次。
-	maxPresignRetries = 3
-	presignRetryDelay = 100 * time.Millisecond
+	// maxRetries 不包含首次请求；失败后最多额外重试 3 次。
+	maxRetries = 3
+	retryDelay = 100 * time.Millisecond
 )
 
 // CompletedPart 是浏览器直传成功后返回的不可伪造分片 ETag。
@@ -54,12 +54,52 @@ func (s *MultipartStore) EnsureBucket(ctx context.Context) error {
 
 // Create 启动一次 multipart upload，并返回仅由服务端保存的 upload ID。
 func (s *MultipartStore) Create(ctx context.Context, objectKey, contentType string) (string, error) {
-	return s.client.NewMultipartUpload(ctx, s.bucket, objectKey, minio.PutObjectOptions{ContentType: contentType})
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		uploadID, err := s.client.NewMultipartUpload(ctx, s.bucket, objectKey, minio.PutObjectOptions{ContentType: contentType})
+		if err == nil {
+			return uploadID, nil
+		}
+		lastErr = err
+		if attempt == maxRetries {
+			break
+		}
+
+		delay := time.Duration(attempt+1) * retryDelay
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return "", lastErr
 }
 
 // Abort 在 API 无法创建可用上传会话时清理未完成分片，同时uploadID直接失效。
 func (s *MultipartStore) Abort(ctx context.Context, objectKey, uploadID string) error {
-	return s.client.AbortMultipartUpload(ctx, s.bucket, objectKey, uploadID)
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		err := s.client.AbortMultipartUpload(ctx, s.bucket, objectKey, uploadID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt == maxRetries {
+			break
+		}
+
+		delay := time.Duration(attempt+1) * retryDelay
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }
 
 // Complete 校验通过后的全部分片写入一个最终对象，并关闭 multipart upload。
@@ -68,8 +108,28 @@ func (s *MultipartStore) Complete(ctx context.Context, objectKey, uploadID strin
 	for i, part := range parts {
 		completed[i] = minio.CompletePart{PartNumber: part.PartNumber, ETag: part.ETag}
 	}
-	_, err := s.client.CompleteMultipartUpload(ctx, s.bucket, objectKey, uploadID, completed, minio.PutObjectOptions{})
-	return err
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		_, err := s.client.CompleteMultipartUpload(ctx, s.bucket, objectKey, uploadID, completed, minio.PutObjectOptions{})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt == maxRetries {
+			break
+		}
+
+		delay := time.Duration(attempt+1) * retryDelay
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }
 
 // PresignedPartURL 仅允许对指定对象、upload ID 和 part number 发起一次 PUT。
@@ -79,19 +139,19 @@ func (s *MultipartStore) PresignedPartURL(ctx context.Context, objectKey, upload
 	params.Set("partNumber", fmt.Sprintf("%d", partNumber))
 
 	var lastErr error
-	for attempt := 0; attempt <= maxPresignRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// 必须签名 PUT 而不是通用对象 URL，防止该地址被用于下载或删除数据。
 		u, err := s.client.Presign(ctx, http.MethodPut, s.bucket, objectKey, s.urlTTL, params)
 		if err == nil {
 			return u.String(), time.Now().Add(s.urlTTL), nil
 		}
 		lastErr = err
-		if attempt == maxPresignRetries {
+		if attempt == maxRetries {
 			break
 		}
 
 		// 退避等待必须响应请求取消，不能让客户端取消后仍阻塞在重试中。
-		delay := time.Duration(attempt+1) * presignRetryDelay
+		delay := time.Duration(attempt+1) * retryDelay
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
