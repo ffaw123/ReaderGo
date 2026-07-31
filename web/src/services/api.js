@@ -1,4 +1,6 @@
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+const maxPartUploadRetries = 3
+const initialPartRetryDelayMs = 400
 
 function getSession() {
   try {
@@ -69,6 +71,44 @@ export const api = {
     }),
 }
 
+function waitForRetry(delayMs) {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs))
+}
+
+function isRetryablePartUploadStatus(status) {
+  return status === 408 || status === 429 || status >= 500
+}
+
+async function uploadPartWithRetry(url, part, partNumber) {
+  let lastError
+
+  // 首次请求之外，最多额外重试 3 次；每次等待时间按指数增长。
+  for (let retry = 0; retry <= maxPartUploadRetries; retry += 1) {
+    try {
+      const response = await fetch(url, { method: 'PUT', body: part })
+      if (!response.ok) {
+        const error = new Error(`第 ${partNumber} 个分片上传失败（HTTP ${response.status}）`)
+        error.retryable = isRetryablePartUploadStatus(response.status)
+        throw error
+      }
+
+      const etag = response.headers.get('etag')
+      if (!etag) {
+        const error = new Error('对象存储未返回 ETag；请检查 MinIO CORS 是否暴露 ETag 响应头')
+        error.retryable = false
+        throw error
+      }
+      return etag
+    } catch (error) {
+      lastError = error
+      if (retry === maxPartUploadRetries || error.retryable === false) break
+      await waitForRetry(initialPartRetryDelayMs * 2 ** retry)
+    }
+  }
+
+  throw new Error(`第 ${partNumber} 个分片上传失败，已重试 ${maxPartUploadRetries} 次：${lastError.message}`)
+}
+
 export async function uploadFileParts(file, session, onProgress) {
   const knownParts = new Map(session.parts.map((part) => [part.part_number, part.url]))
   const missingNumbers = []
@@ -91,12 +131,7 @@ export async function uploadFileParts(file, session, onProgress) {
       const start = (partNumber - 1) * session.part_size
       const end = Math.min(start + session.part_size, file.size)
       const part = file.slice(start, end)
-      const response = await fetch(knownParts.get(partNumber), { method: 'PUT', body: part })
-      if (!response.ok) throw new Error(`第 ${partNumber} 个分片上传失败`)
-      const etag = response.headers.get('etag')
-      if (!etag) {
-        throw new Error('对象存储未返回 ETag；请检查 MinIO CORS 是否暴露 ETag 响应头')
-      }
+      const etag = await uploadPartWithRetry(knownParts.get(partNumber), part, partNumber)
       completedParts[partNumber - 1] = { part_number: partNumber, etag }
       uploadedBytes += part.size
       onProgress(Math.round((uploadedBytes / file.size) * 100))
