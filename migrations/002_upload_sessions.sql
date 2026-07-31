@@ -1,6 +1,3 @@
-ALTER TYPE video_status ADD VALUE IF NOT EXISTS 'uploading';
-ALTER TYPE video_status ADD VALUE IF NOT EXISTS 'uploaded';
-
 CREATE TABLE upload_sessions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES users(id),

@@ -72,16 +72,11 @@ const isReady = computed(() => selectedVideo.value?.status === 'ready')
 const statusMeta = computed(() => {
   const statuses = {
     ready: { label: '分析完成', detail: '所有内容已可检索', percent: 100, tone: 'success' },
-    processing: { label: '正在理解视频', detail: '正在对齐转写与关键画面', percent: 64, tone: 'working' },
-    downloading: { label: '正在获取视频', detail: '正在安全下载视频源', percent: 22, tone: 'working' },
-    summary_ready: { label: '正在建立索引', detail: '摘要已完成，即将可以提问', percent: 86, tone: 'working' },
-    indexing: { label: '正在建立索引', detail: '正在整理可检索片段', percent: 90, tone: 'working' },
+    processing: { label: '正在处理视频', detail: '正在解析内容、建立索引和生成摘要', percent: 64, tone: 'working' },
     uploading: { label: '等待上传完成', detail: '文件分片正在传输', percent: 16, tone: 'working' },
-    uploaded: { label: '上传完成', detail: '等待处理任务开始', percent: 26, tone: 'working' },
-    created: { label: '任务已创建', detail: '即将开始处理', percent: 12, tone: 'working' },
     failed: { label: '处理失败', detail: '请检查视频源后重试', percent: 100, tone: 'danger' },
   }
-  return statuses[selectedVideo.value?.status] || statuses.created
+  return statuses[selectedVideo.value?.status] || statuses.uploading
 })
 const sourceDisabled = computed(() => uploadSource.value === 'file' && selectedFile.value)
 const fileDisabled = computed(() => uploadSource.value === 'url' && uploadUrl.value.trim())
@@ -174,7 +169,7 @@ async function loadSelectedContent() {
 }
 
 async function refreshStatus() {
-  if (previewMode.value || !selectedVideo.value || selectedVideo.value.status === 'ready') return
+  if (previewMode.value || !selectedVideo.value || ['ready', 'failed'].includes(selectedVideo.value.status)) return
   try {
     const status = await api.getVideoStatus(selectedVideo.value.id)
     selectedVideo.value.status = status.status
@@ -407,7 +402,7 @@ function formatRelative(date) {
 }
 
 function statusLabel(status) {
-  return { ready: '可提问', processing: '分析中', failed: '失败', uploading: '上传中', created: '排队中' }[status] || '处理中'
+  return { ready: '可提问', processing: '处理中', failed: '失败', uploading: '上传中' }[status] || '处理中'
 }
 
 watch(

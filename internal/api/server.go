@@ -89,7 +89,7 @@ func (s *Server) createUpload(c *gin.Context) {
 	// 使用固定对象名，不信任 filename 的扩展名；上传完成后由 FFprobe 校验真实媒体格式。
 	objectKey := fmt.Sprintf("tenants/%s/videos/%s/source/original", tenantID, videoID)
 	// 先创建 uploading 视频记录，让后续完成上传流程拥有稳定的资源归属。
-	v := model.Video{ID: videoID, TenantID: tenantID, SourceURL: "local://" + in.Filename, Title: in.Title, Status: "uploading", ObjectKey: objectKey}
+	v := model.Video{ID: videoID, TenantID: tenantID, SourceURL: "local://" + in.Filename, Title: in.Title, Status: model.VideoStatusUploading, ObjectKey: objectKey}
 	if e := s.db.Create(&v).Error; e != nil {
 		fail(c, e)
 		return
@@ -246,7 +246,7 @@ func (s *Server) completeUpload(c *gin.Context) {
 
 	// 只有对象已完成后才创建任务，Worker 才能读取完整视频而不是临时分片。
 	var video model.Video
-	job := model.ProcessingJob{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: "process_video", Status: "pending", Attempt: 1}
+	job := model.ProcessingJob{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: model.TaskPrepare, PipelineVersion: 1, Status: model.JobStatusPending, Attempt: 1}
 	if e := s.db.Transaction(func(tx *gorm.DB) error {
 		if e := tx.Where("id = ? AND tenant_id = ?", session.ID, auth.UserID(c)).First(&session).Error; e != nil {
 			return e
@@ -260,7 +260,7 @@ func (s *Server) completeUpload(c *gin.Context) {
 		if e := tx.Model(&session).Update("status", "completed").Error; e != nil {
 			return e
 		}
-		if e := tx.Model(&video).Updates(map[string]any{"status": "created", "error_message": ""}).Error; e != nil {
+		if e := tx.Model(&video).Updates(map[string]any{"status": model.VideoStatusProcessing, "error_message": ""}).Error; e != nil {
 			return e
 		}
 		return tx.Create(&job).Error
@@ -269,7 +269,7 @@ func (s *Server) completeUpload(c *gin.Context) {
 		return
 	}
 
-	if e := s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID, TaskType: job.TaskType, Attempt: job.Attempt}); e != nil {
+	if e := s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID, TaskType: job.TaskType, Attempt: job.Attempt, PipelineVersion: job.PipelineVersion}); e != nil {
 		_ = s.db.Transaction(func(tx *gorm.DB) error {
 			if e := tx.Model(&job).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error; e != nil {
 				return e
@@ -280,7 +280,7 @@ func (s *Server) completeUpload(c *gin.Context) {
 		return
 	}
 
-	video.Status = "created"
+	video.Status = model.VideoStatusProcessing
 	video.ErrorMessage = ""
 	c.JSON(http.StatusCreated, gin.H{"video": video, "job_id": job.ID})
 }
@@ -404,6 +404,7 @@ type createVideoRequest struct {
 	Title     string `json:"title"`
 }
 
+// URL 方式上传视频时触发该函数
 // createVideo 先持久化视频与任务，再发送 Kafka 消息，避免 Worker 找不到任务记录。
 func (s *Server) createVideo(c *gin.Context) {
 	var in createVideoRequest
@@ -418,17 +419,17 @@ func (s *Server) createVideo(c *gin.Context) {
 		return
 	}
 	tenant := auth.UserID(c)
-	v := model.Video{TenantID: tenant, SourceURL: in.SourceURL, Title: in.Title, Status: "created"}
+	v := model.Video{TenantID: tenant, SourceURL: in.SourceURL, Title: in.Title, Status: model.VideoStatusProcessing}
 	if e = s.db.Create(&v).Error; e != nil {
 		fail(c, e)
 		return
 	}
-	j := model.ProcessingJob{TenantID: tenant, VideoID: v.ID, TaskType: "process_video", Status: "pending", Attempt: 1}
+	j := model.ProcessingJob{TenantID: tenant, VideoID: v.ID, TaskType: model.TaskPrepare, PipelineVersion: 1, Status: model.JobStatusPending, Attempt: 1}
 	if e = s.db.Create(&j).Error; e != nil {
 		fail(c, e)
 		return
 	}
-	if e = s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: j.ID, TenantID: tenant, VideoID: v.ID, TaskType: j.TaskType, Attempt: j.Attempt}); e != nil {
+	if e = s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: j.ID, TenantID: tenant, VideoID: v.ID, TaskType: j.TaskType, Attempt: j.Attempt, PipelineVersion: j.PipelineVersion}); e != nil {
 		// 生产消息失败时将持久化状态标为失败，避免任务长期卡在 pending。
 		_ = s.db.Model(&j).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error
 		_ = s.db.Model(&v).Update("status", "failed").Error
@@ -462,17 +463,17 @@ func (s *Server) videoStatus(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var j model.ProcessingJob
-	result := s.db.Where("video_id = ?", v.ID).Order("created_at DESC").Limit(1).Find(&j)
+	if c.Query("details") != "true" {
+		c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage})
+		return
+	}
+	var jobs []model.ProcessingJob
+	result := s.db.Select("DISTINCT ON (task_type) *").Where("video_id = ?", v.ID).Order("task_type, pipeline_version DESC").Find(&jobs)
 	if result.Error != nil {
 		fail(c, result.Error)
 		return
 	}
-	if result.RowsAffected == 0 {
-		c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "job": nil})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "job": j})
+	c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "jobs": jobs})
 }
 
 // summary 只有处理完成并写入摘要后才返回内容。

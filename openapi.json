@@ -76,7 +76,7 @@
           "id":            { "type": "string", "format": "uuid" },
           "source_url":    { "type": "string", "format": "uri" },
           "title":         { "type": "string" },
-          "status":        { "type": "string", "enum": ["uploading","uploaded","created","downloading","processing","summary_ready","indexing","ready","failed"] },
+          "status":        { "type": "string", "enum": ["uploading","processing","ready","failed"] },
           "duration_ms":   { "type": "integer", "format": "int64" },
           "object_key":    { "type": "string" },
           "error_message": { "type": "string" },
@@ -88,7 +88,8 @@
         "type": "object",
         "properties": {
           "id":            { "type": "string", "format": "uuid" },
-          "task_type":     { "type": "string" },
+          "task_type":     { "type": "string", "enum": ["prepare","asr","vision","rag_index","summary"] },
+          "pipeline_version": { "type": "integer", "minimum": 1 },
           "attempt":       { "type": "integer" },
           "status":        { "type": "string", "enum": ["pending","running","succeeded","failed"] },
           "error_message": { "type": "string" },
@@ -136,7 +137,11 @@
           "video_id":       { "type": "string", "format": "uuid" },
           "status":         { "type": "string" },
           "error_message":  { "type": "string" },
-          "job":            { "$ref": "#/components/schemas/ProcessingJob" }
+          "jobs": {
+            "type": "array",
+            "description": "仅在 details=true 时返回；每个任务类型的最新任务。",
+            "items": { "$ref": "#/components/schemas/ProcessingJob" }
+          }
         }
       },
       "VideoSummary": {
@@ -436,7 +441,7 @@
       "get": {
         "tags": ["Videos"],
         "summary": "查询视频处理状态",
-        "description": "同时返回视频的处理状态和最近一次处理任务的详情，适合前端轮询。",
+        "description": "默认仅返回视频总体状态；传入 details=true 时返回每个任务类型的最新任务详情。",
         "operationId": "getVideoStatus",
         "security": [{ "BearerAuth": [] }],
         "parameters": [
@@ -446,11 +451,18 @@
             "required": true,
             "description": "视频 UUID",
             "schema": { "type": "string", "format": "uuid" }
+          },
+          {
+            "name": "details",
+            "in": "query",
+            "required": false,
+            "description": "设为 true 时包含分阶段任务详情。",
+            "schema": { "type": "boolean", "default": false }
           }
         ],
         "responses": {
           "200": {
-            "description": "视频状态和最近的任务",
+            "description": "视频总体状态；可选地包含分阶段任务详情",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/VideoStatusResponse" }

@@ -38,7 +38,7 @@ services:
     command: server /data --console-address :9001
     environment:
       MINIO_ROOT_USER: readergo
-      MINIO_ROOT_PASSWORD: readergo-secret
+      MINIO_ROOT_PASSWORD: readergo
     ports: ["9000:9000", "9001:9001"]
     volumes: ["minio_data:/data"]
   # 为浏览器直传分片配置 CORS，并暴露完成 multipart upload 必需的 ETag。

@@ -3,7 +3,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- 视频与任务使用受限状态集合，避免写入无法识别的生命周期状态。
-CREATE TYPE video_status AS ENUM ('created','downloading','processing','summary_ready','indexing','ready','failed');
+CREATE TYPE video_status AS ENUM ('uploading','processing','ready','failed');
 CREATE TYPE job_status AS ENUM ('pending','running','succeeded','failed');
 
 -- users 是第一版的登录身份与租户边界。
@@ -21,7 +21,7 @@ CREATE TABLE videos (
   tenant_id uuid NOT NULL REFERENCES users(id), 
   source_url text NOT NULL,
   title text NOT NULL DEFAULT '', 
-  status video_status NOT NULL DEFAULT 'created', 
+  status video_status NOT NULL DEFAULT 'uploading',
   duration_ms bigint NOT NULL DEFAULT 0,
   object_key text NOT NULL DEFAULT '', 
   error_message text NOT NULL DEFAULT '', 
@@ -35,13 +35,15 @@ CREATE TABLE processing_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 
   tenant_id uuid NOT NULL REFERENCES users(id), 
   video_id uuid NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-  task_type text NOT NULL, 
+  task_type text NOT NULL CHECK (task_type IN ('prepare','asr','vision','rag_index','summary')),
+  pipeline_version integer NOT NULL DEFAULT 1 CHECK (pipeline_version > 0),
   attempt integer NOT NULL DEFAULT 1, 
   status job_status NOT NULL DEFAULT 'pending', 
   error_message text NOT NULL DEFAULT '', 
   created_at timestamptz NOT NULL DEFAULT now(), 
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX processing_jobs_video_task_pipeline_idx ON processing_jobs(video_id, task_type, pipeline_version);
 -- 每个视频只有一个最终摘要。
 CREATE TABLE video_summaries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 
