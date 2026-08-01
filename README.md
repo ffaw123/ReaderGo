@@ -30,8 +30,8 @@ ReaderGo/
 │   └── 002_upload_sessions.sql     ← 本地分片上传会话表
 │
 ├── cmd/                            ← 可独立启动的应用入口
-│   ├── api/main.go                 ← HTTP API 服务入口
-│   └── worker/main.go              ← Kafka Worker 服务入口
+│   ├── api/main.go                 ← HTTP API 服务入口-有自己的生产者实例
+│   └── worker/main.go              ← 创建 worker 实例，一个 worker 实例既有消费者也有生产者实例
 │
 ├── internal/                       ← 后端业务实现
 │   ├── api/server.go                ← 路由、鉴权、视频和上传接口
@@ -41,7 +41,7 @@ ReaderGo/
 │   ├── model/models.go              ← 数据模型和状态、任务常量
 │   ├── queue/queue.go               ← Kafka 消息和分阶段 topic
 │   ├── storage/multipart.go         ← MinIO 分片上传封装
-│   └── worker/worker.go             ← 任务编排、状态归并和处理器接口
+│   └── worker/worker.go             ← Worker 实例运行的具体逻辑-包括任务流程编排
 │
 └── web/                            ← Vue 3 + Vite 前端
     ├── package.json                 ← 前端依赖与脚本

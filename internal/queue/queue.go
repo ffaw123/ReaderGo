@@ -14,6 +14,11 @@ const (
 	VisionJobsTopic   = "video.vision.jobs"
 	RAGIndexJobsTopic = "video.rag-index.jobs"
 	SummaryJobsTopic  = "video.summary.jobs"
+
+	// UploadMethodLocalDirect 表示源文件已经由客户端直传至 MinIO，Worker 可直接开始媒体处理。
+	UploadMethodLocalDirect = "local_direct"
+	// UploadMethodURL 表示源文件仍需由 prepare 阶段下载、校验并写入对象存储。
+	UploadMethodURL = "url"
 )
 
 var VideoJobsTopics = []string{PrepareJobsTopic, ASRJobsTopic, VisionJobsTopic, RAGIndexJobsTopic, SummaryJobsTopic}
@@ -25,6 +30,13 @@ type VideoJobMessage struct {
 	VideoID  string `json:"video_id"`
 	TaskType string `json:"task_type"`
 	Attempt  int    `json:"attempt"`
+	// UploadMethod 仅描述源文件的进入方式，用于确定 prepare 是否为前置阶段。
+	UploadMethod string `json:"upload_method"`
+}
+
+// IsUploadMethod 用于在消费前拒绝缺失或未知的上传方式，避免错误地跳过前置任务。
+func IsUploadMethod(method string) bool {
+	return method == UploadMethodLocalDirect || method == UploadMethodURL
 }
 
 // Producer 是供 HTTP 处理器使用的轻量 Kafka 封装。
@@ -39,7 +51,7 @@ func NewProducer(brokers []string) (*Producer, error) {
 // Close 在优雅关闭时刷新并释放 Kafka 生产者。
 func (p *Producer) Close() error { return p.client.Close() }
 
-// Publish 序列化任务，并以视频 ID 作为 Key 以尽量维持同视频任务的顺序。
+// Publish 投递任务。
 func (p *Producer) Publish(ctx context.Context, m VideoJobMessage) error {
 	b, e := json.Marshal(m)
 	if e != nil {
@@ -49,6 +61,7 @@ func (p *Producer) Publish(ctx context.Context, m VideoJobMessage) error {
 	if e != nil {
 		return e
 	}
+	// 使用video_id作为key确保同一个视频能进入同一个分区，保证任务的处理顺序
 	_, _, e = p.client.SendMessage(&sarama.ProducerMessage{Topic: topic, Key: sarama.StringEncoder(m.VideoID), Value: sarama.ByteEncoder(b)})
 	return e
 }

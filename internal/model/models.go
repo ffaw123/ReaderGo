@@ -20,8 +20,6 @@ const (
 	TaskSummary  = "summary"
 )
 
-var RequiredTaskTypes = []string{TaskPrepare, TaskASR, TaskVision, TaskRAGIndex, TaskSummary}
-
 // User 同时表示登录身份和第一版中的租户隔离边界。
 type User struct {
 	ID           string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`

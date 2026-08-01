@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"github.com/IBM/sarama"
 	"log"
 	"os"
 	"os/signal"
@@ -11,6 +10,8 @@ import (
 	"readergo/internal/queue"
 	"readergo/internal/worker"
 	"syscall"
+
+	"github.com/IBM/sarama"
 )
 
 func main() {
@@ -29,6 +30,7 @@ func main() {
 	}
 	log.Println("database connected")
 
+	// 这里创建的生产者是给worker用的，任务完成 → 投递下一阶段任务（流水线接力）。
 	jobs, e := queue.NewProducer(c.Brokers())
 	if e != nil {
 		log.Fatal(e)

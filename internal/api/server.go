@@ -244,9 +244,12 @@ func (s *Server) completeUpload(c *gin.Context) {
 		return
 	}
 
-	// 只有对象已完成后才创建任务，Worker 才能读取完整视频而不是临时分片。
+	// 直传对象已完成，Worker 可直接读取完整视频，因此从 ASR 与 Vision 两个阶段并行开始。
 	var video model.Video
-	job := model.ProcessingJob{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: model.TaskPrepare, Status: model.JobStatusPending, Attempt: 1}
+	jobs := []model.ProcessingJob{
+		{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: model.TaskASR, Status: model.JobStatusPending, Attempt: 1},
+		{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: model.TaskVision, Status: model.JobStatusPending, Attempt: 1},
+	}
 	if e := s.db.Transaction(func(tx *gorm.DB) error {
 		if e := tx.Where("id = ? AND tenant_id = ?", session.ID, auth.UserID(c)).First(&session).Error; e != nil {
 			return e
@@ -263,26 +266,28 @@ func (s *Server) completeUpload(c *gin.Context) {
 		if e := tx.Model(&video).Updates(map[string]any{"status": model.VideoStatusProcessing, "error_message": ""}).Error; e != nil {
 			return e
 		}
-		return tx.Create(&job).Error
+		return tx.Create(&jobs).Error
 	}); e != nil {
 		fail(c, e)
 		return
 	}
 
-	if e := s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID, TaskType: job.TaskType, Attempt: job.Attempt}); e != nil {
-		_ = s.db.Transaction(func(tx *gorm.DB) error {
-			if e := tx.Model(&job).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error; e != nil {
-				return e
-			}
-			return tx.Model(&video).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error
-		})
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not queue processing job"})
-		return
+	for _, job := range jobs {
+		if e := s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID, TaskType: job.TaskType, Attempt: job.Attempt, UploadMethod: queue.UploadMethodLocalDirect}); e != nil {
+			_ = s.db.Transaction(func(tx *gorm.DB) error {
+				if e := tx.Model(&model.ProcessingJob{}).Where("video_id = ? AND task_type IN ?", video.ID, []string{model.TaskASR, model.TaskVision}).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error; e != nil {
+					return e
+				}
+				return tx.Model(&video).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error
+			})
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not queue processing job"})
+			return
+		}
 	}
 
 	video.Status = model.VideoStatusProcessing
 	video.ErrorMessage = ""
-	c.JSON(http.StatusCreated, gin.H{"video": video, "job_id": job.ID})
+	c.JSON(http.StatusCreated, gin.H{"video": video, "job_id": jobs[0].ID})
 }
 
 func (s *Server) presignParts(ctx context.Context, session model.UploadSession, numbers []int) ([]uploadPartURL, error) {
@@ -419,7 +424,7 @@ func (s *Server) createVideo(c *gin.Context) {
 		return
 	}
 	tenant := auth.UserID(c)
-	v := model.Video{TenantID: tenant, SourceURL: in.SourceURL, Title: in.Title, Status: model.VideoStatusProcessing}
+	v := model.Video{TenantID: tenant, SourceURL: in.SourceURL, Title: in.Title, Status: model.VideoStatusUploading}
 	if e = s.db.Create(&v).Error; e != nil {
 		fail(c, e)
 		return
@@ -429,7 +434,7 @@ func (s *Server) createVideo(c *gin.Context) {
 		fail(c, e)
 		return
 	}
-	if e = s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: j.ID, TenantID: tenant, VideoID: v.ID, TaskType: j.TaskType, Attempt: j.Attempt}); e != nil {
+	if e = s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: j.ID, TenantID: tenant, VideoID: v.ID, TaskType: j.TaskType, Attempt: j.Attempt, UploadMethod: queue.UploadMethodURL}); e != nil {
 		// 生产消息失败时将持久化状态标为失败，避免任务长期卡在 pending。
 		_ = s.db.Model(&j).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error
 		_ = s.db.Model(&v).Update("status", "failed").Error
