@@ -58,7 +58,7 @@ func (x *Consumer) run(ctx context.Context, message queue.VideoJobMessage) error
 	if job.Status == model.JobStatusSucceeded {
 		return nil
 	}
-	if job.TaskType != message.TaskType || job.VideoID != message.VideoID || job.PipelineVersion != message.PipelineVersion {
+	if job.TaskType != message.TaskType || job.VideoID != message.VideoID {
 		return fmt.Errorf("job message does not match persisted job %s", job.ID)
 	}
 	if ready, err := x.prerequisitesSatisfied(&job); err != nil {
@@ -89,12 +89,12 @@ func (x *Consumer) run(ctx context.Context, message queue.VideoJobMessage) error
 		if err != nil {
 			return err
 		}
-		return x.reconcileVideoStatus(tx, job.VideoID, job.PipelineVersion)
+		return x.reconcileVideoStatus(tx, job.VideoID)
 	}); err != nil {
 		return err
 	}
 	for _, nextJob := range next {
-		if err := x.jobs.Publish(ctx, queue.VideoJobMessage{JobID: nextJob.ID, TenantID: nextJob.TenantID, VideoID: nextJob.VideoID, TaskType: nextJob.TaskType, Attempt: nextJob.Attempt, PipelineVersion: nextJob.PipelineVersion}); err != nil {
+		if err := x.jobs.Publish(ctx, queue.VideoJobMessage{JobID: nextJob.ID, TenantID: nextJob.TenantID, VideoID: nextJob.VideoID, TaskType: nextJob.TaskType, Attempt: nextJob.Attempt}); err != nil {
 			_ = x.markJobFailed(nextJob, err.Error())
 			return err
 		}
@@ -116,7 +116,7 @@ func (x *Consumer) prerequisitesSatisfied(job *model.ProcessingJob) (bool, error
 	}
 	var count int64
 	err := x.db.Model(&model.ProcessingJob{}).
-		Where("video_id = ? AND pipeline_version = ? AND task_type IN ? AND status = ?", job.VideoID, job.PipelineVersion, prerequisiteTypes, model.JobStatusSucceeded).
+		Where("video_id = ? AND task_type IN ? AND status = ?", job.VideoID, prerequisiteTypes, model.JobStatusSucceeded).
 		Count(&count).Error
 	return count == int64(len(prerequisiteTypes)), err
 }
@@ -129,7 +129,7 @@ func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([
 	case model.TaskASR, model.TaskVision:
 		var completeCount int64
 		if err := tx.Model(&model.ProcessingJob{}).
-			Where("video_id = ? AND pipeline_version = ? AND task_type IN ? AND status = ?", completed.VideoID, completed.PipelineVersion, []string{model.TaskASR, model.TaskVision}, model.JobStatusSucceeded).
+			Where("video_id = ? AND task_type IN ? AND status = ?", completed.VideoID, []string{model.TaskASR, model.TaskVision}, model.JobStatusSucceeded).
 			Count(&completeCount).Error; err != nil {
 			return nil, err
 		}
@@ -140,9 +140,9 @@ func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([
 
 	next := make([]model.ProcessingJob, 0, len(taskTypes))
 	for _, taskType := range taskTypes {
-		candidate := model.ProcessingJob{TenantID: completed.TenantID, VideoID: completed.VideoID, TaskType: taskType, PipelineVersion: completed.PipelineVersion, Attempt: 1, Status: model.JobStatusPending}
+		candidate := model.ProcessingJob{TenantID: completed.TenantID, VideoID: completed.VideoID, TaskType: taskType, Attempt: 1, Status: model.JobStatusPending}
 		result := tx.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "video_id"}, {Name: "task_type"}, {Name: "pipeline_version"}},
+			Columns:   []clause.Column{{Name: "video_id"}, {Name: "task_type"}},
 			DoNothing: true,
 		}).Create(&candidate)
 		if result.Error != nil {
@@ -156,9 +156,9 @@ func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([
 }
 
 // reconcileVideoStatus is the only coordinator that derives videos.status from task states.
-func (x *Consumer) reconcileVideoStatus(tx *gorm.DB, videoID string, pipelineVersion int) error {
+func (x *Consumer) reconcileVideoStatus(tx *gorm.DB, videoID string) error {
 	var jobs []model.ProcessingJob
-	if err := tx.Where("video_id = ? AND pipeline_version = ?", videoID, pipelineVersion).Find(&jobs).Error; err != nil {
+	if err := tx.Where("video_id = ?", videoID).Find(&jobs).Error; err != nil {
 		return err
 	}
 	statuses := make(map[string]string, len(jobs))
@@ -181,7 +181,7 @@ func (x *Consumer) markJobFailed(job model.ProcessingJob, message string) error 
 		if err := tx.Model(&job).Updates(map[string]any{"status": model.JobStatusFailed, "error_message": message}).Error; err != nil {
 			return err
 		}
-		return x.reconcileVideoStatus(tx, job.VideoID, job.PipelineVersion)
+		return x.reconcileVideoStatus(tx, job.VideoID)
 	})
 }
 

@@ -49,16 +49,15 @@ type Video struct {
 
 // ProcessingJob 记录由 Kafka 分发的处理任务及其重试次数。
 type ProcessingJob struct {
-	ID              string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	TenantID        string    `gorm:"type:uuid;not null" json:"-"`
-	VideoID         string    `gorm:"type:uuid;not null" json:"video_id"`
-	TaskType        string    `json:"task_type"`
-	PipelineVersion int       `json:"pipeline_version"`
-	Attempt         int       `json:"attempt"`
-	Status          string    `json:"status"`
-	ErrorMessage    string    `json:"error_message,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID           string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID     string    `gorm:"type:uuid;not null" json:"-"`
+	VideoID      string    `gorm:"type:uuid;not null" json:"video_id"`
+	TaskType     string    `json:"task_type"`
+	Attempt      int       `json:"attempt"`
+	Status       string    `json:"status"`
+	ErrorMessage string    `json:"error_message,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type UploadSession struct {

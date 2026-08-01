@@ -246,7 +246,7 @@ func (s *Server) completeUpload(c *gin.Context) {
 
 	// 只有对象已完成后才创建任务，Worker 才能读取完整视频而不是临时分片。
 	var video model.Video
-	job := model.ProcessingJob{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: model.TaskPrepare, PipelineVersion: 1, Status: model.JobStatusPending, Attempt: 1}
+	job := model.ProcessingJob{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: model.TaskPrepare, Status: model.JobStatusPending, Attempt: 1}
 	if e := s.db.Transaction(func(tx *gorm.DB) error {
 		if e := tx.Where("id = ? AND tenant_id = ?", session.ID, auth.UserID(c)).First(&session).Error; e != nil {
 			return e
@@ -269,7 +269,7 @@ func (s *Server) completeUpload(c *gin.Context) {
 		return
 	}
 
-	if e := s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID, TaskType: job.TaskType, Attempt: job.Attempt, PipelineVersion: job.PipelineVersion}); e != nil {
+	if e := s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID, TaskType: job.TaskType, Attempt: job.Attempt}); e != nil {
 		_ = s.db.Transaction(func(tx *gorm.DB) error {
 			if e := tx.Model(&job).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error; e != nil {
 				return e
@@ -424,12 +424,12 @@ func (s *Server) createVideo(c *gin.Context) {
 		fail(c, e)
 		return
 	}
-	j := model.ProcessingJob{TenantID: tenant, VideoID: v.ID, TaskType: model.TaskPrepare, PipelineVersion: 1, Status: model.JobStatusPending, Attempt: 1}
+	j := model.ProcessingJob{TenantID: tenant, VideoID: v.ID, TaskType: model.TaskPrepare, Status: model.JobStatusPending, Attempt: 1}
 	if e = s.db.Create(&j).Error; e != nil {
 		fail(c, e)
 		return
 	}
-	if e = s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: j.ID, TenantID: tenant, VideoID: v.ID, TaskType: j.TaskType, Attempt: j.Attempt, PipelineVersion: j.PipelineVersion}); e != nil {
+	if e = s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: j.ID, TenantID: tenant, VideoID: v.ID, TaskType: j.TaskType, Attempt: j.Attempt}); e != nil {
 		// 生产消息失败时将持久化状态标为失败，避免任务长期卡在 pending。
 		_ = s.db.Model(&j).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error
 		_ = s.db.Model(&v).Update("status", "failed").Error
@@ -468,7 +468,7 @@ func (s *Server) videoStatus(c *gin.Context) {
 		return
 	}
 	var jobs []model.ProcessingJob
-	result := s.db.Select("DISTINCT ON (task_type) *").Where("video_id = ?", v.ID).Order("task_type, pipeline_version DESC").Find(&jobs)
+	result := s.db.Where("video_id = ?", v.ID).Order("task_type").Find(&jobs)
 	if result.Error != nil {
 		fail(c, result.Error)
 		return

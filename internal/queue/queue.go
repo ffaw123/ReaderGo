@@ -20,12 +20,11 @@ var VideoJobsTopics = []string{PrepareJobsTopic, ASRJobsTopic, VisionJobsTopic, 
 
 // VideoJobMessage 包含定位并处理一个视频任务所需的最小信息。
 type VideoJobMessage struct {
-	JobID           string `json:"job_id"`
-	TenantID        string `json:"tenant_id"`
-	VideoID         string `json:"video_id"`
-	TaskType        string `json:"task_type"`
-	Attempt         int    `json:"attempt"`
-	PipelineVersion int    `json:"pipeline_version"`
+	JobID    string `json:"job_id"`
+	TenantID string `json:"tenant_id"`
+	VideoID  string `json:"video_id"`
+	TaskType string `json:"task_type"`
+	Attempt  int    `json:"attempt"`
 }
 
 // Producer 是供 HTTP 处理器使用的轻量 Kafka 封装。

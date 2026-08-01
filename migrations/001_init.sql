@@ -36,14 +36,13 @@ CREATE TABLE processing_jobs (
   tenant_id uuid NOT NULL REFERENCES users(id), 
   video_id uuid NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
   task_type text NOT NULL CHECK (task_type IN ('prepare','asr','vision','rag_index','summary')),
-  pipeline_version integer NOT NULL DEFAULT 1 CHECK (pipeline_version > 0),
   attempt integer NOT NULL DEFAULT 1, 
   status job_status NOT NULL DEFAULT 'pending', 
   error_message text NOT NULL DEFAULT '', 
   created_at timestamptz NOT NULL DEFAULT now(), 
   updated_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX processing_jobs_video_task_pipeline_idx ON processing_jobs(video_id, task_type, pipeline_version);
+CREATE UNIQUE INDEX processing_jobs_video_task_idx ON processing_jobs(video_id, task_type);
 -- 每个视频只有一个最终摘要。
 CREATE TABLE video_summaries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 

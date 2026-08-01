@@ -89,7 +89,6 @@
         "properties": {
           "id":            { "type": "string", "format": "uuid" },
           "task_type":     { "type": "string", "enum": ["prepare","asr","vision","rag_index","summary"] },
-          "pipeline_version": { "type": "integer", "minimum": 1 },
           "attempt":       { "type": "integer" },
           "status":        { "type": "string", "enum": ["pending","running","succeeded","failed"] },
           "error_message": { "type": "string" },
@@ -139,7 +138,7 @@
           "error_message":  { "type": "string" },
           "jobs": {
             "type": "array",
-            "description": "仅在 details=true 时返回；每个任务类型的最新任务。",
+            "description": "仅在 details=true 时返回；各阶段的任务详情。",
             "items": { "$ref": "#/components/schemas/ProcessingJob" }
           }
         }
@@ -441,7 +440,7 @@
       "get": {
         "tags": ["Videos"],
         "summary": "查询视频处理状态",
-        "description": "默认仅返回视频总体状态；传入 details=true 时返回每个任务类型的最新任务详情。",
+        "description": "默认仅返回视频总体状态；传入 details=true 时返回各阶段任务详情。",
         "operationId": "getVideoStatus",
         "security": [{ "BearerAuth": [] }],
         "parameters": [
