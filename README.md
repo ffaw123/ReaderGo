@@ -18,8 +18,8 @@ ReaderGo/
 │
 ├── batch/
 │   ├── start.bat                   ← Windows 一键启动 Docker、API、Worker 和前端
-│   ├── stop.bat                    ← 停止 Docker 服务，保留数据卷
-│   └── stop-and-remove-data.bat    ← 停止 Docker 服务并删除数据卷
+│   ├── stop.bat                    ← 停止 Docker 与项目服务，保留数据卷
+│   └── stop-v.bat                  ← 停止 Docker 与项目服务并删除数据卷
 ├── docker/
 │   └── minio-cors.json             ← MinIO 浏览器直传的 CORS 配置
 ├── docs/

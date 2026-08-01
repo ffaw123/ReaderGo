@@ -3,6 +3,10 @@ setlocal
 
 pushd "%~dp0.."
 set "PROJECT_ROOT=%CD%"
+set "RUNTIME_DIR=%TEMP%\ReaderGo"
+
+if not exist "%RUNTIME_DIR%" mkdir "%RUNTIME_DIR%"
+del /q "%RUNTIME_DIR%\api.pid" "%RUNTIME_DIR%\worker.pid" "%RUNTIME_DIR%\web.pid" 2>nul
 
 echo Starting Docker services...
 docker compose up -d
@@ -26,9 +30,14 @@ if not exist "%PROJECT_ROOT%\web\node_modules\" (
 )
 
 echo Starting ReaderGo API, Worker, and web client in separate terminals...
-start "ReaderGo API" /D "%PROJECT_ROOT%" powershell.exe -NoExit -Command "$Host.UI.RawUI.WindowTitle = 'ReaderGo API'; go run ./cmd/api"
-start "ReaderGo Worker" /D "%PROJECT_ROOT%" powershell.exe -NoExit -Command "$Host.UI.RawUI.WindowTitle = 'ReaderGo Worker'; go run ./cmd/worker"
-start "ReaderGo Web" /D "%PROJECT_ROOT%\web" powershell.exe -NoExit -Command "$Host.UI.RawUI.WindowTitle = 'ReaderGo Web'; npm run dev"
+call :start_service "%PROJECT_ROOT%" "go run ./cmd/api" "%RUNTIME_DIR%\api.pid"
+call :start_service "%PROJECT_ROOT%" "go run ./cmd/worker" "%RUNTIME_DIR%\worker.pid"
+call :start_service "%PROJECT_ROOT%\web" "npm run dev" "%RUNTIME_DIR%\web.pid"
 
 popd
 endlocal
+exit /b
+
+:start_service
+powershell.exe -NoProfile -Command "$process = Start-Process -FilePath 'powershell.exe' -WorkingDirectory '%~1' -ArgumentList '-NoExit', '-Command', '%~2' -PassThru; Set-Content -Path '%~3' -Value $process.Id"
+exit /b
