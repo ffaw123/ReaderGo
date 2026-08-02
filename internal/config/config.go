@@ -17,6 +17,8 @@ type Config struct {
 	MinIOEndpoint, MinIOAccessKey, MinIOSecretKey  string
 	MinIOBucket                                    string
 	MinIOSecure                                    bool
+	// FFmpegPath 是 FFmpeg 可执行文件路径；Worker 启动时会校验它及同目录的 ffprobe。
+	FFmpegPath string
 	// UploadPartSizeMiB 限制为 16-64 MiB，以平衡重试成本和请求数量。
 	UploadPartSizeMiB, UploadURLTTLMinutes int
 }
@@ -24,7 +26,7 @@ type Config struct {
 // Load 优先加载本地 .env，再校验生产环境必填配置。
 func Load() (Config, error) {
 	_ = godotenv.Load()
-	c := Config{HTTPAddr: value("HTTP_ADDR", ":8080"), DatabaseURL: os.Getenv("DATABASE_URL"), KafkaBrokers: value("KAFKA_BROKERS", "localhost:9092"), JWTSecret: os.Getenv("JWT_SECRET"), JWTTTLHours: intValue("JWT_TTL_HOURS", 24), MinIOEndpoint: os.Getenv("MINIO_ENDPOINT"), MinIOAccessKey: os.Getenv("MINIO_ACCESS_KEY"), MinIOSecretKey: os.Getenv("MINIO_SECRET_KEY"), MinIOBucket: value("MINIO_BUCKET", "videos"), MinIOSecure: boolValue("MINIO_SECURE", false), UploadPartSizeMiB: intValue("UPLOAD_PART_SIZE_MIB", 32), UploadURLTTLMinutes: intValue("UPLOAD_URL_TTL_MINUTES", 15)}
+	c := Config{HTTPAddr: value("HTTP_ADDR", ":8080"), DatabaseURL: os.Getenv("DATABASE_URL"), KafkaBrokers: value("KAFKA_BROKERS", "localhost:9092"), JWTSecret: os.Getenv("JWT_SECRET"), JWTTTLHours: intValue("JWT_TTL_HOURS", 24), MinIOEndpoint: os.Getenv("MINIO_ENDPOINT"), MinIOAccessKey: os.Getenv("MINIO_ACCESS_KEY"), MinIOSecretKey: os.Getenv("MINIO_SECRET_KEY"), MinIOBucket: value("MINIO_BUCKET", "videos"), MinIOSecure: boolValue("MINIO_SECURE", false), FFmpegPath: value("FFMPEG_PATH", "ffmpeg"), UploadPartSizeMiB: intValue("UPLOAD_PART_SIZE_MIB", 32), UploadURLTTLMinutes: intValue("UPLOAD_URL_TTL_MINUTES", 15)}
 	if c.DatabaseURL == "" || len(c.JWTSecret) < 32 || c.MinIOEndpoint == "" || c.MinIOAccessKey == "" || c.MinIOSecretKey == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL, MinIO credentials, and a JWT_SECRET of at least 32 characters are required")
 	}

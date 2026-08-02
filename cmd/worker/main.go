@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"readergo/internal/config"
 	"readergo/internal/db"
+	"readergo/internal/media"
 	"readergo/internal/queue"
 	"readergo/internal/worker"
 	"syscall"
@@ -23,6 +24,15 @@ func main() {
 		log.Fatal(e)
 	}
 	log.Printf("config loaded, brokers=%v", c.Brokers())
+	// Worker 启动时尽早验证媒体工具，避免 Kafka 任务开始消费后才发现本机缺少 FFmpeg。
+	ffmpeg, e := media.NewFFmpeg(c.FFmpegPath)
+	if e != nil {
+		log.Fatal(e)
+	}
+	if e := ffmpeg.Validate(context.Background()); e != nil {
+		log.Fatal(e)
+	}
+	log.Printf("ffmpeg ready: %s", ffmpeg.Path())
 
 	d, e := db.Open(c.DatabaseURL)
 	if e != nil {
