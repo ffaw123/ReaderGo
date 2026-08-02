@@ -90,11 +90,8 @@ func NewASRProcessor(db *gorm.DB, ffmpeg *media.FFmpeg, minIOEndpoint, minIOAcce
 	}, nil
 }
 
-// Process 根据任务类型路由处理；ASR 以外阶段在后续逐步替换为各自 Processor。
+// Process 实现 Processor 接口，路由器已按 TaskType 过滤，此处直接执行 ASR。
 func (p *ASRProcessor) Process(ctx context.Context, job queue.VideoJobMessage) error {
-	if job.TaskType != model.TaskASR {
-		return PlaceholderProcessor{}.Process(ctx, job)
-	}
 	return p.consumeASR(ctx, job)
 }
 
