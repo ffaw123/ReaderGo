@@ -39,6 +39,11 @@ func main() {
 		log.Fatal(e)
 	}
 	log.Println("database connected")
+	// ASR Processor 自己管理对象下载、音频提取、转写及带时间戳的结果落库。
+	asrProcessor, e := worker.NewASRProcessor(d, ffmpeg, c.MinIOEndpoint, c.MinIOAccessKey, c.MinIOSecretKey, c.MinIOSecure, c.MinIOBucket, c.ASRBaseURL, c.ASRAPIKey, c.ASRModel, c.ASRConcurrency)
+	if e != nil {
+		log.Fatal(e)
+	}
 
 	// 这里创建的生产者是给worker用的，任务完成 → 投递下一阶段任务（流水线接力）。
 	jobs, e := queue.NewProducer(c.Brokers())
@@ -67,7 +72,7 @@ func main() {
 
 	// Consumer Group 重平衡后需要再次调用 Consume，因此在未退出时循环运行。
 	for ctx.Err() == nil {
-		if e := group.Consume(ctx, queue.VideoJobsTopics, worker.New(d, worker.PlaceholderProcessor{}, jobs)); e != nil && ctx.Err() == nil {
+		if e := group.Consume(ctx, queue.VideoJobsTopics, worker.New(d, asrProcessor, jobs)); e != nil && ctx.Err() == nil {
 			log.Printf("consumer error: %v", e)
 		}
 	}

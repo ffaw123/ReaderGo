@@ -27,7 +27,8 @@ ReaderGo/
 │   └── kafka设计方案_v1.md         ← Kafka 异步处理与状态管理设计
 ├── migrations/
 │   ├── 001_init.sql                ← 核心表、状态枚举与 pgvector 初始化
-│   └── 002_upload_sessions.sql     ← 本地分片上传会话表
+│   ├── 002_upload_sessions.sql     ← 本地分片上传会话表
+│   └── 003_asr_segments.sql        ← ASR 原始转写片段表
 │
 ├── cmd/                            ← 可独立启动的应用入口
 │   ├── api/main.go                 ← HTTP API 服务入口-有自己的生产者实例

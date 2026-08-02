@@ -24,6 +24,20 @@ func TestFFmpegTimestampUsesMilliseconds(t *testing.T) {
 	}
 }
 
+func TestParseSilenceIntervals(t *testing.T) {
+	output := "silence_start: 8.75\nsilence_end: 9.25 | silence_duration: 0.5\nsilence_start: 19.6\n"
+	got := parseSilenceIntervals(output, 20*time.Second)
+	want := []SilenceInterval{{StartMS: 8750, EndMS: 9250}, {StartMS: 19600, EndMS: 20000}}
+	if len(got) != len(want) {
+		t.Fatalf("interval count = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("interval %d = %#v, want %#v", i, got[i], want[i])
+		}
+	}
+}
+
 // TestFFmpegSmoke 会在显式设置 FFMPEG_SMOKE_PATH 后验证本机工具的完整调用链。
 // 默认跳过，保证 CI 不需要预装 FFmpeg；本地可借此验证实际安装路径。
 func TestFFmpegSmoke(t *testing.T) {

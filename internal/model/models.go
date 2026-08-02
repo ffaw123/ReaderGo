@@ -58,6 +58,21 @@ type ProcessingJob struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
+// ASRSegment 保存 ASR 阶段的原始转写结果，不等同于最终的 RAG 检索片段。
+// start_ms 与 end_ms 均相对视频起点，使用 [start_ms, end_ms) 左闭右开区间。
+type ASRSegment struct {
+	ID         string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID   string    `gorm:"type:uuid;not null;index" json:"-"`
+	VideoID    string    `gorm:"type:uuid;not null;index" json:"video_id"`
+	StartMS    int64     `gorm:"not null" json:"start_ms"`
+	EndMS      int64     `gorm:"not null" json:"end_ms"`
+	Transcript string    `gorm:"not null" json:"transcript"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// TableName 显式指定原始转写表，避免和 RAG 最终使用的 video_segments 混淆。
+func (ASRSegment) TableName() string { return "asr_segments" }
+
 type UploadSession struct {
 	ID        string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	TenantID  string    `gorm:"type:uuid;not null;index" json:"-"`
