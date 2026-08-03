@@ -40,12 +40,16 @@ func main() {
 	}
 	log.Println("database connected")
 
-	// 构建各个阶段 Processor；当前仅接入 ASR，后续依次创建 Vision / RAG / Summary。
+	// 构建各阶段 Processor；OCR 沿用现有 vision 任务类型，由 Router 统一分发。
 	asrProcessor, e := worker.NewASRProcessor(d, ffmpeg, c.MinIOEndpoint, c.MinIOAccessKey, c.MinIOSecretKey, c.MinIOSecure, c.MinIOBucket, c.ASRBaseURL, c.ASRAPIKey, c.ASRModel, c.ASRConcurrency)
 	if e != nil {
 		log.Fatal(e)
 	}
-	router := worker.NewRouterProcessor(asrProcessor)
+	ocrProcessor, e := worker.NewOCRProcessor(d, ffmpeg, c.MinIOEndpoint, c.MinIOAccessKey, c.MinIOSecretKey, c.MinIOSecure, c.MinIOBucket, c.OCRBaseURL, c.OCRMinConfidence, c.OCRSceneThreshold, c.OCRHashDistance, c.OCRConcurrency)
+	if e != nil {
+		log.Fatal(e)
+	}
+	router := worker.NewRouterProcessor(asrProcessor, ocrProcessor)
 
 	// 这里创建的生产者是给worker用的，任务完成 → 投递下一阶段任务（流水线接力）。
 	jobs, e := queue.NewProducer(c.Brokers())

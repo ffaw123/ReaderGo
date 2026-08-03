@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +33,12 @@ type MediaInfo struct {
 	Height     int
 	VideoCodec string
 	AudioCodec string
+}
+
+// FrameSample 表示一次抽帧输出及其在原视频时间轴上的毫秒位置。
+type FrameSample struct {
+	TimestampMS int64
+	Path        string
 }
 
 // NewFFmpeg 创建 FFmpeg 工具，并校验 ffmpeg 与 ffprobe 是否可以定位。
@@ -172,6 +180,105 @@ func (f *FFmpeg) ExtractFramesEvery(ctx context.Context, inputPath, outputPatter
 		return fmt.Errorf("extract frames from %q: %w", inputPath, err)
 	}
 	return nil
+}
+
+var scenePTSRegex = regexp.MustCompile(`pts_time:([0-9]+(?:\.[0-9]+)?)`)
+
+// DetectSceneChanges 使用 FFmpeg 的 scene score 找出画面明显变化的时间点。
+// 返回值统一换算成相对视频起点的毫秒，供调用方与固定采样时间合并。
+func (f *FFmpeg) DetectSceneChanges(ctx context.Context, inputPath string, threshold float64) ([]int64, error) {
+	if threshold <= 0 || threshold > 1 {
+		return nil, fmt.Errorf("scene threshold must be greater than 0 and at most 1")
+	}
+	filter := fmt.Sprintf("select=gt(scene\\,%s),showinfo", strconv.FormatFloat(threshold, 'f', -1, 64))
+	output, err := f.run(ctx, f.path, "-nostdin", "-i", inputPath, "-an", "-vf", filter, "-f", "null", "-")
+	if err != nil {
+		return nil, fmt.Errorf("detect scene changes in %q: %w", inputPath, err)
+	}
+	return parseSceneChangeTimestamps(string(output)), nil
+}
+
+// ExtractOCRFrames 在一次视频解码中同时完成固定间隔抽帧和场景变化抽帧。
+// 相比逐个时间点启动 FFmpeg，该方式不会为后段采样帧反复解码视频前半部分。
+func (f *FFmpeg) ExtractOCRFrames(ctx context.Context, inputPath, outputDir string, duration, interval time.Duration, sceneThreshold float64) ([]FrameSample, error) {
+	if duration <= 0 || interval <= 0 {
+		return nil, fmt.Errorf("OCR frame duration and interval must be positive")
+	}
+	if sceneThreshold <= 0 || sceneThreshold > 1 {
+		return nil, fmt.Errorf("scene threshold must be greater than 0 and at most 1")
+	}
+
+	fixedPattern := filepath.Join(outputDir, "fixed-%06d.jpg")
+	scenePattern := filepath.Join(outputDir, "scene-%06d.jpg")
+	intervalSeconds := strconv.FormatFloat(interval.Seconds(), 'f', -1, 64)
+	threshold := strconv.FormatFloat(sceneThreshold, 'f', -1, 64)
+	// 场景分支始终输出首帧，避免“无场景变化”时 image2 编码器因零帧输入失败；重复首帧稍后由感知哈希去除。
+	filter := fmt.Sprintf("[0:v]split=2[fixed_src][scene_src];[fixed_src]fps=1/%s:start_time=0:eof_action=pass,showinfo@fixed[fixed];[scene_src]select=eq(n\\,0)+gt(scene\\,%s),showinfo@scene[scene]", intervalSeconds, threshold)
+	output, err := f.run(ctx, f.path,
+		"-nostdin", "-y", "-i", inputPath,
+		"-filter_complex", filter,
+		"-map", "[fixed]", "-fps_mode", "vfr", "-q:v", "2", "-start_number", "0", fixedPattern,
+		"-map", "[scene]", "-fps_mode", "vfr", "-q:v", "2", "-start_number", "0", scenePattern,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("extract OCR frames from %q: %w", inputPath, err)
+	}
+
+	fixedTimestamps := parseNamedShowInfoTimestamps(string(output), "showinfo@fixed")
+	sceneTimestamps := parseNamedShowInfoTimestamps(string(output), "showinfo@scene")
+	frames := make([]FrameSample, 0, len(fixedTimestamps)+len(sceneTimestamps))
+	for index, timestamp := range fixedTimestamps {
+		if timestamp < 0 || timestamp >= duration.Milliseconds() {
+			continue
+		}
+		path := filepath.Join(outputDir, fmt.Sprintf("fixed-%06d.jpg", index))
+		if _, err := os.Stat(path); err != nil {
+			return nil, fmt.Errorf("locate fixed OCR frame at %d ms: %w", timestamp, err)
+		}
+		frames = append(frames, FrameSample{TimestampMS: timestamp, Path: path})
+	}
+	for index, timestamp := range sceneTimestamps {
+		if timestamp < 0 || timestamp >= duration.Milliseconds() {
+			continue
+		}
+		path := filepath.Join(outputDir, fmt.Sprintf("scene-%06d.jpg", index))
+		if _, err := os.Stat(path); err != nil {
+			return nil, fmt.Errorf("locate scene OCR frame at %d ms: %w", timestamp, err)
+		}
+		frames = append(frames, FrameSample{TimestampMS: timestamp, Path: path})
+	}
+	sort.Slice(frames, func(i, j int) bool { return frames[i].TimestampMS < frames[j].TimestampMS })
+	return frames, nil
+}
+
+func parseNamedShowInfoTimestamps(output, filterName string) []int64 {
+	var timestamps []int64
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(line, filterName) {
+			continue
+		}
+		match := scenePTSRegex.FindStringSubmatch(line)
+		if len(match) != 2 {
+			continue
+		}
+		seconds, err := strconv.ParseFloat(match[1], 64)
+		if err == nil {
+			timestamps = append(timestamps, int64(math.Round(seconds*1000)))
+		}
+	}
+	return timestamps
+}
+
+func parseSceneChangeTimestamps(output string) []int64 {
+	matches := scenePTSRegex.FindAllStringSubmatch(output, -1)
+	timestamps := make([]int64, 0, len(matches))
+	for _, match := range matches {
+		seconds, err := strconv.ParseFloat(match[1], 64)
+		if err == nil {
+			timestamps = append(timestamps, int64(math.Round(seconds*1000)))
+		}
+	}
+	return timestamps
 }
 
 func (f *FFmpeg) run(ctx context.Context, executable string, args ...string) ([]byte, error) {

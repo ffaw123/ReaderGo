@@ -24,6 +24,21 @@ func TestFFmpegTimestampUsesMilliseconds(t *testing.T) {
 	}
 }
 
+func TestParseSceneChangeTimestamps(t *testing.T) {
+	output := "[Parsed_showinfo_1] n:0 pts:15360 pts_time:1.024 duration:512\n" +
+		"[Parsed_showinfo_1] n:1 pts:45675 pts_time:3.045 duration:512\n"
+	want := []int64{1024, 3045}
+	got := parseSceneChangeTimestamps(output)
+	if len(got) != len(want) {
+		t.Fatalf("timestamps = %#v, want %#v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Errorf("timestamp %d = %d, want %d", index, got[index], want[index])
+		}
+	}
+}
+
 // TestFFmpegSmoke 会在显式设置 FFMPEG_SMOKE_PATH 后验证本机工具的完整调用链。
 // 默认跳过，保证 CI 不需要预装 FFmpeg；本地可借此验证实际安装路径。
 func TestFFmpegSmoke(t *testing.T) {
@@ -68,5 +83,17 @@ func TestFFmpegSmoke(t *testing.T) {
 		if err != nil || fileInfo.Size() == 0 {
 			t.Fatalf("expected non-empty media output %q, err=%v", output, err)
 		}
+	}
+	ocrDir := filepath.Join(dir, "ocr-frames")
+	if err := os.Mkdir(ocrDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 验证固定采样与场景采样可以在同一个 FFmpeg 进程中完成。
+	frames, err := tool.ExtractOCRFrames(ctx, input, ocrDir, time.Duration(info.DurationMS)*time.Millisecond, 500*time.Millisecond, 0.99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) < 2 || frames[0].TimestampMS != 0 {
+		t.Fatalf("unexpected OCR frames: %#v", frames)
 	}
 }

@@ -13,13 +13,16 @@ type RouterProcessor struct {
 }
 
 // NewRouterProcessor 创建路由器，参数按需传入已初始化的 Processor。
-// 当前仅接入 ASR，后续依次添加 Vision、RAGIndex、Summary 即可。
-func NewRouterProcessor(asr *ASRProcessor) *RouterProcessor {
+// OCRProcessor 沿用现有 TaskVision 路由键，保持 Kafka topic、数据库任务类型和协调逻辑兼容。
+func NewRouterProcessor(asr *ASRProcessor, ocr *OCRProcessor) *RouterProcessor {
 	r := &RouterProcessor{
 		processors: make(map[string]Processor),
 	}
 	if asr != nil {
 		r.processors[model.TaskASR] = asr
+	}
+	if ocr != nil {
+		r.processors[model.TaskVision] = ocr
 	}
 	return r
 }

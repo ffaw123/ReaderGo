@@ -21,14 +21,16 @@ ReaderGo/
 │   ├── stop.bat                    ← 停止 Docker 与项目服务，保留数据卷
 │   └── stop-v.bat                  ← 停止 Docker 与项目服务并删除数据卷
 ├── docker/
-│   └── minio-cors.json             ← MinIO 浏览器直传的 CORS 配置
+│   ├── minio-cors.json             ← MinIO 浏览器直传的 CORS 配置
+│   └── paddleocr/Dockerfile         ← PaddleOCR CPU HTTP 服务镜像
 ├── docs/
 │   ├── 设计方案_v1.md              ← 视频理解 Agent 的产品与技术设计
 │   └── kafka设计方案_v1.md         ← Kafka 异步处理与状态管理设计
 ├── migrations/
 │   ├── 001_init.sql                ← 核心表、状态枚举与 pgvector 初始化
 │   ├── 002_upload_sessions.sql     ← 本地分片上传会话表
-│   └── 003_asr_segments.sql        ← ASR 原始转写片段表
+│   ├── 003_asr_segments.sql        ← ASR 原始转写片段表
+│   └── 004_ocr_segments.sql        ← OCR 抽样画面文字与处理状态表
 │
 ├── cmd/                            ← 可独立启动的应用入口
 │   ├── api/main.go                 ← HTTP API 服务入口-有自己的生产者实例
@@ -79,7 +81,7 @@ Copy-Item .env.example .env
 .\batch\start.bat
 ```
 
-脚本会启动 Docker 依赖，并分别打开 API、Worker、前端三个终端。首次运行时，只有在 `web/node_modules` 不存在的情况下才会执行 `npm install`。前端默认访问地址为 <http://localhost:5173>，API 地址为 <http://localhost:8080>。
+脚本会启动 Docker 依赖（包括 PostgreSQL、Kafka、MinIO 和 PaddleOCR），并分别打开 API、Worker、前端三个终端。PaddleOCR 首次启动需要安装服务依赖并下载模型，耗时会明显长于后续启动；模型缓存在 `paddleocr_models` 数据卷中。首次运行时，只有在 `web/node_modules` 不存在的情况下才会执行 `npm install`。前端默认访问地址为 <http://localhost:5173>，API 地址为 <http://localhost:8080>，OCR 接口为 <http://localhost:8081/ocr>。
 
 ### 手动启动
 
