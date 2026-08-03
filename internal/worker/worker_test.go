@@ -9,31 +9,29 @@ import (
 	"strings"
 	"testing"
 
-	"readergo/internal/media"
-
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 )
 
-func TestBuildAudioChunksPrefersSilenceNearTenSeconds(t *testing.T) {
-	chunks := buildAudioChunks(28000, []media.SilenceInterval{{StartMS: 9000, EndMS: 10000}, {StartMS: 19500, EndMS: 20000}})
-	want := []audioChunk{{StartMS: 0, EndMS: 9000}, {StartMS: 10000, EndMS: 19500}, {StartMS: 20000, EndMS: 28000}}
+func TestBuildAudioChunksKeepsShortVideoAsTailChunk(t *testing.T) {
+	chunks := buildAudioChunks(22000)
+	want := []audioChunk{{StartMS: 0, EndMS: 22000}}
 	if !reflect.DeepEqual(chunks, want) {
 		t.Errorf("chunks = %#v, want %#v", chunks, want)
 	}
 }
 
-func TestBuildAudioChunksSkipsLongSilenceBeforeMaximumDuration(t *testing.T) {
-	chunks := buildAudioChunks(30000, []media.SilenceInterval{{StartMS: 14000, EndMS: 18000}})
-	want := []audioChunk{{StartMS: 0, EndMS: 14000}, {StartMS: 18000, EndMS: 30000}}
+func TestBuildAudioChunksUsesExactThirtySecondChunk(t *testing.T) {
+	chunks := buildAudioChunks(30000)
+	want := []audioChunk{{StartMS: 0, EndMS: 30000}}
 	if !reflect.DeepEqual(chunks, want) {
 		t.Errorf("chunks = %#v, want %#v", chunks, want)
 	}
 }
 
-func TestBuildAudioChunksUsesExactRangesForHardCut(t *testing.T) {
-	chunks := buildAudioChunks(22000, nil)
-	want := []audioChunk{{StartMS: 0, EndMS: 10000}, {StartMS: 10000, EndMS: 22000}}
+func TestBuildAudioChunksKeepsRemainder(t *testing.T) {
+	chunks := buildAudioChunks(65000)
+	want := []audioChunk{{StartMS: 0, EndMS: 30000}, {StartMS: 30000, EndMS: 60000}, {StartMS: 60000, EndMS: 65000}}
 	if !reflect.DeepEqual(chunks, want) {
 		t.Errorf("chunks = %#v, want %#v", chunks, want)
 	}

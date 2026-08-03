@@ -25,11 +25,7 @@ import (
 )
 
 const (
-	asrTargetDuration = 10 * time.Second
-	asrMinDuration    = 3 * time.Second
-	asrMaxDuration    = 15 * time.Second
-	asrMinSilence     = 300 * time.Millisecond
-	asrSilenceDB      = -30
+	asrChunkDuration = 30 * time.Second
 )
 
 type audioChunk struct {
@@ -130,11 +126,7 @@ func (p *ASRProcessor) consumeASR(ctx context.Context, job queue.VideoJobMessage
 		return fmt.Errorf("store video duration: %w", err)
 	}
 
-	silences, err := p.ffmpeg.DetectSilences(ctx, videoPath, time.Duration(info.DurationMS)*time.Millisecond, asrSilenceDB, asrMinSilence)
-	if err != nil {
-		return err
-	}
-	chunks := buildAudioChunks(info.DurationMS, silences)
+	chunks := buildAudioChunks(info.DurationMS)
 	transcripts, err := p.transcribeChunks(ctx, videoPath, workDir, chunks)
 	if err != nil {
 		return err
@@ -238,45 +230,18 @@ func (p *ASRProcessor) transcribeAudio(ctx context.Context, audioPath string) (s
 	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
 }
 
-// buildAudioChunks 按原视频毫秒时间轴规划 ASR 音频块，规则如下：
-//  1. 每块以 10 秒为目标时长，仅接受开始后 3～15 秒内的静音作为候选边界。
-//  2. 候选静音结束后到视频结尾必须至少剩余 3 秒，避免生成过短的尾块。
-//  3. 存在多个候选静音时，选择静音开始时刻最接近目标 10 秒的位置。
-//  4. 选中静音后，当前块结束于 silence.StartMS，下一块开始于 silence.EndMS；
-//     被选中的完整静音不会提交给 ASR，输出时间轴中的间隙即表示无语音区间。
-//  5. 找不到候选静音且剩余内容超过 15 秒时，在 10 秒处硬切，相邻块首尾连续且不重叠。
-//  6. 找不到候选静音且剩余内容不超过 15 秒时，将全部剩余内容作为最后一块。
-func buildAudioChunks(durationMS int64, silences []media.SilenceInterval) []audioChunk {
-	var chunks []audioChunk
-	start := int64(0)
-	for start < durationMS {
-		remaining := durationMS - start
-		bestIndex, bestDistance := -1, int64(^uint64(0)>>1)
-		for index, silence := range silences {
-			if silence.StartMS < start+asrMinDuration.Milliseconds() || silence.StartMS > start+asrMaxDuration.Milliseconds() || durationMS-silence.EndMS < asrMinDuration.Milliseconds() {
-				continue
-			}
-			distance := silence.StartMS - (start + asrTargetDuration.Milliseconds())
-			if distance < 0 {
-				distance = -distance
-			}
-			if distance < bestDistance {
-				bestIndex, bestDistance = index, distance
-			}
-		}
+// buildAudioChunks 从视频 0 ms 起按固定 30 秒切分，生成连续的左闭右开区间；
+// 最后不足 30 秒的内容单独保留，确保整条视频时间轴既不遗漏也不重叠。
+func buildAudioChunks(durationMS int64) []audioChunk {
+	if durationMS <= 0 {
+		return nil
+	}
 
-		end := durationMS
-		nextStart := durationMS
-		if bestIndex >= 0 {
-			// 完整跳过作为边界的静音，避免静音占用相邻 ASR 块的有效时长。
-			end = silences[bestIndex].StartMS
-			nextStart = silences[bestIndex].EndMS
-		} else if remaining > asrMaxDuration.Milliseconds() {
-			end = start + asrTargetDuration.Milliseconds()
-			nextStart = end
-		}
-		chunks = append(chunks, audioChunk{StartMS: start, EndMS: end})
-		start = nextStart
+	chunkDurationMS := asrChunkDuration.Milliseconds()
+	chunks := make([]audioChunk, 0, (durationMS+chunkDurationMS-1)/chunkDurationMS)
+	for startMS := int64(0); startMS < durationMS; startMS += chunkDurationMS {
+		endMS := min(startMS+chunkDurationMS, durationMS)
+		chunks = append(chunks, audioChunk{StartMS: startMS, EndMS: endMS})
 	}
 	return chunks
 }

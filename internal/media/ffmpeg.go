@@ -2,7 +2,6 @@
 package media
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -32,12 +31,6 @@ type MediaInfo struct {
 	Height     int
 	VideoCodec string
 	AudioCodec string
-}
-
-// SilenceInterval 表示原视频时间轴上的静音区间。
-type SilenceInterval struct {
-	StartMS int64
-	EndMS   int64
 }
 
 // NewFFmpeg 创建 FFmpeg 工具，并校验 ffmpeg 与 ffprobe 是否可以定位。
@@ -133,55 +126,6 @@ func (f *FFmpeg) ExtractAudioSegment(ctx context.Context, inputPath, outputPath 
 		return fmt.Errorf("audio segment must satisfy 0 <= start < end")
 	}
 	return f.extractAudio(ctx, inputPath, outputPath, &start, &end)
-}
-
-// DetectSilences 检测低于阈值且持续达到指定时长的静音区间。
-func (f *FFmpeg) DetectSilences(ctx context.Context, inputPath string, duration time.Duration, thresholdDB int, minSilence time.Duration) ([]SilenceInterval, error) {
-	filter := fmt.Sprintf("silencedetect=noise=%ddB:d=%s", thresholdDB, ffmpegTimestamp(minSilence))
-	output, err := f.run(ctx, f.path, "-nostdin", "-i", inputPath, "-af", filter, "-f", "null", "-")
-	if err != nil {
-		return nil, fmt.Errorf("detect silence in %q: %w", inputPath, err)
-	}
-	return parseSilenceIntervals(string(output), duration), nil
-}
-
-func parseSilenceIntervals(output string, duration time.Duration) []SilenceInterval {
-	var intervals []SilenceInterval
-	var startMS int64 = -1
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if value, ok := silenceValue(line, "silence_start:"); ok {
-			startMS = max(0, value)
-		}
-		if value, ok := silenceValue(line, "silence_end:"); ok && startMS >= 0 {
-			endMS := min(value, duration.Milliseconds())
-			if endMS > startMS {
-				intervals = append(intervals, SilenceInterval{StartMS: startMS, EndMS: endMS})
-			}
-			startMS = -1
-		}
-	}
-	if startMS >= 0 && duration.Milliseconds() > startMS {
-		intervals = append(intervals, SilenceInterval{StartMS: startMS, EndMS: duration.Milliseconds()})
-	}
-	return intervals
-}
-
-func silenceValue(line, marker string) (int64, bool) {
-	index := strings.Index(line, marker)
-	if index < 0 {
-		return 0, false
-	}
-	value := strings.Fields(line[index+len(marker):])
-	if len(value) == 0 {
-		return 0, false
-	}
-	seconds, err := strconv.ParseFloat(value[0], 64)
-	if err != nil {
-		return 0, false
-	}
-	return int64(math.Round(seconds * 1000)), true
 }
 
 func (f *FFmpeg) extractAudio(ctx context.Context, inputPath, outputPath string, start, end *time.Duration) error {
