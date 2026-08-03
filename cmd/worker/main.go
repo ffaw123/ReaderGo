@@ -5,83 +5,64 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"syscall"
+
 	"readergo/internal/config"
 	"readergo/internal/db"
 	"readergo/internal/media"
+	"readergo/internal/outbox"
 	"readergo/internal/queue"
 	"readergo/internal/worker"
-	"syscall"
 
-	"github.com/IBM/sarama"
+	"github.com/google/uuid"
 )
 
 func main() {
 	log.Println("readergo worker starting ...")
+	configValue, err := config.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Worker 启动时先验证媒体工具，避免领取 RabbitMQ 任务后才发现 FFmpeg 不可用。
+	ffmpeg, err := media.NewFFmpeg(configValue.FFmpegPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := ffmpeg.Validate(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+	database, err := db.Open(configValue.DatabaseURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	asrProcessor, err := worker.NewASRProcessor(database, ffmpeg, configValue.MinIOEndpoint, configValue.MinIOAccessKey, configValue.MinIOSecretKey, configValue.MinIOSecure, configValue.MinIOBucket, configValue.ASRBaseURL, configValue.ASRAPIKey, configValue.ASRModel, configValue.ASRConcurrency)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ocrProcessor, err := worker.NewOCRProcessor(database, ffmpeg, configValue.MinIOEndpoint, configValue.MinIOAccessKey, configValue.MinIOSecretKey, configValue.MinIOSecure, configValue.MinIOBucket, configValue.OCRBaseURL, configValue.OCRMinConfidence, configValue.OCRSceneThreshold, configValue.OCRHashDistance, configValue.OCRConcurrency)
+	if err != nil {
+		log.Fatal(err)
+	}
+	writer := outbox.NewWriter(configValue.RabbitMQJobsExchange, configValue.RabbitMQDLXExchange)
+	handler := worker.New(database, worker.NewRouterProcessor(asrProcessor, ocrProcessor), writer, worker.Options{
+		WorkerID: "worker-" + uuid.NewString(), MaxAttempts: configValue.JobMaxAttempts,
+		RetryDelays: configValue.JobRetryDelays, LeaseTTL: configValue.JobLeaseTTL,
+		HeartbeatInterval: configValue.JobHeartbeatInterval,
+	})
 
-	// Worker 复用与 API 一致的配置和数据库，以便更新同一份任务状态。
-	c, e := config.Load()
-	if e != nil {
-		log.Fatal(e)
-	}
-	log.Printf("config loaded, brokers=%v", c.Brokers())
-	// Worker 启动时尽早验证媒体工具，避免 Kafka 任务开始消费后才发现本机缺少 FFmpeg。
-	ffmpeg, e := media.NewFFmpeg(c.FFmpegPath)
-	if e != nil {
-		log.Fatal(e)
-	}
-	if e := ffmpeg.Validate(context.Background()); e != nil {
-		log.Fatal(e)
-	}
-	log.Printf("ffmpeg ready: %s", ffmpeg.Path())
-
-	d, e := db.Open(c.DatabaseURL)
-	if e != nil {
-		log.Fatal(e)
-	}
-	log.Println("database connected")
-
-	// 构建各阶段 Processor；OCR 沿用现有 vision 任务类型，由 Router 统一分发。
-	asrProcessor, e := worker.NewASRProcessor(d, ffmpeg, c.MinIOEndpoint, c.MinIOAccessKey, c.MinIOSecretKey, c.MinIOSecure, c.MinIOBucket, c.ASRBaseURL, c.ASRAPIKey, c.ASRModel, c.ASRConcurrency)
-	if e != nil {
-		log.Fatal(e)
-	}
-	ocrProcessor, e := worker.NewOCRProcessor(d, ffmpeg, c.MinIOEndpoint, c.MinIOAccessKey, c.MinIOSecretKey, c.MinIOSecure, c.MinIOBucket, c.OCRBaseURL, c.OCRMinConfidence, c.OCRSceneThreshold, c.OCRHashDistance, c.OCRConcurrency)
-	if e != nil {
-		log.Fatal(e)
-	}
-	router := worker.NewRouterProcessor(asrProcessor, ocrProcessor)
-
-	// 这里创建的生产者是给worker用的，任务完成 → 投递下一阶段任务（流水线接力）。
-	jobs, e := queue.NewProducer(c.Brokers())
-	if e != nil {
-		log.Fatal(e)
-	}
-	defer jobs.Close()
-	log.Println("kafka producer connected")
-
-	// 显式指定 Kafka 协议版本，并从最早的未提交位点开始消费。
-	cfg := sarama.NewConfig()
-	cfg.Version = sarama.V3_9_0_0
-	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
-	group, e := sarama.NewConsumerGroup(c.Brokers(), "readergo-video-workers", cfg)
-	if e != nil {
-		log.Fatal(e)
-	}
-	defer group.Close()
-	log.Printf("consumer group joined, topics=%v", queue.VideoJobsTopics)
-
-	// 收到终止信号后取消消费循环，让 Consumer Group 正常释放分区。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	log.Println("worker ready, waiting for jobs ...")
-
-	// Consumer Group 重平衡后需要再次调用 Consume，因此在未退出时循环运行。
-	for ctx.Err() == nil {
-		if e := group.Consume(ctx, queue.VideoJobsTopics, worker.New(d, router, jobs)); e != nil && ctx.Err() == nil {
-			log.Printf("consumer error: %v", e)
-		}
+	// 租约回收独立于消息消费，RabbitMQ/Worker 重启后 running 任务仍能回到 pending 并重新派发。
+	go handler.RunReconciler(ctx, configValue.JobHeartbeatInterval)
+	topology := queue.TopologyConfig{
+		JobsExchange: configValue.RabbitMQJobsExchange, DLXExchange: configValue.RabbitMQDLXExchange,
+		ConsumerTimeout: configValue.RabbitMQConsumerTimeout,
 	}
-
+	log.Printf("worker ready, consuming %d RabbitMQ queues", len(queue.QueueSpecs))
+	if err := queue.RunConsumers(ctx, queue.ConsumerConfig{
+		URL: configValue.RabbitMQURL, Topology: topology, Prefetch: configValue.RabbitMQPrefetch,
+	}, handler); err != nil {
+		log.Fatal(err)
+	}
 	log.Println("worker shutting down")
 }

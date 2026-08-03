@@ -425,7 +425,7 @@ func (p *OCRProcessor) recognizeOnce(ctx context.Context, imagePath string) (ocr
 
 func (p *OCRProcessor) replaceOCRSegments(ctx context.Context, videoID string, segments []model.OCRSegment) error {
 	return p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Kafka 至少投递一次；原子替换保证任务重跑不会残留旧采样结果。
+		// RabbitMQ 与 Outbox 均允许重复投递；原子替换保证任务重跑不会残留旧采样结果。
 		if err := tx.Where("video_id = ?", videoID).Delete(&model.OCRSegment{}).Error; err != nil {
 			return fmt.Errorf("clear previous OCR segments: %w", err)
 		}

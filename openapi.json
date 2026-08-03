@@ -316,7 +316,7 @@
       "post": {
         "tags": ["Videos"],
         "summary": "完成本地分片上传并创建处理任务",
-        "description": "客户端上传全部分片后，提交每个分片的 ETag。服务端完成 MinIO Multipart Upload，并将视频处理任务投递至 Kafka。",
+        "description": "客户端上传全部分片后，提交每个分片的 ETag。服务端完成 MinIO Multipart Upload，并在同一事务创建处理任务和 RabbitMQ Outbox 通知。",
         "operationId": "completeUpload",
         "security": [{ "BearerAuth": [] }],
         "parameters": [
@@ -372,7 +372,7 @@
       "post": {
         "tags": ["Videos"],
         "summary": "提交视频处理任务",
-        "description": "提交一个视频 URL 进行异步处理。系统创建视频记录和处理任务后，通过 Kafka 分发给 Worker。",
+        "description": "提交一个视频 URL 进行异步处理。系统在同一事务创建视频、prepare 任务和 Outbox，再通过 RabbitMQ 分发给 Worker。",
         "operationId": "createVideo",
         "security": [{ "BearerAuth": [] }],
         "requestBody": {

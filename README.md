@@ -12,7 +12,7 @@ ReaderGo/
 │
 ├── README.md                       ← 项目说明、启动方式与当前文件地图
 ├── .env.example                    ← 本地环境变量示例
-├── docker-compose.yml              ← PostgreSQL、Redis、Kafka、MinIO 编排
+├── docker-compose.yml              ← PostgreSQL、Redis、RabbitMQ、MinIO 编排
 ├── openapi.json                    ← HTTP API 契约
 ├── go.mod / go.sum                 ← Go 模块与依赖锁定文件
 │
@@ -25,7 +25,8 @@ ReaderGo/
 │   └── paddleocr/Dockerfile         ← PaddleOCR CPU HTTP 服务镜像
 ├── docs/
 │   ├── 设计方案_v1.md              ← 视频理解 Agent 的产品与技术设计
-│   └── kafka设计方案_v1.md         ← Kafka 异步处理与状态管理设计
+│   ├── RabbitMQ设计方案_v1.md      ← 当前 RabbitMQ、Outbox 与任务租约设计
+│   └── Kafka到RabbitMQ迁移指南.md  ← 消息层迁移约束与验收清单
 ├── migrations/
 │   ├── 001_init.sql                ← 核心表、状态枚举与 pgvector 初始化
 │   ├── 002_upload_sessions.sql     ← 本地分片上传会话表
@@ -33,8 +34,9 @@ ReaderGo/
 │   └── 004_ocr_segments.sql        ← OCR 抽样画面文字与处理状态表
 │
 ├── cmd/                            ← 可独立启动的应用入口
-│   ├── api/main.go                 ← HTTP API 服务入口-有自己的生产者实例
-│   └── worker/main.go              ← 创建 worker 实例，一个 worker 实例既有消费者也有生产者实例
+│   ├── api/main.go                 ← HTTP API 服务入口，只写业务数据与 Outbox
+│   ├── outbox/main.go              ← Outbox Dispatcher 与 Confirm Publisher
+│   └── worker/main.go              ← RabbitMQ 消费、任务执行和租约回收入口
 │
 ├── internal/                       ← 后端业务实现
 │   ├── api/server.go                ← 路由、鉴权、视频和上传接口
@@ -42,7 +44,8 @@ ReaderGo/
 │   ├── config/config.go             ← 环境变量加载与配置校验
 │   ├── db/db.go                     ← GORM PostgreSQL 连接
 │   ├── model/models.go              ← 数据模型和状态、任务常量
-│   ├── queue/queue.go               ← Kafka 消息和分阶段 topic
+│   ├── outbox/                      ← 事务 Outbox 写入和可靠分发
+│   ├── queue/                       ← RabbitMQ 契约、拓扑、Confirm 发布与手动 ACK 消费
 │   ├── storage/multipart.go         ← MinIO 分片上传封装
 │   └── worker/worker.go             ← Worker 实例运行的具体逻辑-包括任务流程编排
 │
@@ -57,7 +60,7 @@ ReaderGo/
         └── styles.css               ← 全局样式
 ```
 
-请求处理主路径：`cmd/api → internal/api → internal/auth / internal/db → internal/queue → Kafka → cmd/worker → internal/worker`。
+请求处理主路径：`cmd/api → internal/api → PostgreSQL(message_outbox) → cmd/outbox → RabbitMQ → cmd/worker → internal/worker`。
 
 ## 启动
 
@@ -81,7 +84,7 @@ Copy-Item .env.example .env
 .\batch\start.bat
 ```
 
-脚本会启动 Docker 依赖（包括 PostgreSQL、Kafka、MinIO 和 PaddleOCR），并分别打开 API、Worker、前端三个终端。PaddleOCR 首次启动需要安装服务依赖并下载模型，耗时会明显长于后续启动；模型缓存在 `paddleocr_models` 数据卷中。首次运行时，只有在 `web/node_modules` 不存在的情况下才会执行 `npm install`。前端默认访问地址为 <http://localhost:5173>，API 地址为 <http://localhost:8080>，OCR 接口为 <http://localhost:8081/ocr>。
+脚本会启动 Docker 依赖（包括 PostgreSQL、RabbitMQ、MinIO 和 PaddleOCR），并分别打开 Outbox Dispatcher、Worker、API、前端四个终端。PaddleOCR 首次启动需要安装服务依赖并下载模型，耗时会明显长于后续启动；模型缓存在 `paddleocr_models` 数据卷中。首次运行时，只有在 `web/node_modules` 不存在的情况下才会执行 `npm install`。前端默认访问地址为 <http://localhost:5173>，API 地址为 <http://localhost:8080>，RabbitMQ 管理界面为 <http://localhost:15672>，OCR 接口为 <http://localhost:8081/ocr>。
 
 ### 手动启动
 
@@ -92,10 +95,13 @@ Copy-Item .env.example .env
 docker compose up -d
 go run ./cmd/api
 
-# 终端 2：项目根目录
+# 终端 2：项目根目录（必须启动，负责把事务 Outbox 发布到 RabbitMQ）
+go run ./cmd/outbox
+
+# 终端 3：项目根目录
 go run ./cmd/worker
 
-# 终端 3：web 目录
+# 终端 4：web 目录
 cd web
 npm install  # 仅首次安装依赖或依赖变更后需要
 npm run dev

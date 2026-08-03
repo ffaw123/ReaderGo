@@ -77,7 +77,7 @@ func NewASRProcessor(db *gorm.DB, ffmpeg *media.FFmpeg, minIOEndpoint, minIOAcce
 	client := openai.NewClient(
 		option.WithAPIKey(apiKey),
 		option.WithBaseURL(endpointURL.String()),
-		// 为每次 ASR 请求设置上限，避免下游服务异常时长期占用 Kafka 消费协程。
+		// 为每次 ASR 请求设置上限，避免下游服务异常时长期占用 RabbitMQ delivery。
 		option.WithHTTPClient(&http.Client{Timeout: 4 * time.Minute}),
 	)
 	return &ASRProcessor{

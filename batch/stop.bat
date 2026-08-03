@@ -3,9 +3,10 @@ setlocal
 
 pushd "%~dp0.."
 set "RUNTIME_DIR=%TEMP%\ReaderGo"
-echo Closing ReaderGo web, Worker, and API terminals...
+echo Closing ReaderGo web, Worker, Outbox, and API terminals...
 call :stop_service "%RUNTIME_DIR%\web.pid"
 call :stop_service "%RUNTIME_DIR%\worker.pid"
+call :stop_service "%RUNTIME_DIR%\outbox.pid"
 call :stop_service "%RUNTIME_DIR%\api.pid"
 
 echo Stopping ReaderGo Docker services while keeping data volumes...

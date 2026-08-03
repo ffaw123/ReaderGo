@@ -39,7 +39,7 @@ type Video struct {
 	SourceURL string `json:"source_url"`
 	Title     string `json:"title"`
 	Status    string `json:"status"`
-	// UploadMethod 持久化源文件进入方式，供暂停恢复时安全重建 Kafka 消息。
+	// UploadMethod 持久化源文件进入方式，供暂停恢复时安全重建 RabbitMQ 消息。
 	UploadMethod     string    `json:"-"`
 	PausedFromStatus *string   `json:"paused_from_status,omitempty"`
 	DurationMS       int64     `json:"duration_ms"`
@@ -49,18 +49,48 @@ type Video struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
-// ProcessingJob 记录由 Kafka 分发的处理任务及其重试次数。
+// ProcessingJob 记录由 RabbitMQ 通知执行的处理任务；PostgreSQL 始终是任务状态事实来源。
 type ProcessingJob struct {
-	ID           string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	TenantID     string    `gorm:"type:uuid;not null" json:"-"`
-	VideoID      string    `gorm:"type:uuid;not null" json:"video_id"`
-	TaskType     string    `json:"task_type"`
-	Attempt      int       `json:"attempt"`
-	Status       string    `json:"status"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID             string     `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID       string     `gorm:"type:uuid;not null" json:"-"`
+	VideoID        string     `gorm:"type:uuid;not null" json:"video_id"`
+	TaskType       string     `json:"task_type"`
+	Attempt        int        `json:"attempt"`
+	Status         string     `json:"status"`
+	ErrorMessage   string     `json:"error_message,omitempty"`
+	LeaseOwner     string     `json:"-"`
+	LeaseExpiresAt *time.Time `json:"-"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
+
+const (
+	OutboxStatusPending    = "pending"
+	OutboxStatusPublishing = "publishing"
+	OutboxStatusPublished  = "published"
+)
+
+// OutboxMessage 将数据库状态变更与待发布通知放在同一事务中，避免提交后进程崩溃造成漏消息。
+type OutboxMessage struct {
+	ID              string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
+	TenantID        string    `gorm:"type:uuid;not null;index"`
+	VideoID         string    `gorm:"type:uuid;not null;index"`
+	JobID           string    `gorm:"type:uuid;not null;index"`
+	TaskType        string    `gorm:"not null"`
+	Attempt         int       `gorm:"not null"`
+	ExchangeName    string    `gorm:"not null"`
+	RoutingKey      string    `gorm:"not null"`
+	Payload         string    `gorm:"type:jsonb;not null"`
+	Status          string    `gorm:"not null"`
+	AvailableAt     time.Time `gorm:"not null"`
+	PublishAttempts int       `gorm:"not null"`
+	LastError       string    `gorm:"not null"`
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	PublishedAt     *time.Time
+}
+
+func (OutboxMessage) TableName() string { return "message_outbox" }
 
 // ASRSegment 保存 ASR 阶段的原始转写结果，不等同于最终的 RAG 检索片段。
 // start_ms 与 end_ms 均相对视频起点，使用 [start_ms, end_ms) 左闭右开区间。

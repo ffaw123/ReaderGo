@@ -41,10 +41,32 @@ CREATE TABLE processing_jobs (
   attempt integer NOT NULL DEFAULT 1, 
   status job_status NOT NULL DEFAULT 'pending', 
   error_message text NOT NULL DEFAULT '', 
+  lease_owner text NOT NULL DEFAULT '',
+  lease_expires_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(), 
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX processing_jobs_video_task_idx ON processing_jobs(video_id, task_type);
+-- message_outbox 与任务状态在同一事务落库，再由独立 Dispatcher 可靠发布到 RabbitMQ。
+CREATE TABLE message_outbox (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES users(id),
+  video_id uuid NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+  job_id uuid NOT NULL REFERENCES processing_jobs(id) ON DELETE CASCADE,
+  task_type text NOT NULL CHECK (task_type IN ('prepare','asr','vision','rag_index','summary')),
+  attempt integer NOT NULL,
+  exchange_name text NOT NULL,
+  routing_key text NOT NULL,
+  payload jsonb NOT NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','publishing','published')),
+  available_at timestamptz NOT NULL DEFAULT now(),
+  publish_attempts integer NOT NULL DEFAULT 0,
+  last_error text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz
+);
+CREATE INDEX message_outbox_pending_idx ON message_outbox(status, available_at, created_at);
 -- 每个视频只有一个最终摘要。
 CREATE TABLE video_summaries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 

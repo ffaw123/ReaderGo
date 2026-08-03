@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"readergo/internal/model"
 	"readergo/internal/queue"
@@ -15,6 +16,16 @@ import (
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 )
+
+func TestRetryDelayUsesConfiguredAttemptBackoff(t *testing.T) {
+	consumer := Consumer{options: Options{RetryDelays: []time.Duration{30 * time.Second, 5 * time.Minute, 30 * time.Minute}}}
+	if got := consumer.retryDelay(1); got != 30*time.Second {
+		t.Fatalf("retryDelay(1) = %s, want 30s", got)
+	}
+	if got := consumer.retryDelay(3); got != 30*time.Minute {
+		t.Fatalf("retryDelay(3) = %s, want 30m", got)
+	}
+}
 
 func TestDeriveVideoStatusPreservesPausedWithPendingJobs(t *testing.T) {
 	jobs := []model.ProcessingJob{

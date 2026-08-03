@@ -12,6 +12,7 @@ import (
 
 	"readergo/internal/auth"
 	"readergo/internal/model"
+	"readergo/internal/outbox"
 	"readergo/internal/queue"
 	"readergo/internal/storage"
 
@@ -25,7 +26,7 @@ import (
 type Server struct {
 	db       *gorm.DB
 	auth     *auth.Service
-	jobs     queue.Publisher
+	outbox   *outbox.Writer
 	uploads  *storage.MultipartStore
 	partSize int64
 }
@@ -276,23 +277,19 @@ func (s *Server) completeUpload(c *gin.Context) {
 		if e := tx.Model(&video).Updates(map[string]any{"status": model.VideoStatusProcessing, "error_message": ""}).Error; e != nil {
 			return e
 		}
-		return tx.Create(&jobs).Error
+		if e := tx.Create(&jobs).Error; e != nil {
+			return e
+		}
+		// 两个任务及其通知在同一事务提交，RabbitMQ 暂时不可用也不会造成漏派发。
+		for _, job := range jobs {
+			if e := s.outbox.EnqueueJob(tx, job, queue.UploadMethodLocalDirect, time.Now().UTC()); e != nil {
+				return e
+			}
+		}
+		return nil
 	}); e != nil {
 		fail(c, e)
 		return
-	}
-
-	for _, job := range jobs {
-		if e := s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID, TaskType: job.TaskType, Attempt: job.Attempt, UploadMethod: queue.UploadMethodLocalDirect}); e != nil {
-			_ = s.db.Transaction(func(tx *gorm.DB) error {
-				if e := tx.Model(&model.ProcessingJob{}).Where("video_id = ? AND task_type IN ?", video.ID, []string{model.TaskASR, model.TaskVision}).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error; e != nil {
-					return e
-				}
-				return tx.Model(&video).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error
-			})
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not queue processing job"})
-			return
-		}
 	}
 
 	video.Status = model.VideoStatusProcessing
@@ -323,9 +320,9 @@ func firstPartNumbers(partCount int) []int {
 	return numbers
 }
 
-// New 使用数据库、鉴权服务、消息生产者和视频上传创建 API 服务。
-func New(db *gorm.DB, authService *auth.Service, jobs queue.Publisher, uploads *storage.MultipartStore, partSize int64) *Server {
-	return &Server{db: db, auth: authService, jobs: jobs, uploads: uploads, partSize: partSize}
+// New 使用数据库、鉴权、事务 Outbox 和视频上传组件创建 API 服务。
+func New(db *gorm.DB, authService *auth.Service, outboxWriter *outbox.Writer, uploads *storage.MultipartStore, partSize int64) *Server {
+	return &Server{db: db, auth: authService, outbox: outboxWriter, uploads: uploads, partSize: partSize}
 }
 
 // Router 注册公开鉴权路由和必须携带 JWT 的业务路由。
@@ -422,7 +419,7 @@ type createVideoRequest struct {
 }
 
 // URL 方式上传视频时触发该函数
-// createVideo 先持久化视频与任务，再发送 Kafka 消息，避免 Worker 找不到任务记录。
+// createVideo 在同一事务持久化视频、prepare 任务和 Outbox 通知。
 func (s *Server) createVideo(c *gin.Context) {
 	var in createVideoRequest
 	if c.ShouldBindJSON(&in) != nil {
@@ -437,20 +434,18 @@ func (s *Server) createVideo(c *gin.Context) {
 	}
 	tenant := auth.UserID(c)
 	v := model.Video{TenantID: tenant, SourceURL: in.SourceURL, Title: in.Title, Status: model.VideoStatusUploading, UploadMethod: queue.UploadMethodURL}
-	if e = s.db.Create(&v).Error; e != nil {
-		fail(c, e)
-		return
-	}
 	j := model.ProcessingJob{TenantID: tenant, VideoID: v.ID, TaskType: model.TaskPrepare, Status: model.JobStatusPending, Attempt: 1}
-	if e = s.db.Create(&j).Error; e != nil {
+	if e = s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&v).Error; err != nil {
+			return err
+		}
+		j.VideoID = v.ID
+		if err := tx.Create(&j).Error; err != nil {
+			return err
+		}
+		return s.outbox.EnqueueJob(tx, j, queue.UploadMethodURL, time.Now().UTC())
+	}); e != nil {
 		fail(c, e)
-		return
-	}
-	if e = s.jobs.Publish(context.Background(), queue.VideoJobMessage{JobID: j.ID, TenantID: tenant, VideoID: v.ID, TaskType: j.TaskType, Attempt: j.Attempt, UploadMethod: queue.UploadMethodURL}); e != nil {
-		// 生产消息失败时将持久化状态标为失败，避免任务长期卡在 pending。
-		_ = s.db.Model(&j).Updates(map[string]any{"status": "failed", "error_message": e.Error()}).Error
-		_ = s.db.Model(&v).Update("status", "failed").Error
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not queue processing job"})
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"video": v, "job_id": j.ID})
@@ -601,6 +596,12 @@ func (s *Server) resumeVideo(c *gin.Context) {
 		}).Error; err != nil {
 			return err
 		}
+		// 恢复只为当前 pending attempt 追加新事件；Outbox UUID 允许同一 attempt 再派发。
+		for _, job := range pendingJobs {
+			if err := s.outbox.EnqueueJob(tx, job, video.UploadMethod, time.Now().UTC()); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -621,40 +622,10 @@ func (s *Server) resumeVideo(c *gin.Context) {
 		return
 	}
 
-	for _, job := range pendingJobs {
-		message := queue.VideoJobMessage{
-			JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID,
-			TaskType: job.TaskType, Attempt: job.Attempt, UploadMethod: video.UploadMethod,
-		}
-		if err := s.jobs.Publish(context.Background(), message); err != nil {
-			// 部分消息可能已经发布；重新置为 paused 后，Worker 的视频状态门禁会阻止它们执行。
-			_ = s.restorePausedAfterPublishFailure(video.ID, tenantID, restoredStatus)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not queue resumed processing jobs"})
-			return
-		}
-	}
 	c.JSON(http.StatusOK, gin.H{
 		"video_id":    video.ID,
 		"status":      restoredStatus,
 		"queued_jobs": len(pendingJobs),
-	})
-}
-
-func (s *Server) restorePausedAfterPublishFailure(videoID, tenantID, restoredStatus string) error {
-	return s.db.Transaction(func(tx *gorm.DB) error {
-		var video model.Video
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND tenant_id = ?", videoID, tenantID).First(&video).Error; err != nil {
-			return err
-		}
-		// 已经进入 ready/failed 的终态不能被补偿逻辑倒退回 paused。
-		if video.Status == model.VideoStatusReady || video.Status == model.VideoStatusFailed {
-			return nil
-		}
-		return tx.Model(&video).Updates(map[string]any{
-			"status":             model.VideoStatusPaused,
-			"paused_from_status": restoredStatus,
-		}).Error
 	})
 }
 

@@ -25,7 +25,7 @@ type FFmpeg struct {
 }
 
 // MediaInfo 是视频准备、ASR 和 Vision 共用的基础媒体信息。
-// DurationMS 以视频开始为 0 的全局时间基准表示，和 Kafka 设计中的时间契约一致。
+// DurationMS 以视频开始为 0 的全局时间基准表示，和异步处理流水线的时间契约一致。
 type MediaInfo struct {
 	DurationMS int64
 	FormatName string

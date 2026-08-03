@@ -6,7 +6,7 @@ set "PROJECT_ROOT=%CD%"
 set "RUNTIME_DIR=%TEMP%\ReaderGo"
 
 if not exist "%RUNTIME_DIR%" mkdir "%RUNTIME_DIR%"
-del /q "%RUNTIME_DIR%\api.pid" "%RUNTIME_DIR%\worker.pid" "%RUNTIME_DIR%\web.pid" 2>nul
+del /q "%RUNTIME_DIR%\api.pid" "%RUNTIME_DIR%\outbox.pid" "%RUNTIME_DIR%\worker.pid" "%RUNTIME_DIR%\web.pid" 2>nul
 
 echo Starting Docker services...
 docker compose up -d
@@ -29,9 +29,10 @@ if not exist "%PROJECT_ROOT%\web\node_modules\" (
   popd
 )
 
-echo Starting ReaderGo API, Worker, and web client in separate terminals...
-call :start_service "%PROJECT_ROOT%" "go run ./cmd/api" "%RUNTIME_DIR%\api.pid"
+echo Starting ReaderGo Outbox, Worker, API, and web client in separate terminals...
+call :start_service "%PROJECT_ROOT%" "go run ./cmd/outbox" "%RUNTIME_DIR%\outbox.pid"
 call :start_service "%PROJECT_ROOT%" "go run ./cmd/worker" "%RUNTIME_DIR%\worker.pid"
+call :start_service "%PROJECT_ROOT%" "go run ./cmd/api" "%RUNTIME_DIR%\api.pid"
 call :start_service "%PROJECT_ROOT%\web" "npm run dev" "%RUNTIME_DIR%\web.pid"
 
 popd

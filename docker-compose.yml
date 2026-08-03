@@ -17,21 +17,20 @@ services:
     # 预留给进度缓存、限流、会话和分布式锁。
     image: redis:7-alpine
     ports: ["6379:6379"]
-  kafka:
-    # 单节点 KRaft 模式仅用于本地开发，生产环境应部署高可用集群。
-    image: apache/kafka:3.9.0
-    ports: ["9092:9092"]
+  rabbitmq:
+    # 本地与生产使用相同的 direct exchange / quorum queue 拓扑。
+    image: rabbitmq:4-management
     environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      RABBITMQ_DEFAULT_USER: readergo
+      RABBITMQ_DEFAULT_PASS: readergo-secret
+      RABBITMQ_DEFAULT_VHOST: readergo
+    ports: ["5672:5672", "15672:15672"]
+    volumes: ["rabbitmq_data:/var/lib/rabbitmq"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
   minio:
     # 兼容 S3 的对象存储，用于原视频、音频、帧和短片段。
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
@@ -73,4 +72,5 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  rabbitmq_data:
   paddleocr_models:

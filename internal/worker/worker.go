@@ -2,181 +2,135 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync/atomic"
 	"time"
 
 	"readergo/internal/model"
+	"readergo/internal/outbox"
 	"readergo/internal/queue"
 
-	"github.com/IBM/sarama"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 const pauseStatePollInterval = 750 * time.Millisecond
 
-// Processor 隔离每个视频处理阶段的具体实现。
-// 不同阶段（prepare / asr / vision / rag_index / summary）可分别实现此接口，
-// 使消费者循环与具体处理逻辑解耦，便于独立测试和替换。
 type Processor interface {
 	Process(context.Context, queue.VideoJobMessage) error
 }
 
-// Consumer 协调任务执行，数据库是唯一的状态来源（source of truth）。
-// 持有 Processor 完成具体处理，持有 Publisher 将下一阶段任务写回 Kafka。
+type Options struct {
+	WorkerID          string
+	MaxAttempts       int
+	RetryDelays       []time.Duration
+	LeaseTTL          time.Duration
+	HeartbeatInterval time.Duration
+}
+
+// Consumer 只处理业务状态；RabbitMQ delivery tag 和 ACK 始终留在 queue 消费层。
 type Consumer struct {
 	db        *gorm.DB
 	processor Processor
-	jobs      queue.Publisher
+	outbox    *outbox.Writer
+	options   Options
 }
 
-// New 创建消费者实例，绑定数据库、处理逻辑和 Kafka 投递能力。
-func New(db *gorm.DB, processor Processor, jobs queue.Publisher) *Consumer {
-	return &Consumer{db: db, processor: processor, jobs: jobs}
-}
-
-func (x *Consumer) Setup(sarama.ConsumerGroupSession) error   { return nil }
-func (x *Consumer) Cleanup(sarama.ConsumerGroupSession) error { return nil }
-
-// ConsumeClaim 每条消息都以数据库任务为准；暂停时消息可以提交，恢复接口会重新投递 pending 任务。
-func (x *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	for message := range claim.Messages() {
-		var job queue.VideoJobMessage
-		if err := json.Unmarshal(message.Value, &job); err != nil {
-			log.Printf("invalid job: %v", err)
-			session.MarkMessage(message, "")
-			continue
-		}
-		if err := x.run(session.Context(), job); err != nil {
-			log.Printf("job %s failed: %v", job.JobID, err)
-		}
-		// Kafka 只负责通知，任务是否需要恢复由 PostgreSQL 中的 pending 状态决定。
-		session.MarkMessage(message, "")
+func New(db *gorm.DB, processor Processor, writer *outbox.Writer, options Options) *Consumer {
+	if options.WorkerID == "" {
+		options.WorkerID = uuid.NewString()
 	}
-	return nil
+	return &Consumer{db: db, processor: processor, outbox: writer, options: options}
 }
 
-func (x *Consumer) run(ctx context.Context, message queue.VideoJobMessage) error {
+// Handle 在终态或下一次可靠通知已经提交后返回 nil，RabbitMQ 层此时才会 ACK。
+func (x *Consumer) Handle(ctx context.Context, message queue.VideoJobMessage) error {
 	job, claimed, err := x.claimJob(ctx, message)
-	if err != nil {
+	if err != nil || !claimed {
 		return err
 	}
-	if !claimed {
+
+	processorCtx, stopMonitor, pauseRequested, leaseLost := x.withLifecycleMonitor(ctx, job)
+	processErr := x.processor.Process(processorCtx, message)
+	stopMonitor()
+	if leaseLost.Load() {
+		// 新租约持有者已接管时，旧 Worker 不能再写任务终态。
 		return nil
 	}
-
-	// API 与 Worker 是不同进程，通过轮询数据库把 paused 转换为 Processor 可感知的 context 取消。
-	processorCtx, stopPauseMonitor, pauseRequested := x.withPauseCancellation(ctx, job.VideoID)
-	processErr := x.processor.Process(processorCtx, message)
-	stopPauseMonitor()
 	if processErr != nil {
 		if pauseRequested.Load() {
-			if err := x.returnJobToPendingAfterPause(job); err != nil {
-				return fmt.Errorf("return paused job %s to pending: %w", job.ID, err)
-			}
-			return nil
+			return x.returnJobToPendingAfterPause(ctx, job)
 		}
-		_ = x.markJobFailed(job, processErr.Error(), message.UploadMethod)
-		return processErr
-	}
-
-	var next []model.ProcessingJob
-	publishNext := false
-	if err := x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 与 pause/resume 接口统一先锁视频行，避免成功提交越过暂停边界。
-		var video model.Video
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", job.VideoID).Error; err != nil {
+		if ctx.Err() != nil {
+			// 连接或进程退出时保留 running，Reconciler 会在租约过期后可靠恢复。
+			return ctx.Err()
+		}
+		if err := x.handleProcessFailure(ctx, job, message.UploadMethod, processErr.Error()); err != nil {
 			return err
 		}
-		result := tx.Model(&model.ProcessingJob{}).
-			Where("id = ? AND status = ?", job.ID, model.JobStatusRunning).
-			Updates(map[string]any{"status": model.JobStatusSucceeded, "error_message": ""})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			return fmt.Errorf("job %s is no longer running", job.ID)
-		}
-		var err error
-		next, err = x.createNextJobs(tx, job)
-		if err != nil {
-			return err
-		}
-		finalStatus, err := x.reconcileVideoStatusLocked(tx, &video, message.UploadMethod)
-		if err != nil {
-			return err
-		}
-		// 暂停期间可以确认当前阶段成功并创建下游 pending 任务，但不能继续向 Kafka 推进。
-		publishNext = finalStatus != model.VideoStatusPaused
-		return nil
-	}); err != nil {
-		return err
-	}
-	if !publishNext {
+		log.Printf("job %s attempt %d failed and was persisted for retry or DLQ: %v", job.ID, job.Attempt, processErr)
 		return nil
 	}
-	for _, nextJob := range next {
-		message := queue.VideoJobMessage{
-			JobID: nextJob.ID, TenantID: nextJob.TenantID, VideoID: nextJob.VideoID,
-			TaskType: nextJob.TaskType, Attempt: nextJob.Attempt, UploadMethod: message.UploadMethod,
-		}
-		if err := x.jobs.Publish(ctx, message); err != nil {
-			_ = x.markJobFailed(nextJob, err.Error(), message.UploadMethod)
-			return err
-		}
-	}
-	return nil
+	return x.completeJob(ctx, job, message.UploadMethod)
 }
 
-// claimJob 使用视频行锁和条件更新完成原子抢占，重复 Kafka 消息只能有一个进入 Processor。
+// claimJob 用视频行锁和条件更新完成原子抢占，重复消息最多只有一个进入 Processor。
 func (x *Consumer) claimJob(ctx context.Context, message queue.VideoJobMessage) (model.ProcessingJob, bool, error) {
 	var job model.ProcessingJob
 	claimed := false
-	if !queue.IsUploadMethod(message.UploadMethod) {
-		return job, false, fmt.Errorf("job message has unknown upload method %q", message.UploadMethod)
+	if err := queue.ValidateMessage(message); err != nil {
+		return job, false, queue.Permanent(err)
 	}
 	err := x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var video model.Video
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND tenant_id = ?", message.VideoID, message.TenantID).
-			First(&video).Error; err != nil {
+			Where("id = ? AND tenant_id = ?", message.VideoID, message.TenantID).First(&video).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return queue.Permanent(fmt.Errorf("video %s does not exist", message.VideoID))
+			}
 			return err
 		}
 		if video.UploadMethod != message.UploadMethod {
-			return fmt.Errorf("job message upload method %q does not match video %q", message.UploadMethod, video.UploadMethod)
+			return queue.Permanent(fmt.Errorf("job upload method %q does not match video %q", message.UploadMethod, video.UploadMethod))
 		}
-		if err := tx.First(&job, "id = ?", message.JobID).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&job, "id = ?", message.JobID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return queue.Permanent(fmt.Errorf("job %s does not exist", message.JobID))
+			}
 			return err
 		}
-		if job.TaskType != message.TaskType || job.VideoID != message.VideoID || job.TenantID != message.TenantID || job.Attempt != message.Attempt {
-			return fmt.Errorf("job message does not match persisted job %s", job.ID)
+		if job.TaskType != message.TaskType || job.VideoID != message.VideoID || job.TenantID != message.TenantID {
+			return queue.Permanent(fmt.Errorf("job message does not match persisted job %s", job.ID))
 		}
-		if video.Status == model.VideoStatusPaused || video.Status == model.VideoStatusReady || video.Status == model.VideoStatusFailed {
+		// 旧 attempt 与已执行/正在执行的重复通知都直接确认，不允许倒退数据库状态。
+		if message.Attempt < job.Attempt || job.Status != model.JobStatusPending || video.Status == model.VideoStatusPaused || video.Status == model.VideoStatusReady || video.Status == model.VideoStatusFailed {
 			return nil
 		}
-		if job.Status != model.JobStatusPending {
-			return nil
+		if message.Attempt > job.Attempt {
+			return queue.Permanent(fmt.Errorf("message attempt %d is ahead of persisted attempt %d", message.Attempt, job.Attempt))
 		}
 		ready, err := x.prerequisitesSatisfied(tx, &job, message.UploadMethod)
 		if err != nil {
 			return err
 		}
 		if !ready {
-			return fmt.Errorf("prerequisites are not complete for %s job %s", job.TaskType, job.ID)
+			return queue.Permanent(fmt.Errorf("prerequisites are not complete for %s job %s", job.TaskType, job.ID))
 		}
+		leaseOwner := x.options.WorkerID + ":" + uuid.NewString()
+		leaseExpiresAt := time.Now().UTC().Add(x.options.LeaseTTL)
 		result := tx.Model(&model.ProcessingJob{}).
-			Where("id = ? AND status = ?", job.ID, model.JobStatusPending).
-			Updates(map[string]any{"status": model.JobStatusRunning, "error_message": ""})
+			Where("id = ? AND status = ? AND attempt = ?", job.ID, model.JobStatusPending, job.Attempt).
+			Updates(map[string]any{"status": model.JobStatusRunning, "error_message": "", "lease_owner": leaseOwner, "lease_expires_at": leaseExpiresAt})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
 			return nil
 		}
-		job.Status = model.JobStatusRunning
+		job.Status, job.LeaseOwner, job.LeaseExpiresAt = model.JobStatusRunning, leaseOwner, &leaseExpiresAt
 		claimed = true
 		if job.TaskType == model.TaskPrepare {
 			return nil
@@ -186,35 +140,40 @@ func (x *Consumer) claimJob(ctx context.Context, message queue.VideoJobMessage) 
 	return job, claimed, err
 }
 
-// withPauseCancellation 监听持久化暂停状态；所有媒体命令和外部 HTTP 请求都会继承返回的 context。
-func (x *Consumer) withPauseCancellation(parent context.Context, videoID string) (context.Context, func(), *atomic.Bool) {
+func (x *Consumer) withLifecycleMonitor(parent context.Context, job model.ProcessingJob) (context.Context, func(), *atomic.Bool, *atomic.Bool) {
 	processorCtx, cancel := context.WithCancel(parent)
 	stop := make(chan struct{})
 	stopped := make(chan struct{})
-	pauseRequested := &atomic.Bool{}
+	pauseRequested, leaseLost := &atomic.Bool{}, &atomic.Bool{}
 	go func() {
 		defer close(stopped)
-		ticker := time.NewTicker(pauseStatePollInterval)
-		defer ticker.Stop()
+		pauseTicker := time.NewTicker(pauseStatePollInterval)
+		heartbeatTicker := time.NewTicker(x.options.HeartbeatInterval)
+		defer pauseTicker.Stop()
+		defer heartbeatTicker.Stop()
 		for {
 			select {
 			case <-stop:
 				return
 			case <-parent.Done():
 				return
-			case <-processorCtx.Done():
-				return
-			case <-ticker.C:
+			case <-pauseTicker.C:
 				var video model.Video
-				if err := x.db.WithContext(processorCtx).Select("status").First(&video, "id = ?", videoID).Error; err != nil {
-					if processorCtx.Err() != nil {
-						return
-					}
-					log.Printf("check pause state for video %s: %v", videoID, err)
+				if err := x.db.WithContext(processorCtx).Select("status").First(&video, "id = ?", job.VideoID).Error; err == nil && video.Status == model.VideoStatusPaused {
+					pauseRequested.Store(true)
+					cancel()
+					return
+				}
+			case <-heartbeatTicker.C:
+				result := x.db.WithContext(processorCtx).Model(&model.ProcessingJob{}).
+					Where("id = ? AND status = ? AND lease_owner = ?", job.ID, model.JobStatusRunning, job.LeaseOwner).
+					Update("lease_expires_at", time.Now().UTC().Add(x.options.LeaseTTL))
+				if result.Error != nil {
+					log.Printf("renew lease for job %s: %v", job.ID, result.Error)
 					continue
 				}
-				if video.Status == model.VideoStatusPaused {
-					pauseRequested.Store(true)
+				if result.RowsAffected != 1 {
+					leaseLost.Store(true)
 					cancel()
 					return
 				}
@@ -226,27 +185,112 @@ func (x *Consumer) withPauseCancellation(parent context.Context, videoID string)
 		cancel()
 		<-stopped
 	}
-	return processorCtx, stopMonitor, pauseRequested
+	return processorCtx, stopMonitor, pauseRequested, leaseLost
 }
 
-func (x *Consumer) returnJobToPendingAfterPause(job model.ProcessingJob) error {
-	return x.db.Transaction(func(tx *gorm.DB) error {
+func (x *Consumer) returnJobToPendingAfterPause(ctx context.Context, job model.ProcessingJob) error {
+	return x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var video model.Video
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", job.VideoID).Error; err != nil {
 			return err
 		}
-		// 兄弟任务可能在暂停期间先进入 failed；本任务仍必须退出 running，避免留下僵尸任务。
 		result := tx.Model(&model.ProcessingJob{}).
-			Where("id = ? AND status = ?", job.ID, model.JobStatusRunning).
-			Updates(map[string]any{"status": model.JobStatusPending, "error_message": ""})
+			Where("id = ? AND status = ? AND lease_owner = ?", job.ID, model.JobStatusRunning, job.LeaseOwner).
+			Updates(map[string]any{"status": model.JobStatusPending, "error_message": "", "lease_owner": "", "lease_expires_at": nil})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
-			return fmt.Errorf("paused job %s is no longer running", job.ID)
+			return fmt.Errorf("paused job %s lost its lease", job.ID)
 		}
 		return nil
 	})
+}
+
+func (x *Consumer) completeJob(ctx context.Context, job model.ProcessingJob, uploadMethod string) error {
+	return x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var video model.Video
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", job.VideoID).Error; err != nil {
+			return err
+		}
+		result := tx.Model(&model.ProcessingJob{}).
+			Where("id = ? AND status = ? AND lease_owner = ?", job.ID, model.JobStatusRunning, job.LeaseOwner).
+			Updates(map[string]any{"status": model.JobStatusSucceeded, "error_message": "", "lease_owner": "", "lease_expires_at": nil})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("job %s lost its lease before completion", job.ID)
+		}
+		next, err := x.createNextJobs(tx, job)
+		if err != nil {
+			return err
+		}
+		finalStatus, err := x.reconcileVideoStatusLocked(tx, &video, uploadMethod)
+		if err != nil {
+			return err
+		}
+		if finalStatus != model.VideoStatusPaused {
+			for _, nextJob := range next {
+				if err := x.outbox.EnqueueJob(tx, nextJob, uploadMethod, time.Now().UTC()); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func (x *Consumer) handleProcessFailure(ctx context.Context, job model.ProcessingJob, uploadMethod, errorMessage string) error {
+	return x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var video model.Video
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", job.VideoID).Error; err != nil {
+			return err
+		}
+		var current model.ProcessingJob
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, "id = ?", job.ID).Error; err != nil {
+			return err
+		}
+		if current.Status != model.JobStatusRunning || current.LeaseOwner != job.LeaseOwner {
+			return nil
+		}
+		if video.Status == model.VideoStatusPaused {
+			// 暂停边界恰好与 Processor 失败重合时不消耗 attempt，恢复接口会重新派发当前任务。
+			return tx.Model(&current).Updates(map[string]any{
+				"status": model.JobStatusPending, "error_message": "", "lease_owner": "", "lease_expires_at": nil,
+			}).Error
+		}
+		if current.Attempt < x.options.MaxAttempts {
+			current.Attempt++
+			if err := tx.Model(&current).Updates(map[string]any{
+				"status": model.JobStatusPending, "attempt": current.Attempt, "error_message": errorMessage,
+				"lease_owner": "", "lease_expires_at": nil,
+			}).Error; err != nil {
+				return err
+			}
+			return x.outbox.EnqueueJob(tx, current, uploadMethod, time.Now().UTC().Add(x.retryDelay(current.Attempt-1)))
+		}
+		if err := tx.Model(&current).Updates(map[string]any{
+			"status": model.JobStatusFailed, "error_message": errorMessage, "lease_owner": "", "lease_expires_at": nil,
+		}).Error; err != nil {
+			return err
+		}
+		if _, err := x.reconcileVideoStatusLocked(tx, &video, uploadMethod); err != nil {
+			return err
+		}
+		return x.outbox.EnqueueDeadLetter(tx, current, uploadMethod)
+	})
+}
+
+func (x *Consumer) retryDelay(failedAttempt int) time.Duration {
+	index := failedAttempt - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(x.options.RetryDelays) {
+		index = len(x.options.RetryDelays) - 1
+	}
+	return x.options.RetryDelays[index]
 }
 
 func (x *Consumer) prerequisitesSatisfied(db *gorm.DB, job *model.ProcessingJob, uploadMethod string) (bool, error) {
@@ -273,7 +317,6 @@ func (x *Consumer) prerequisitesSatisfied(db *gorm.DB, job *model.ProcessingJob,
 	return count == int64(len(prerequisiteTypes)), err
 }
 
-// createNextJobs 只创建不存在的下一阶段任务；暂停时这些任务留在 pending，等待恢复接口重新投递。
 func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([]model.ProcessingJob, error) {
 	var taskTypes []string
 	switch completed.TaskType {
@@ -290,14 +333,10 @@ func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([
 			taskTypes = []string{model.TaskRAGIndex, model.TaskSummary}
 		}
 	}
-
 	next := make([]model.ProcessingJob, 0, len(taskTypes))
 	for _, taskType := range taskTypes {
 		candidate := model.ProcessingJob{TenantID: completed.TenantID, VideoID: completed.VideoID, TaskType: taskType, Attempt: 1, Status: model.JobStatusPending}
-		result := tx.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "video_id"}, {Name: "task_type"}},
-			DoNothing: true,
-		}).Create(&candidate)
+		result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "video_id"}, {Name: "task_type"}}, DoNothing: true}).Create(&candidate)
 		if result.Error != nil {
 			return nil, result.Error
 		}
@@ -306,15 +345,6 @@ func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([
 		}
 	}
 	return next, nil
-}
-
-// reconcileVideoStatus 是唯一负责从任务状态推导视频总体状态的地方。
-func (x *Consumer) reconcileVideoStatus(tx *gorm.DB, videoID, uploadMethod string) (string, error) {
-	var video model.Video
-	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", videoID).Error; err != nil {
-		return "", err
-	}
-	return x.reconcileVideoStatusLocked(tx, &video, uploadMethod)
 }
 
 func (x *Consumer) reconcileVideoStatusLocked(tx *gorm.DB, video *model.Video, uploadMethod string) (string, error) {
@@ -334,12 +364,10 @@ func (x *Consumer) reconcileVideoStatusLocked(tx *gorm.DB, video *model.Video, u
 	if err := tx.Model(video).Updates(updates).Error; err != nil {
 		return "", err
 	}
-	video.Status = status
-	video.ErrorMessage = errorMessage
+	video.Status, video.ErrorMessage = status, errorMessage
 	return status, nil
 }
 
-// deriveVideoStatus 让失败和完成终态优先于 paused，其余未完成任务才保留暂停状态。
 func deriveVideoStatus(currentStatus, uploadMethod string, jobs []model.ProcessingJob, requiredTaskTypes []string) (string, string) {
 	statuses := make(map[string]string, len(jobs))
 	for _, job := range jobs {
@@ -367,25 +395,6 @@ func deriveVideoStatus(currentStatus, uploadMethod string, jobs []model.Processi
 	return model.VideoStatusProcessing, ""
 }
 
-func (x *Consumer) markJobFailed(job model.ProcessingJob, errorMessage, uploadMethod string) error {
-	return x.db.Transaction(func(tx *gorm.DB) error {
-		var video model.Video
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", job.VideoID).Error; err != nil {
-			return err
-		}
-		// 下游消息发布与暂停并发时保留 pending，恢复接口会负责重新投递。
-		if video.Status == model.VideoStatusPaused && job.Status == model.JobStatusPending {
-			return nil
-		}
-		if err := tx.Model(&model.ProcessingJob{}).Where("id = ?", job.ID).
-			Updates(map[string]any{"status": model.JobStatusFailed, "error_message": errorMessage}).Error; err != nil {
-			return err
-		}
-		_, err := x.reconcileVideoStatusLocked(tx, &video, uploadMethod)
-		return err
-	})
-}
-
 func requiredTaskTypesForUploadMethod(uploadMethod string) ([]string, error) {
 	switch uploadMethod {
 	case queue.UploadMethodLocalDirect:
@@ -397,7 +406,67 @@ func requiredTaskTypesForUploadMethod(uploadMethod string) ([]string, error) {
 	}
 }
 
-// PlaceholderProcessor 保证尚未接入的阶段仍能推进；真实阶段应实现可取消的 context 调用。
+// ReconcileExpired 回收崩溃 Worker 遗留的过期 running 任务，并在同一事务追加新 Outbox。
+func (x *Consumer) ReconcileExpired(ctx context.Context) (int, error) {
+	var ids []string
+	if err := x.db.WithContext(ctx).Model(&model.ProcessingJob{}).
+		Where("status = ? AND lease_expires_at < ?", model.JobStatusRunning, time.Now().UTC()).
+		Order("lease_expires_at").Limit(100).Pluck("id", &ids).Error; err != nil {
+		return 0, err
+	}
+	recovered := 0
+	for _, id := range ids {
+		err := x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var job model.ProcessingJob
+			if err := tx.First(&job, "id = ?", id).Error; err != nil {
+				return err
+			}
+			var video model.Video
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", job.VideoID).Error; err != nil {
+				return err
+			}
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&job, "id = ?", id).Error; err != nil {
+				return err
+			}
+			if job.Status != model.JobStatusRunning || job.LeaseExpiresAt == nil || !job.LeaseExpiresAt.Before(time.Now().UTC()) {
+				return nil
+			}
+			if err := tx.Model(&job).Updates(map[string]any{"status": model.JobStatusPending, "lease_owner": "", "lease_expires_at": nil}).Error; err != nil {
+				return err
+			}
+			if video.Status != model.VideoStatusPaused && video.Status != model.VideoStatusReady && video.Status != model.VideoStatusFailed {
+				if err := x.outbox.EnqueueJob(tx, job, video.UploadMethod, time.Now().UTC()); err != nil {
+					return err
+				}
+			}
+			recovered++
+			return nil
+		})
+		if err != nil {
+			return recovered, err
+		}
+	}
+	return recovered, nil
+}
+
+func (x *Consumer) RunReconciler(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count, err := x.ReconcileExpired(ctx)
+			if err != nil {
+				log.Printf("reconcile expired job leases: %v", err)
+			} else if count > 0 {
+				log.Printf("recovered %d expired job leases", count)
+			}
+		}
+	}
+}
+
 type PlaceholderProcessor struct{}
 
 func (PlaceholderProcessor) Process(ctx context.Context, job queue.VideoJobMessage) error {
