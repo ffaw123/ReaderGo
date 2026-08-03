@@ -146,6 +146,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .video-item__content small { display: flex; align-items: center; gap: 5px; color: #667a71; font-size: 9px; }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #d6a663; }
 .status-dot--ready { background: #8bc9a8; }
+.status-dot--paused { background: #8796aa; }
 .status-dot--failed { background: #d46e5d; }
 .sidebar-loading, .library-empty { display: flex; flex: 1; align-items: center; justify-content: center; color: #70827a; font-size: 11px; }
 .sidebar-loading { gap: 8px; }
@@ -188,18 +189,25 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .video-title-row h1 { margin: 4px 0 0; overflow: hidden; color: var(--ink); font-size: 20px; font-weight: 600; letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap; }
 .status-card { margin-top: 22px; padding: 18px 19px 15px; border: 1px solid #dce1da; border-radius: 15px; background: var(--paper); }
 .status-card--working { background: #fbf9f2; }
+.status-card--paused { border-color: #d5dbe4; background: #f5f7fa; }
 .status-card--danger { border-color: #e7c9c1; background: #fdf7f4; }
 .status-card__top { display: flex; align-items: center; gap: 11px; }
 .status-illustration { display: grid; width: 36px; height: 36px; place-items: center; border-radius: 11px; color: #315d4b; background: #ddefe4; }
 .status-card--working .status-illustration { color: #8a5f30; background: #f5e8cf; }
+.status-card--paused .status-illustration { color: #53657c; background: #e1e7ef; }
 .status-card--danger .status-illustration { color: #9a4435; background: #f3dcd6; }
-.status-card__top > div { flex: 1; }
+.status-card__copy { min-width: 0; flex: 1; }
 .status-card__top strong { color: #24342e; font-size: 13px; }
 .status-card__top p { margin: 3px 0 0; color: #7f8884; font-size: 10px; }
 .status-percent { color: var(--green); font-size: 11px; font-weight: 700; }
+.status-card__actions { display: flex; align-items: center; gap: 10px; }
+.status-control { display: inline-flex; height: 30px; padding: 0 10px; align-items: center; gap: 5px; border: 1px solid #ced7d1; border-radius: 8px; color: #3d6152; background: #f8faf7; font: inherit; font-size: 10px; font-weight: 700; cursor: pointer; }
+.status-control:hover:not(:disabled) { border-color: #aebfb5; background: #edf4ef; }
+.status-control:disabled { cursor: not-allowed; opacity: .55; }
 .progress-track { height: 4px; margin-top: 15px; overflow: hidden; border-radius: 99px; background: #e4e5de; }
 .progress-track > span { display: block; height: 100%; border-radius: inherit; background: var(--green); transition: width 300ms ease; }
 .status-card--working .progress-track > span { background: #ce8d51; }
+.status-card--paused .progress-track > span { background: #8494a8; }
 .status-card--danger .progress-track > span { background: #c86250; }
 .process-steps { display: flex; margin-top: 13px; justify-content: space-between; gap: 8px; color: #a0a7a3; font-size: 9px; }
 .process-steps span { display: flex; align-items: center; gap: 3px; }

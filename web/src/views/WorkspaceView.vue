@@ -19,6 +19,7 @@ import {
   MessageCircleMore,
   MoreHorizontal,
   PanelLeftClose,
+  Pause,
   Play,
   Plus,
   RotateCcw,
@@ -58,6 +59,8 @@ const dragActive = ref(false)
 const uploadBusy = ref(false)
 const uploadProgress = ref(0)
 const uploadError = ref('')
+const pauseSettled = ref(true)
+const statusActionBusy = ref(false)
 let statusTimer
 let toastTimer
 
@@ -69,11 +72,24 @@ const filteredVideos = computed(() => {
 const userName = computed(() => session.value?.user?.display_name || session.value?.user?.email?.split('@')[0] || '探索者')
 const userInitial = computed(() => userName.value.slice(0, 1).toUpperCase())
 const isReady = computed(() => selectedVideo.value?.status === 'ready')
+const canPauseSelected = computed(() => {
+  const video = selectedVideo.value
+  if (!video) return false
+  if (video.status === 'processing') return true
+  // URL prepare 属于后台流水线；本地 Multipart 尚未完成时不显示处理暂停。
+  return video.status === 'uploading' && /^https?:\/\//i.test(video.source_url || '')
+})
 const statusMeta = computed(() => {
   const statuses = {
     ready: { label: '分析完成', detail: '所有内容已可检索', percent: 100, tone: 'success' },
     processing: { label: '正在处理视频', detail: '正在解析内容、建立索引和生成摘要', percent: 64, tone: 'working' },
     uploading: { label: '等待上传完成', detail: '文件分片正在传输', percent: 16, tone: 'working' },
+    paused: {
+      label: pauseSettled.value ? '处理已暂停' : '正在暂停处理',
+      detail: pauseSettled.value ? '点击继续后将从未完成的阶段恢复' : '正在安全停止运行中的任务',
+      percent: 64,
+      tone: 'paused',
+    },
     failed: { label: '处理失败', detail: '请检查视频源后重试', percent: 100, tone: 'danger' },
   }
   return statuses[selectedVideo.value?.status] || statuses.uploading
@@ -171,11 +187,51 @@ async function loadSelectedContent() {
 async function refreshStatus() {
   if (previewMode.value || !selectedVideo.value || ['ready', 'failed'].includes(selectedVideo.value.status)) return
   try {
-    const status = await api.getVideoStatus(selectedVideo.value.id)
+    const status = await api.getVideoStatus(selectedVideo.value.id, true)
     selectedVideo.value.status = status.status
+    pauseSettled.value = status.pause_settled !== false
     if (status.status === 'ready') await loadSelectedContent()
   } catch {
     // 轮询失败不打断用户；显式操作时再展示错误。
+  }
+}
+
+async function toggleProcessing() {
+  const video = selectedVideo.value
+  if (!video || statusActionBusy.value) return
+  if (video.status === 'paused' && !pauseSettled.value) return
+
+  statusActionBusy.value = true
+  try {
+    if (previewMode.value) {
+      if (video.status === 'paused') {
+        video.status = video.previewPausedFrom || 'processing'
+        pauseSettled.value = true
+        notify('已继续处理视频')
+      } else {
+        video.previewPausedFrom = video.status
+        video.status = 'paused'
+        pauseSettled.value = true
+        notify('视频处理已暂停')
+      }
+      return
+    }
+    if (video.status === 'paused') {
+      const result = await api.resumeVideo(video.id)
+      video.status = result.status
+      pauseSettled.value = true
+      notify('已继续处理视频')
+    } else {
+      const result = await api.pauseVideo(video.id)
+      video.status = result.status
+      pauseSettled.value = result.pause_settled
+      notify(result.pause_settled ? '视频处理已暂停' : '正在安全暂停视频处理')
+    }
+  } catch (error) {
+    notify(error.message, 'error')
+    await refreshStatus()
+  } finally {
+    statusActionBusy.value = false
   }
 }
 
@@ -402,15 +458,17 @@ function formatRelative(date) {
 }
 
 function statusLabel(status) {
-  return { ready: '可提问', processing: '处理中', failed: '失败', uploading: '上传中' }[status] || '处理中'
+  return { ready: '可提问', processing: '处理中', paused: '已暂停', failed: '失败', uploading: '上传中' }[status] || '处理中'
 }
 
 watch(
   selectedId,
   async () => {
+    pauseSettled.value = true
     await loadSelectedContent()
     clearInterval(statusTimer)
     statusTimer = setInterval(refreshStatus, 5000)
+    await refreshStatus()
     await nextTick()
     scrollChat()
   },
@@ -555,14 +613,28 @@ onBeforeUnmount(() => {
               <div class="status-card__top">
                 <span class="status-illustration">
                   <Check v-if="isReady" :size="21" />
+                  <Pause v-else-if="selectedVideo.status === 'paused'" :size="21" />
                   <LoaderCircle v-else-if="selectedVideo.status !== 'failed'" :size="21" class="spin" />
                   <X v-else :size="21" />
                 </span>
-                <div>
+                <div class="status-card__copy">
                   <strong>{{ statusMeta.label }}</strong>
                   <p>{{ statusMeta.detail }}</p>
                 </div>
-                <span class="status-percent">{{ statusMeta.percent }}%</span>
+                <div class="status-card__actions">
+                  <span class="status-percent">{{ statusMeta.percent }}%</span>
+                  <button
+                    v-if="canPauseSelected || selectedVideo.status === 'paused'"
+                    class="status-control"
+                    :disabled="statusActionBusy || (selectedVideo.status === 'paused' && !pauseSettled)"
+                    @click="toggleProcessing"
+                  >
+                    <LoaderCircle v-if="statusActionBusy" :size="13" class="spin" />
+                    <Play v-else-if="selectedVideo.status === 'paused'" :size="13" fill="currentColor" />
+                    <Pause v-else :size="13" />
+                    {{ selectedVideo.status === 'paused' ? (pauseSettled ? '继续处理' : '正在暂停') : '暂停处理' }}
+                  </button>
+                </div>
               </div>
               <div class="progress-track"><span :style="{ width: `${statusMeta.percent}%` }"></span></div>
               <div class="process-steps">

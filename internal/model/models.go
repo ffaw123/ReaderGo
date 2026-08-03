@@ -5,6 +5,7 @@ import "time"
 const (
 	VideoStatusUploading  = "uploading"
 	VideoStatusProcessing = "processing"
+	VideoStatusPaused     = "paused"
 	VideoStatusReady      = "ready"
 	VideoStatusFailed     = "failed"
 
@@ -33,16 +34,19 @@ type User struct {
 // Video 记录提交的视频来源及其异步处理生命周期。
 // TenantID 永不序列化，调用方不能获知或伪造资源归属。
 type Video struct {
-	ID           string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	TenantID     string    `gorm:"type:uuid;not null;index" json:"-"`
-	SourceURL    string    `json:"source_url"`
-	Title        string    `json:"title"`
-	Status       string    `json:"status"`
-	DurationMS   int64     `json:"duration_ms"`
-	ObjectKey    string    `json:"object_key"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID        string `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID  string `gorm:"type:uuid;not null;index" json:"-"`
+	SourceURL string `json:"source_url"`
+	Title     string `json:"title"`
+	Status    string `json:"status"`
+	// UploadMethod 持久化源文件进入方式，供暂停恢复时安全重建 Kafka 消息。
+	UploadMethod     string    `json:"-"`
+	PausedFromStatus *string   `json:"paused_from_status,omitempty"`
+	DurationMS       int64     `json:"duration_ms"`
+	ObjectKey        string    `json:"object_key"`
+	ErrorMessage     string    `json:"error_message,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // ProcessingJob 记录由 Kafka 分发的处理任务及其重试次数。

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -16,9 +17,18 @@ import (
 	"readergo/internal/model"
 )
 
+func TestDeduplicateFramesStopsWhenContextIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := (&OCRProcessor{}).deduplicateFrames(ctx, []media.FrameSample{{Path: "must-not-be-read.jpg"}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("deduplicateFrames() error = %v, want context.Canceled", err)
+	}
+}
+
 func TestDeduplicateFramesAlwaysMergesSameTimestamp(t *testing.T) {
 	processor := &OCRProcessor{hashDistance: 0}
-	frames, err := processor.deduplicateFrames([]media.FrameSample{
+	frames, err := processor.deduplicateFrames(context.Background(), []media.FrameSample{
 		{TimestampMS: 15000, Path: createOCRTestImage(t)},
 		// 第二个路径故意不存在：同毫秒采样应在读取图片前直接合并。
 		{TimestampMS: 15000, Path: "does-not-exist.jpg"},

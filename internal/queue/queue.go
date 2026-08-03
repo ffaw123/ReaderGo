@@ -34,6 +34,11 @@ type VideoJobMessage struct {
 	UploadMethod string `json:"upload_method"`
 }
 
+// Publisher 抽象任务投递能力，便于 API 与 Worker 在测试中替换 Kafka 实现。
+type Publisher interface {
+	Publish(context.Context, VideoJobMessage) error
+}
+
 // IsUploadMethod 用于在消费前拒绝缺失或未知的上传方式，避免错误地跳过前置任务。
 func IsUploadMethod(method string) bool {
 	return method == UploadMethodLocalDirect || method == UploadMethodURL

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -17,16 +18,25 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Server 汇集 HTTP 接口依赖，避免处理器直接依赖全局变量。
 type Server struct {
 	db       *gorm.DB
 	auth     *auth.Service
-	jobs     *queue.Producer
+	jobs     queue.Publisher
 	uploads  *storage.MultipartStore
 	partSize int64
 }
+
+var (
+	errVideoNotPausable       = errors.New("video is not in a pausable state")
+	errVideoNotPaused         = errors.New("video is not paused")
+	errPauseStillSettling     = errors.New("running jobs have not stopped yet")
+	errPausedVideoHasFailures = errors.New("paused video contains failed jobs")
+	errNoPendingJobs          = errors.New("paused video has no pending jobs")
+)
 
 const (
 	// 首批 URL 与建议的最大并发数一致，避免在初始化时暴露全部分片授权。
@@ -89,7 +99,7 @@ func (s *Server) createUpload(c *gin.Context) {
 	// 使用固定对象名，不信任 filename 的扩展名；上传完成后由 FFprobe 校验真实媒体格式。
 	objectKey := fmt.Sprintf("tenants/%s/videos/%s/source/original", tenantID, videoID)
 	// 先创建 uploading 视频记录，让后续完成上传流程拥有稳定的资源归属。
-	v := model.Video{ID: videoID, TenantID: tenantID, SourceURL: "local://" + in.Filename, Title: in.Title, Status: model.VideoStatusUploading, ObjectKey: objectKey}
+	v := model.Video{ID: videoID, TenantID: tenantID, SourceURL: "local://" + in.Filename, Title: in.Title, Status: model.VideoStatusUploading, UploadMethod: queue.UploadMethodLocalDirect, ObjectKey: objectKey}
 	if e := s.db.Create(&v).Error; e != nil {
 		fail(c, e)
 		return
@@ -167,7 +177,7 @@ func (s *Server) uploadPartURLs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"upload_id": session.ID, "parts": parts})
 }
 
-// 这个函数会将前面上传的分片也直接清除，不能用于用户手动暂停（未实现）。
+// 这个函数会将前面上传的分片也直接清除，不能用于视频处理暂停。
 // cancelUpload 中止对象存储 multipart upload，并保留数据库记录供审计与清理。
 // 只允许将仍在上传的会话转换为 cancelled，避免覆盖已完成或其他终态。
 func (s *Server) cancelUpload(ctx context.Context, session model.UploadSession, reason string) error {
@@ -314,7 +324,7 @@ func firstPartNumbers(partCount int) []int {
 }
 
 // New 使用数据库、鉴权服务、消息生产者和视频上传创建 API 服务。
-func New(db *gorm.DB, authService *auth.Service, jobs *queue.Producer, uploads *storage.MultipartStore, partSize int64) *Server {
+func New(db *gorm.DB, authService *auth.Service, jobs queue.Publisher, uploads *storage.MultipartStore, partSize int64) *Server {
 	return &Server{db: db, auth: authService, jobs: jobs, uploads: uploads, partSize: partSize}
 }
 
@@ -335,6 +345,8 @@ func (s *Server) Router() *gin.Engine {
 	p.POST("/uploads/:id/complete", s.completeUpload)
 	p.GET("/videos/:id", s.getVideo) // 这里的id是指视频id
 	p.GET("/videos/:id/status", s.videoStatus)
+	p.POST("/videos/:id/pause", s.pauseVideo)
+	p.POST("/videos/:id/resume", s.resumeVideo)
 	p.GET("/videos/:id/summary", s.summary)
 	p.POST("/videos/:id/conversations", s.createConversation)
 	p.POST("/conversations/:id/messages", s.createMessage) // 这里的id是会话id
@@ -424,7 +436,7 @@ func (s *Server) createVideo(c *gin.Context) {
 		return
 	}
 	tenant := auth.UserID(c)
-	v := model.Video{TenantID: tenant, SourceURL: in.SourceURL, Title: in.Title, Status: model.VideoStatusUploading}
+	v := model.Video{TenantID: tenant, SourceURL: in.SourceURL, Title: in.Title, Status: model.VideoStatusUploading, UploadMethod: queue.UploadMethodURL}
 	if e = s.db.Create(&v).Error; e != nil {
 		fail(c, e)
 		return
@@ -462,14 +474,209 @@ func (s *Server) getVideo(c *gin.Context) {
 	}
 }
 
+// pauseVideo 只改变视频的期望运行状态；正在执行的任务由 Worker 确认取消后回到 pending。
+// API 不能直接把 running 改为 pending，否则旧 Worker 尚未退出时可能被恢复请求重复启动。
+func (s *Server) pauseVideo(c *gin.Context) {
+	tenantID := auth.UserID(c)
+	var video model.Video
+	var runningJobs int64
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		// 与 Worker 的任务抢占使用同一把视频行锁，保证“开始执行”和“请求暂停”有明确先后顺序。
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", c.Param("id"), tenantID).
+			First(&video).Error; err != nil {
+			return err
+		}
+		if video.Status == model.VideoStatusPaused {
+			return tx.Model(&model.ProcessingJob{}).
+				Where("video_id = ? AND status = ?", video.ID, model.JobStatusRunning).
+				Count(&runningJobs).Error
+		}
+		if video.Status != model.VideoStatusProcessing && video.Status != model.VideoStatusUploading {
+			return errVideoNotPausable
+		}
+		// 本地 Multipart 上传由浏览器负责，尚未完成时没有后台任务，不能混用视频处理暂停。
+		if video.Status == model.VideoStatusUploading && video.UploadMethod != queue.UploadMethodURL {
+			return errVideoNotPausable
+		}
+		var jobCount int64
+		if err := tx.Model(&model.ProcessingJob{}).Where("video_id = ?", video.ID).Count(&jobCount).Error; err != nil {
+			return err
+		}
+		if jobCount == 0 {
+			return errVideoNotPausable
+		}
+		pausedFrom := video.Status
+		if err := tx.Model(&video).Updates(map[string]any{
+			"status":             model.VideoStatusPaused,
+			"paused_from_status": pausedFrom,
+		}).Error; err != nil {
+			return err
+		}
+		video.Status = model.VideoStatusPaused
+		video.PausedFromStatus = &pausedFrom
+		return tx.Model(&model.ProcessingJob{}).
+			Where("video_id = ? AND status = ?", video.ID, model.JobStatusRunning).
+			Count(&runningJobs).Error
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "video not found"})
+		case errors.Is(err, errVideoNotPausable):
+			c.JSON(http.StatusConflict, gin.H{"error": "video is not in a pausable state"})
+		default:
+			fail(c, err)
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"video_id":      video.ID,
+		"status":        model.VideoStatusPaused,
+		"pause_settled": runningJobs == 0,
+	})
+}
+
+// resumeVideo 恢复暂停前的总体状态，并只重新投递尚未完成的 pending 任务。
+func (s *Server) resumeVideo(c *gin.Context) {
+	tenantID := auth.UserID(c)
+	var video model.Video
+	var pendingJobs []model.ProcessingJob
+	restoredStatus := ""
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", c.Param("id"), tenantID).
+			First(&video).Error; err != nil {
+			return err
+		}
+		if video.Status != model.VideoStatusPaused {
+			return errVideoNotPaused
+		}
+		var runningJobs int64
+		if err := tx.Model(&model.ProcessingJob{}).
+			Where("video_id = ? AND status = ?", video.ID, model.JobStatusRunning).
+			Count(&runningJobs).Error; err != nil {
+			return err
+		}
+		if runningJobs > 0 {
+			return errPauseStillSettling
+		}
+		var failedJobs int64
+		if err := tx.Model(&model.ProcessingJob{}).
+			Where("video_id = ? AND status = ?", video.ID, model.JobStatusFailed).
+			Count(&failedJobs).Error; err != nil {
+			return err
+		}
+		if failedJobs > 0 {
+			return errPausedVideoHasFailures
+		}
+		if err := tx.Where("video_id = ? AND status = ?", video.ID, model.JobStatusPending).
+			Order("created_at").Find(&pendingJobs).Error; err != nil {
+			return err
+		}
+		if len(pendingJobs) == 0 {
+			return errNoPendingJobs
+		}
+		if video.PausedFromStatus != nil {
+			restoredStatus = *video.PausedFromStatus
+		}
+		if restoredStatus != model.VideoStatusUploading && restoredStatus != model.VideoStatusProcessing {
+			// 兼容迁移前的极端数据；URL prepare 尚未完成时应回到 uploading。
+			restoredStatus = model.VideoStatusProcessing
+			if video.UploadMethod == queue.UploadMethodURL {
+				var prepareSucceeded int64
+				if err := tx.Model(&model.ProcessingJob{}).
+					Where("video_id = ? AND task_type = ? AND status = ?", video.ID, model.TaskPrepare, model.JobStatusSucceeded).
+					Count(&prepareSucceeded).Error; err != nil {
+					return err
+				}
+				if prepareSucceeded == 0 {
+					restoredStatus = model.VideoStatusUploading
+				}
+			}
+		}
+		if err := tx.Model(&video).Updates(map[string]any{
+			"status":             restoredStatus,
+			"paused_from_status": nil,
+		}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "video not found"})
+		case errors.Is(err, errPauseStillSettling):
+			c.JSON(http.StatusConflict, gin.H{"error": "video is still pausing; wait for running jobs to stop"})
+		case errors.Is(err, errPausedVideoHasFailures):
+			c.JSON(http.StatusConflict, gin.H{"error": "video has failed jobs and cannot be resumed"})
+		case errors.Is(err, errNoPendingJobs):
+			c.JSON(http.StatusConflict, gin.H{"error": "video has no pending jobs to resume"})
+		case errors.Is(err, errVideoNotPaused):
+			c.JSON(http.StatusConflict, gin.H{"error": "video is not paused"})
+		default:
+			fail(c, err)
+		}
+		return
+	}
+
+	for _, job := range pendingJobs {
+		message := queue.VideoJobMessage{
+			JobID: job.ID, TenantID: job.TenantID, VideoID: job.VideoID,
+			TaskType: job.TaskType, Attempt: job.Attempt, UploadMethod: video.UploadMethod,
+		}
+		if err := s.jobs.Publish(context.Background(), message); err != nil {
+			// 部分消息可能已经发布；重新置为 paused 后，Worker 的视频状态门禁会阻止它们执行。
+			_ = s.restorePausedAfterPublishFailure(video.ID, tenantID, restoredStatus)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not queue resumed processing jobs"})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"video_id":    video.ID,
+		"status":      restoredStatus,
+		"queued_jobs": len(pendingJobs),
+	})
+}
+
+func (s *Server) restorePausedAfterPublishFailure(videoID, tenantID, restoredStatus string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var video model.Video
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", videoID, tenantID).First(&video).Error; err != nil {
+			return err
+		}
+		// 已经进入 ready/failed 的终态不能被补偿逻辑倒退回 paused。
+		if video.Status == model.VideoStatusReady || video.Status == model.VideoStatusFailed {
+			return nil
+		}
+		return tx.Model(&video).Updates(map[string]any{
+			"status":             model.VideoStatusPaused,
+			"paused_from_status": restoredStatus,
+		}).Error
+	})
+}
+
 // videoStatus 同时返回视频状态和最近一次处理任务状态，便于前端轮询。
 func (s *Server) videoStatus(c *gin.Context) {
 	v, ok := s.ownedVideo(c)
 	if !ok {
 		return
 	}
+	pauseSettled := true
+	if v.Status == model.VideoStatusPaused {
+		var runningJobs int64
+		if err := s.db.Model(&model.ProcessingJob{}).
+			Where("video_id = ? AND status = ?", v.ID, model.JobStatusRunning).
+			Count(&runningJobs).Error; err != nil {
+			fail(c, err)
+			return
+		}
+		pauseSettled = runningJobs == 0
+	}
 	if c.Query("details") != "true" {
-		c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage})
+		c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "pause_settled": pauseSettled})
 		return
 	}
 	var jobs []model.ProcessingJob
@@ -478,7 +685,7 @@ func (s *Server) videoStatus(c *gin.Context) {
 		fail(c, result.Error)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "jobs": jobs})
+	c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "pause_settled": pauseSettled, "jobs": jobs})
 }
 
 // summary 只有处理完成并写入摘要后才返回内容。

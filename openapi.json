@@ -76,7 +76,8 @@
           "id":            { "type": "string", "format": "uuid" },
           "source_url":    { "type": "string", "format": "uri" },
           "title":         { "type": "string" },
-          "status":        { "type": "string", "enum": ["uploading","processing","ready","failed"] },
+          "status":        { "type": "string", "enum": ["uploading","processing","paused","ready","failed"] },
+          "paused_from_status": { "type": "string", "enum": ["uploading","processing"], "description": "仅在暂停时返回暂停前的总体状态" },
           "duration_ms":   { "type": "integer", "format": "int64" },
           "object_key":    { "type": "string" },
           "error_message": { "type": "string" },
@@ -134,13 +135,23 @@
         "type": "object",
         "properties": {
           "video_id":       { "type": "string", "format": "uuid" },
-          "status":         { "type": "string" },
+          "status":         { "type": "string", "enum": ["uploading","processing","paused","ready","failed"] },
           "error_message":  { "type": "string" },
+          "pause_settled":  { "type": "boolean", "description": "paused 时表示所有 running 任务是否已经安全停止" },
           "jobs": {
             "type": "array",
             "description": "仅在 details=true 时返回；各阶段的任务详情。",
             "items": { "$ref": "#/components/schemas/ProcessingJob" }
           }
+        }
+      },
+      "VideoControlResponse": {
+        "type": "object",
+        "properties": {
+          "video_id":      { "type": "string", "format": "uuid" },
+          "status":        { "type": "string", "enum": ["uploading","processing","paused"] },
+          "pause_settled": { "type": "boolean", "description": "暂停接口返回；false 表示 Worker 仍在停止任务" },
+          "queued_jobs":   { "type": "integer", "description": "恢复接口重新投递的 pending 任务数量" }
         }
       },
       "VideoSummary": {
@@ -470,6 +481,74 @@
           },
           "404": {
             "description": "视频不存在",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/videos/{id}/pause": {
+      "post": {
+        "tags": ["Videos"],
+        "summary": "暂停视频处理",
+        "description": "将视频标记为 paused；Worker 安全取消 running 任务后会将任务恢复为 pending。",
+        "operationId": "pauseVideo",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "视频 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "暂停请求已接受",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VideoControlResponse" } } }
+          },
+          "404": {
+            "description": "视频不存在",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "视频当前状态不允许暂停",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/videos/{id}/resume": {
+      "post": {
+        "tags": ["Videos"],
+        "summary": "继续视频处理",
+        "description": "恢复暂停前状态，并重新投递所有尚未完成的 pending 任务。",
+        "operationId": "resumeVideo",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "视频 UUID",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "视频处理已恢复",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VideoControlResponse" } } }
+          },
+          "404": {
+            "description": "视频不存在",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "视频未暂停、仍在停止任务，或没有可恢复任务",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": {
+            "description": "恢复任务投递失败，视频会补偿回 paused",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
         }

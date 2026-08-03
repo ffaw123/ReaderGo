@@ -9,9 +9,52 @@ import (
 	"strings"
 	"testing"
 
+	"readergo/internal/model"
+	"readergo/internal/queue"
+
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 )
+
+func TestDeriveVideoStatusPreservesPausedWithPendingJobs(t *testing.T) {
+	jobs := []model.ProcessingJob{
+		{TaskType: model.TaskASR, Status: model.JobStatusSucceeded},
+		{TaskType: model.TaskVision, Status: model.JobStatusPending},
+	}
+	required := []string{model.TaskASR, model.TaskVision}
+	status, errorMessage := deriveVideoStatus(model.VideoStatusPaused, queue.UploadMethodLocalDirect, jobs, required)
+	if status != model.VideoStatusPaused || errorMessage != "" {
+		t.Fatalf("deriveVideoStatus() = (%q, %q), want paused without error", status, errorMessage)
+	}
+}
+
+func TestDeriveVideoStatusLetsReadyWinOverPaused(t *testing.T) {
+	jobs := []model.ProcessingJob{
+		{TaskType: model.TaskASR, Status: model.JobStatusSucceeded},
+		{TaskType: model.TaskVision, Status: model.JobStatusSucceeded},
+	}
+	required := []string{model.TaskASR, model.TaskVision}
+	status, _ := deriveVideoStatus(model.VideoStatusPaused, queue.UploadMethodLocalDirect, jobs, required)
+	if status != model.VideoStatusReady {
+		t.Fatalf("deriveVideoStatus() = %q, want ready", status)
+	}
+}
+
+func TestDeriveVideoStatusLetsFailureWinOverPaused(t *testing.T) {
+	jobs := []model.ProcessingJob{{TaskType: model.TaskASR, Status: model.JobStatusFailed, ErrorMessage: "ASR unavailable"}}
+	status, errorMessage := deriveVideoStatus(model.VideoStatusPaused, queue.UploadMethodLocalDirect, jobs, []string{model.TaskASR})
+	if status != model.VideoStatusFailed || errorMessage != "ASR unavailable" {
+		t.Fatalf("deriveVideoStatus() = (%q, %q), want failed with job error", status, errorMessage)
+	}
+}
+
+func TestDeriveVideoStatusKeepsURLPrepareUploading(t *testing.T) {
+	jobs := []model.ProcessingJob{{TaskType: model.TaskPrepare, Status: model.JobStatusPending}}
+	status, _ := deriveVideoStatus(model.VideoStatusUploading, queue.UploadMethodURL, jobs, []string{model.TaskPrepare})
+	if status != model.VideoStatusUploading {
+		t.Fatalf("deriveVideoStatus() = %q, want uploading", status)
+	}
+}
 
 func TestBuildAudioChunksKeepsShortVideoAsTailChunk(t *testing.T) {
 	chunks := buildAudioChunks(22000)

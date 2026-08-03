@@ -36,7 +36,9 @@ export const api = {
   register: (body) => request('/api/auth/register', { method: 'POST', body: JSON.stringify(body) }),
   createVideo: (body) => request('/api/videos', { method: 'POST', body: JSON.stringify(body) }),
   getVideo: (id) => request(`/api/videos/${id}`),
-  getVideoStatus: (id) => request(`/api/videos/${id}/status`),
+  getVideoStatus: (id, details = false) => request(`/api/videos/${id}/status${details ? '?details=true' : ''}`),
+  pauseVideo: (id) => request(`/api/videos/${id}/pause`, { method: 'POST' }),
+  resumeVideo: (id) => request(`/api/videos/${id}/resume`, { method: 'POST' }),
   getSummary: (id) => request(`/api/videos/${id}/summary`),
   createConversation: (videoId, title) =>
     request(`/api/videos/${videoId}/conversations`, {

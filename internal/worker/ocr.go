@@ -157,7 +157,7 @@ func (p *OCRProcessor) consumeOCR(ctx context.Context, job queue.VideoJobMessage
 	if err != nil {
 		return err
 	}
-	frames, err := p.deduplicateFrames(samples)
+	frames, err := p.deduplicateFrames(ctx, samples)
 	if err != nil {
 		return err
 	}
@@ -207,9 +207,13 @@ func (p *OCRProcessor) consumeOCR(ctx context.Context, job queue.VideoJobMessage
 	return nil
 }
 
-func (p *OCRProcessor) deduplicateFrames(samples []media.FrameSample) ([]ocrFrame, error) {
+func (p *OCRProcessor) deduplicateFrames(ctx context.Context, samples []media.FrameSample) ([]ocrFrame, error) {
 	frames := make([]ocrFrame, 0, len(samples))
 	for _, sample := range samples {
+		// 感知哈希属于本地 CPU 工作，也要在帧之间响应跨进程暂停请求。
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// 固定采样与场景采样可能命中同一毫秒；时间点相同必须无条件合并，避免生成 [t,t) 区间。
 		if len(frames) > 0 && frames[len(frames)-1].TimestampMS == sample.TimestampMS {
 			continue

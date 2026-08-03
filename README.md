@@ -123,4 +123,6 @@ npm run build
 
 接口前缀为 `/api`。先调用 `POST /api/auth/register`，再以返回的 Bearer Token 调用视频接口。
 
+视频后台处理支持 `POST /api/videos/:id/pause` 与 `POST /api/videos/:id/resume`。暂停以任务阶段为粒度：已完成阶段会保留，正在运行的阶段安全停止后回到 `pending`，恢复时从该阶段开头重新执行。
+
 > `.env` 中的 JWT_SECRET 必须在部署前改为高熵私密值；修改它会使所有现有 Token 失效。

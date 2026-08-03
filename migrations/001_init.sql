@@ -3,7 +3,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- 视频与任务使用受限状态集合，避免写入无法识别的生命周期状态。
-CREATE TYPE video_status AS ENUM ('uploading','processing','ready','failed');
+CREATE TYPE video_status AS ENUM ('uploading','processing','paused','ready','failed');
 CREATE TYPE job_status AS ENUM ('pending','running','succeeded','failed');
 
 -- users 是第一版的登录身份与租户边界。
@@ -22,6 +22,8 @@ CREATE TABLE videos (
   source_url text NOT NULL,
   title text NOT NULL DEFAULT '', 
   status video_status NOT NULL DEFAULT 'uploading',
+  upload_method text NOT NULL DEFAULT 'url' CHECK (upload_method IN ('local_direct','url')),
+  paused_from_status text CHECK (paused_from_status IS NULL OR paused_from_status IN ('uploading','processing')),
   duration_ms bigint NOT NULL DEFAULT 0,
   object_key text NOT NULL DEFAULT '', 
   error_message text NOT NULL DEFAULT '', 
