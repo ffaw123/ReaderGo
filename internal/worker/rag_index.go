@@ -57,7 +57,6 @@ type RAGIndexProcessor struct {
 	chatModel      string
 	embeddingModel string
 	concurrency    int
-	ocrConfidence  float64
 }
 
 type ragWindow struct {
@@ -96,7 +95,7 @@ type ragSegmentOutput struct {
 }
 
 // NewRAGIndexProcessor 校验独立的 RAG 配置并创建可复用的 OpenAI 兼容客户端。
-func NewRAGIndexProcessor(db *gorm.DB, baseURL, apiKey, chatModel, embeddingModel string, concurrency int, requestTimeout time.Duration, ocrConfidence float64) (*RAGIndexProcessor, error) {
+func NewRAGIndexProcessor(db *gorm.DB, baseURL, apiKey, chatModel, embeddingModel string, concurrency int, requestTimeout time.Duration) (*RAGIndexProcessor, error) {
 	if db == nil {
 		return nil, fmt.Errorf("RAG index processor requires database")
 	}
@@ -116,10 +115,6 @@ func NewRAGIndexProcessor(db *gorm.DB, baseURL, apiKey, chatModel, embeddingMode
 	if requestTimeout <= 0 {
 		return nil, fmt.Errorf("RAG_REQUEST_TIMEOUT must be positive")
 	}
-	if ocrConfidence < 0 || ocrConfidence > 1 {
-		return nil, fmt.Errorf("OCR_MIN_CONFIDENCE must be between 0 and 1")
-	}
-
 	client := openai.NewClient(
 		option.WithAPIKey(apiKey),
 		option.WithBaseURL(endpointURL.String()),
@@ -130,7 +125,6 @@ func NewRAGIndexProcessor(db *gorm.DB, baseURL, apiKey, chatModel, embeddingMode
 	return &RAGIndexProcessor{
 		db: db, client: client, chatModel: strings.TrimSpace(chatModel),
 		embeddingModel: strings.TrimSpace(embeddingModel), concurrency: concurrency,
-		ocrConfidence: ocrConfidence,
 	}, nil
 }
 
@@ -151,7 +145,7 @@ func (p *RAGIndexProcessor) Process(ctx context.Context, job queue.VideoJobMessa
 	}
 	var ocrSegments []model.OCRSegment
 	if err := p.db.WithContext(ctx).
-		Where("tenant_id = ? AND video_id = ? AND status = ? AND confidence >= ? AND text <> ''", job.TenantID, job.VideoID, model.OCRStatusSucceeded, p.ocrConfidence).
+		Where("tenant_id = ? AND video_id = ?", job.TenantID, job.VideoID).
 		Order("start_ms ASC, end_ms ASC").Find(&ocrSegments).Error; err != nil {
 		return fmt.Errorf("load OCR evidence for video %s: %w", video.ID, err)
 	}

@@ -50,27 +50,7 @@ services:
       mc mb --ignore-existing readergo/videos;
       mc cors set readergo/videos /config/cors.json
     volumes: ["./docker/minio-cors.json:/config/cors.json:ro"]
-  # PaddleOCR 以独立 HTTP 服务运行；宿主机 Worker 通过 localhost:8081/ocr 调用。
-  paddleocr:
-    build:
-      context: ./docker/paddleocr
-    ports: ["8081:8080"]
-    environment:
-      # 跳过启动时的多模型源连通性探测，模型仍会在缓存缺失时正常下载。
-      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
-      # 与 Go Worker 的 OCR_CONCURRENCY 默认值一致，每路请求使用独立推理实例。
-      OCR_ENGINE_WORKERS: "2"
-    # 持久化自动下载的模型，避免重建容器后重复下载。
-    volumes: ["paddleocr_models:/root/.paddlex"]
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 60s
-    restart: unless-stopped
 volumes:
   postgres_data:
   minio_data:
   rabbitmq_data:
-  paddleocr_models:

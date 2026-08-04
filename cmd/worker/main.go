@@ -39,11 +39,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	ocrProcessor, err := worker.NewOCRProcessor(database, ffmpeg, configValue.MinIOEndpoint, configValue.MinIOAccessKey, configValue.MinIOSecretKey, configValue.MinIOSecure, configValue.MinIOBucket, configValue.OCRBaseURL, configValue.OCRMinConfidence, configValue.OCRSceneThreshold, configValue.OCRHashDistance, configValue.OCRConcurrency)
+	ocrProcessor, err := worker.NewOCRProcessor(database, ffmpeg, configValue.MinIOEndpoint, configValue.MinIOAccessKey, configValue.MinIOSecretKey, configValue.MinIOSecure, configValue.MinIOBucket, configValue.OCRBaseURL, configValue.OCRAPIKey, configValue.OCRModel, configValue.OCRSceneThreshold, configValue.OCRHashDistance, configValue.OCRConcurrency)
 	if err != nil {
 		log.Fatal(err)
 	}
-	ragIndexProcessor, err := worker.NewRAGIndexProcessor(database, configValue.RAGBaseURL, configValue.RAGAPIKey, configValue.RAGChatModel, configValue.RAGEmbeddingModel, configValue.RAGConcurrency, configValue.RAGRequestTimeout, configValue.OCRMinConfidence)
+	ragIndexProcessor, err := worker.NewRAGIndexProcessor(database, configValue.RAGBaseURL, configValue.RAGAPIKey, configValue.RAGChatModel, configValue.RAGEmbeddingModel, configValue.RAGConcurrency, configValue.RAGRequestTimeout)
 	if err != nil {
 		log.Fatal(err)
 	}

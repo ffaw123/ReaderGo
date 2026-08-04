@@ -21,12 +21,12 @@ import (
 
 func TestNewRAGIndexProcessorAcceptsOneToTenConcurrentRequests(t *testing.T) {
 	for _, concurrency := range []int{1, 5, 10} {
-		if _, err := NewRAGIndexProcessor(&gorm.DB{}, "https://example.com/v1", "test-key", "chat-model", "embedding-model", concurrency, time.Minute, 0.6); err != nil {
+		if _, err := NewRAGIndexProcessor(&gorm.DB{}, "https://example.com/v1", "test-key", "chat-model", "embedding-model", concurrency, time.Minute); err != nil {
 			t.Errorf("concurrency %d was rejected: %v", concurrency, err)
 		}
 	}
 	for _, concurrency := range []int{0, 11} {
-		if _, err := NewRAGIndexProcessor(&gorm.DB{}, "https://example.com/v1", "test-key", "chat-model", "embedding-model", concurrency, time.Minute, 0.6); err == nil {
+		if _, err := NewRAGIndexProcessor(&gorm.DB{}, "https://example.com/v1", "test-key", "chat-model", "embedding-model", concurrency, time.Minute); err == nil {
 			t.Errorf("concurrency %d was accepted", concurrency)
 		}
 	}

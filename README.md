@@ -21,8 +21,7 @@ ReaderGo/
 │   ├── stop.bat                    ← 停止 Docker 与项目服务，保留数据卷
 │   └── stop-v.bat                  ← 停止 Docker 与项目服务并删除数据卷
 ├── docker/
-│   ├── minio-cors.json             ← MinIO 浏览器直传的 CORS 配置
-│   └── paddleocr/Dockerfile         ← PaddleOCR CPU HTTP 服务镜像
+│   └── minio-cors.json             ← MinIO 浏览器直传的 CORS 配置
 ├── docs/
 │   ├── 设计方案_v1.md              ← 视频理解 Agent 的产品与技术设计
 │   ├── RabbitMQ设计方案_v1.md      ← 当前 RabbitMQ、Outbox 与任务租约设计
@@ -32,7 +31,7 @@ ReaderGo/
 │   ├── 001_init.sql                ← 核心表、状态枚举与 pgvector 初始化
 │   ├── 002_upload_sessions.sql     ← 本地分片上传会话表
 │   ├── 003_asr_segments.sql        ← ASR 原始转写片段表
-│   └── 004_ocr_segments.sql        ← OCR 抽样画面文字与处理状态表
+│   └── 004_ocr_segments.sql        ← OCR 可用抽样画面文字表
 │
 ├── cmd/                            ← 可独立启动的应用入口
 │   ├── api/main.go                 ← HTTP API 服务入口，只写业务数据与 Outbox
@@ -65,6 +64,8 @@ ReaderGo/
 
 `asr` 会按 60 秒非重叠片段并发提取音频并调用转写接口，`ASR_CONCURRENCY` 默认和上限均为 10。每个 WAV 在请求模型前通过 FFmpeg `volumedetect` 检查峰值音量，不高于 `-50 dB` 的近似全静音片段会直接跳过；无音轨视频作为合法的空 ASR 结果成功完成。所有非静音片段成功后才原子替换该视频的原始 ASR 结果。
 
+`vision` 会按 15 秒固定采样和场景变化采样抽帧，感知哈希去重后通过百炼 OpenAI 兼容接口调用 `qwen-vl-ocr`。使用 `OCR_API_KEY`、`OCR_BASE_URL` 和 `OCR_MODEL` 配置独立服务，`OCR_CONCURRENCY` 默认和上限均为 10。Qwen-VL-OCR 不返回置信度，因此空文本会直接丢弃，`ocr_segments` 只保存非空文字且不保存处理状态或置信度；返回文字不会再做语言、长度或内容规则校验。
+
 `rag_index` 会在 ASR 与 OCR 均成功后，按 60 秒非重叠窗口生成检索摘要、关键事实、关键词和 1024 维主语义向量，并在短事务中原子替换该视频的旧索引。每个窗口独立调用结构化生成接口，默认通过 `RAG_CONCURRENCY=10` 限制并发；Embedding 按每批最多 10 个窗口拆分并同时请求。窗口总结与 Embedding 请求均由 SDK 对临时 HTTP 错误最多重试 3 次，HTTP 成功但响应完整性校验失败时会按 500ms、1s 额外重试当前窗口或当前 Embedding 批次 2 次。启动 Worker 前需要配置 `RAG_API_KEY`、`RAG_BASE_URL`、`RAG_CHAT_MODEL` 与 `RAG_EMBEDDING_MODEL`。
 
 ## 启动
@@ -89,7 +90,7 @@ Copy-Item .env.example .env
 .\batch\start.bat
 ```
 
-脚本会启动 Docker 依赖（包括 PostgreSQL、RabbitMQ、MinIO 和 PaddleOCR），并分别打开 Outbox Dispatcher、Worker、API、前端四个终端。PaddleOCR 首次启动需要安装服务依赖并下载模型，耗时会明显长于后续启动；模型缓存在 `paddleocr_models` 数据卷中。首次运行时，只有在 `web/node_modules` 不存在的情况下才会执行 `npm install`。前端默认访问地址为 <http://localhost:5173>，API 地址为 <http://localhost:8080>，RabbitMQ 管理界面为 <http://localhost:15672>，OCR 接口为 <http://localhost:8081/ocr>。
+脚本会启动 Docker 依赖（PostgreSQL、RabbitMQ、MinIO 和 Redis），并分别打开 Outbox Dispatcher、Worker、API、前端四个终端。首次运行时，只有在 `web/node_modules` 不存在的情况下才会执行 `npm install`。启动 Worker 前需要在 `.env` 中填写独立的 ASR、OCR 和 RAG 模型凭据。前端默认访问地址为 <http://localhost:5173>，API 地址为 <http://localhost:8080>，RabbitMQ 管理界面为 <http://localhost:15672>。
 
 ### 手动启动
 

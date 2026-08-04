@@ -1,14 +1,11 @@
 package worker
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"image"
 	_ "image/jpeg"
-	"io"
 	"log"
 	"math/bits"
 	"net/http"
@@ -25,16 +22,18 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 	"gorm.io/gorm"
 )
 
 const (
 	ocrFixedSampleInterval = 15 * time.Second
-	ocrMaxAttempts         = 3
+	ocrMaxRetries          = 2
 	ocrRequestTimeout      = 60 * time.Second
 )
 
-var ocrRetryDelays = [...]time.Duration{500 * time.Millisecond, time.Second}
+const ocrUserPrompt = "Please output only the text content from the image without any additional descriptions or formatting."
 
 type ocrFrame struct {
 	TimestampMS int64
@@ -42,41 +41,21 @@ type ocrFrame struct {
 	Hash        uint64
 }
 
-type ocrRecognition struct {
-	Text       string
-	Confidence float64
-}
-
-type completedOCRRecognition struct {
-	Result ocrRecognition
-	Done   bool
-}
-
-type ocrServiceUnavailableError struct{ cause error }
-
-func (e *ocrServiceUnavailableError) Error() string {
-	return fmt.Sprintf("OCR service unavailable after %d attempts: %v", ocrMaxAttempts, e.cause)
-}
-
-func (e *ocrServiceUnavailableError) Unwrap() error { return e.cause }
-
-// OCRProcessor 实现现有 vision 阶段：从视频抽帧后调用 PaddleOCR，并保存原始视觉文字。
+// OCRProcessor 实现现有 vision 阶段：抽取视频画面后调用独立 OCR 模型，并保存可用的原始文字。
 type OCRProcessor struct {
 	db             *gorm.DB
 	ffmpeg         *media.FFmpeg
 	objects        *minio.Client
 	bucket         string
-	endpoint       string
-	client         *http.Client
-	minConfidence  float64
+	client         openai.Client
+	model          string
 	sceneThreshold float64
 	hashDistance   int
 	workers        int
-	retryDelays    []time.Duration
 }
 
-// NewOCRProcessor 只校验配置并创建可复用客户端；OCR 服务临时不可用不会阻止 Worker 启动。
-func NewOCRProcessor(db *gorm.DB, ffmpeg *media.FFmpeg, minIOEndpoint, minIOAccessKey, minIOSecretKey string, minIOSecure bool, bucket, baseURL string, minConfidence, sceneThreshold float64, hashDistance, concurrency int) (*OCRProcessor, error) {
+// NewOCRProcessor 创建独立于 ASR 和 RAG 的 OpenAI 兼容客户端，并校验 OCR 模型配置。
+func NewOCRProcessor(db *gorm.DB, ffmpeg *media.FFmpeg, minIOEndpoint, minIOAccessKey, minIOSecretKey string, minIOSecure bool, bucket, baseURL, apiKey, modelName string, sceneThreshold float64, hashDistance, concurrency int) (*OCRProcessor, error) {
 	if db == nil || ffmpeg == nil {
 		return nil, fmt.Errorf("OCR processor requires database and ffmpeg")
 	}
@@ -87,8 +66,11 @@ func NewOCRProcessor(db *gorm.DB, ffmpeg *media.FFmpeg, minIOEndpoint, minIOAcce
 	if err != nil || (endpointURL.Scheme != "http" && endpointURL.Scheme != "https") || endpointURL.Host == "" {
 		return nil, fmt.Errorf("OCR_BASE_URL must be an absolute HTTP(S) URL")
 	}
-	if minConfidence < 0 || minConfidence > 1 {
-		return nil, fmt.Errorf("OCR minimum confidence must be between 0 and 1")
+	if strings.TrimSpace(apiKey) == "" {
+		return nil, fmt.Errorf("OCR_API_KEY is required")
+	}
+	if strings.TrimSpace(modelName) == "" {
+		return nil, fmt.Errorf("OCR_MODEL is required")
 	}
 	if sceneThreshold <= 0 || sceneThreshold > 1 {
 		return nil, fmt.Errorf("OCR scene threshold must be greater than 0 and at most 1")
@@ -96,8 +78,8 @@ func NewOCRProcessor(db *gorm.DB, ffmpeg *media.FFmpeg, minIOEndpoint, minIOAcce
 	if hashDistance < 0 || hashDistance > 64 {
 		return nil, fmt.Errorf("OCR hash distance must be between 0 and 64")
 	}
-	if concurrency < 1 || concurrency > 4 {
-		return nil, fmt.Errorf("OCR concurrency must be between 1 and 4")
+	if concurrency < 1 || concurrency > 10 {
+		return nil, fmt.Errorf("OCR concurrency must be between 1 and 10")
 	}
 
 	objects, err := minio.New(minIOEndpoint, &minio.Options{
@@ -107,11 +89,17 @@ func NewOCRProcessor(db *gorm.DB, ffmpeg *media.FFmpeg, minIOEndpoint, minIOAcce
 	if err != nil {
 		return nil, fmt.Errorf("create MinIO client for OCR: %w", err)
 	}
+	client := openai.NewClient(
+		option.WithAPIKey(strings.TrimSpace(apiKey)),
+		option.WithBaseURL(endpointURL.String()),
+		option.WithHTTPClient(&http.Client{Timeout: ocrRequestTimeout}),
+		// 每个抽样帧在 SDK 内处理临时 HTTP 错误，业务层只接收最终成功或失败结果。
+		option.WithMaxRetries(ocrMaxRetries),
+	)
 	return &OCRProcessor{
 		db: db, ffmpeg: ffmpeg, objects: objects, bucket: bucket,
-		endpoint: endpointURL.String(), client: &http.Client{Timeout: ocrRequestTimeout},
-		minConfidence: minConfidence, sceneThreshold: sceneThreshold, hashDistance: hashDistance, workers: concurrency,
-		retryDelays: ocrRetryDelays[:],
+		client: client, model: strings.TrimSpace(modelName),
+		sceneThreshold: sceneThreshold, hashDistance: hashDistance, workers: concurrency,
 	}, nil
 }
 
@@ -162,49 +150,44 @@ func (p *OCRProcessor) consumeOCR(ctx context.Context, job queue.VideoJobMessage
 		return err
 	}
 
-	segments := make([]model.OCRSegment, 0, len(frames))
-	results, recognizeErr := p.recognizeFrames(ctx, frames)
-	completedCount := len(frames)
-	if recognizeErr != nil {
-		if unavailable, ok := recognizeErr.(*ocrServiceUnavailableError); ok {
-			// 并发请求中任一请求确认服务不可用后，仅保留连续完成的前缀，剩余时间轴统一标记降级。
-			completedCount = 0
-			for completedCount < len(results) && results[completedCount].Done {
-				completedCount++
-			}
-			log.Printf("OCR service unavailable for video %s from frame %d: %v", video.ID, completedCount, unavailable)
-		} else {
-			return recognizeErr
-		}
+	results, err := p.recognizeFrames(ctx, frames)
+	if err != nil {
+		// 不再用数据库 status 表达服务异常；任一请求失败时让任务整体重试，避免提交不完整时间轴。
+		return err
 	}
-	for index := 0; index < completedCount; index++ {
-		frame := frames[index]
-		endMS := info.DurationMS
+	segments := buildOCRSegments(video, info.DurationMS, frames, results)
+	if err := p.replaceOCRSegments(ctx, video.ID, segments); err != nil {
+		return err
+	}
+	log.Printf("OCR completed for video %s: %d usable segments from %d sampled frames", video.ID, len(segments), len(frames))
+	return nil
+}
+
+func buildOCRSegments(video model.Video, durationMS int64, frames []ocrFrame, results []string) []model.OCRSegment {
+	segments := make([]model.OCRSegment, 0, len(frames))
+	for index, frame := range frames {
+		if index >= len(results) {
+			break
+		}
+		text := strings.TrimSpace(results[index])
+		// Qwen-VL-OCR 不返回置信度；只有空文本不代表有效视频证据，直接丢弃且不写入占位记录。
+		if text == "" {
+			continue
+		}
+		endMS := durationMS
 		if index+1 < len(frames) {
 			endMS = frames[index+1].TimestampMS
 		}
 		if endMS <= frame.TimestampMS {
-			// 时间轴异常时不写入非法 [t,t) 区间，数据库约束作为最后一道保护仍然保留。
 			continue
 		}
-		result := results[index].Result
-		status := model.OCRStatusSucceeded
-		if result.Text == "" {
-			status = model.OCRStatusNoText
-		}
-		segments = append(segments, model.OCRSegment{TenantID: video.TenantID, VideoID: video.ID, StartMS: frame.TimestampMS, EndMS: endMS, Text: result.Text, Confidence: result.Confidence, Status: status})
+		segments = append(segments, model.OCRSegment{
+			TenantID: video.TenantID, VideoID: video.ID,
+			StartMS: frame.TimestampMS, EndMS: endMS,
+			Text: text,
+		})
 	}
-	if completedCount < len(frames) {
-		startMS := frames[completedCount].TimestampMS
-		if startMS < info.DurationMS {
-			segments = append(segments, model.OCRSegment{TenantID: video.TenantID, VideoID: video.ID, StartMS: startMS, EndMS: info.DurationMS, Text: "", Confidence: 0, Status: model.OCRStatusServiceUnavailable})
-		}
-	}
-	if err := p.replaceOCRSegments(ctx, video.ID, segments); err != nil {
-		return err
-	}
-	log.Printf("OCR completed for video %s: %d sampled segments", video.ID, len(segments))
-	return nil
+	return segments
 }
 
 func (p *OCRProcessor) deduplicateFrames(ctx context.Context, samples []media.FrameSample) ([]ocrFrame, error) {
@@ -231,16 +214,16 @@ func (p *OCRProcessor) deduplicateFrames(ctx context.Context, samples []media.Fr
 	return frames, nil
 }
 
-func (p *OCRProcessor) recognizeFrames(ctx context.Context, frames []ocrFrame) ([]completedOCRRecognition, error) {
-	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	results := make([]completedOCRRecognition, len(frames))
+func (p *OCRProcessor) recognizeFrames(ctx context.Context, frames []ocrFrame) ([]string, error) {
+	results := make([]string, len(frames))
 	if len(frames) == 0 {
 		return results, nil
 	}
 
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	tasks := make(chan int)
-	errors := make(chan error, 1)
+	errorsChannel := make(chan error, 1)
 	workerCount := min(p.workers, len(frames))
 	var wait sync.WaitGroup
 	wait.Add(workerCount)
@@ -248,16 +231,16 @@ func (p *OCRProcessor) recognizeFrames(ctx context.Context, frames []ocrFrame) (
 		go func() {
 			defer wait.Done()
 			for index := range tasks {
-				result, err := p.recognizeWithRetry(workerCtx, frames[index].Path)
+				result, err := p.recognizeImage(workerCtx, frames[index].Path)
 				if err != nil {
 					select {
-					case errors <- err:
+					case errorsChannel <- fmt.Errorf("recognize OCR frame at %d ms: %w", frames[index].TimestampMS, err):
+						cancel()
 					default:
 					}
-					cancel()
 					return
 				}
-				results[index] = completedOCRRecognition{Result: result, Done: true}
+				results[index] = result
 			}
 		}()
 	}
@@ -273,8 +256,8 @@ sendTasks:
 	close(tasks)
 	wait.Wait()
 	select {
-	case err := <-errors:
-		return results, err
+	case err := <-errorsChannel:
+		return nil, err
 	default:
 		return results, ctx.Err()
 	}
@@ -316,116 +299,36 @@ func sampledLuma(img image.Image, bounds image.Rectangle, x, y int) uint32 {
 	return (299*r + 587*g + 114*b) / 1000
 }
 
-func (p *OCRProcessor) recognizeWithRetry(ctx context.Context, imagePath string) (ocrRecognition, error) {
-	var lastErr error
-	for attempt := 0; attempt < ocrMaxAttempts; attempt++ {
-		result, retryable, err := p.recognizeOnce(ctx, imagePath)
-		if err == nil {
-			return result, nil
-		}
-		if ctx.Err() != nil {
-			return ocrRecognition{}, ctx.Err()
-		}
-		if !retryable {
-			return ocrRecognition{}, err
-		}
-		lastErr = err
-		if attempt == ocrMaxAttempts-1 {
-			break
-		}
-		delay := p.retryDelays[attempt]
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ocrRecognition{}, ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return ocrRecognition{}, &ocrServiceUnavailableError{cause: lastErr}
-}
-
-func (p *OCRProcessor) recognizeOnce(ctx context.Context, imagePath string) (ocrRecognition, bool, error) {
+func (p *OCRProcessor) recognizeImage(ctx context.Context, imagePath string) (string, error) {
 	imageBytes, err := os.ReadFile(imagePath)
 	if err != nil {
-		return ocrRecognition{}, false, fmt.Errorf("read OCR frame: %w", err)
+		return "", fmt.Errorf("read OCR frame: %w", err)
 	}
-	payload, err := json.Marshal(map[string]any{
-		"file":                      base64.StdEncoding.EncodeToString(imageBytes),
-		"fileType":                  1,
-		"useDocOrientationClassify": false,
-		"useDocUnwarping":           false,
-		"useTextlineOrientation":    false,
-		"textRecScoreThresh":        p.minConfidence,
-		"visualize":                 false,
+	imageDataURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(imageBytes)
+	completion, err := p.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model: openai.ChatModel(p.model),
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.UserMessage([]openai.ChatCompletionContentPartUnionParam{
+				openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{
+					URL: imageDataURL,
+				}),
+				openai.TextContentPart(ocrUserPrompt),
+			}),
+		},
 	})
 	if err != nil {
-		return ocrRecognition{}, false, fmt.Errorf("encode OCR request: %w", err)
+		return "", fmt.Errorf("call OCR chat completion: %w", err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return ocrRecognition{}, false, fmt.Errorf("create OCR request: %w", err)
+	if len(completion.Choices) == 0 {
+		return "", fmt.Errorf("OCR model returned no completion choices")
 	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := p.client.Do(request)
-	if err != nil {
-		return ocrRecognition{}, true, fmt.Errorf("call OCR service: %w", err)
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
-	if err != nil {
-		return ocrRecognition{}, true, fmt.Errorf("read OCR response: %w", err)
-	}
-	if response.StatusCode != http.StatusOK {
-		err := fmt.Errorf("OCR service returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
-		retryable := response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError
-		return ocrRecognition{}, retryable, err
-	}
-
-	var decoded struct {
-		ErrorCode int    `json:"errorCode"`
-		ErrorMsg  string `json:"errorMsg"`
-		Result    struct {
-			OCRResults []struct {
-				PrunedResult struct {
-					Texts  []string  `json:"rec_texts"`
-					Scores []float64 `json:"rec_scores"`
-				} `json:"prunedResult"`
-			} `json:"ocrResults"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		return ocrRecognition{}, true, fmt.Errorf("decode OCR response: %w", err)
-	}
-	if decoded.ErrorCode != 0 {
-		return ocrRecognition{}, true, fmt.Errorf("OCR service error %d: %s", decoded.ErrorCode, decoded.ErrorMsg)
-	}
-	if len(decoded.Result.OCRResults) != 1 {
-		return ocrRecognition{}, true, fmt.Errorf("OCR service returned %d image results, want 1", len(decoded.Result.OCRResults))
-	}
-	result := decoded.Result.OCRResults[0].PrunedResult
-	if len(result.Texts) != len(result.Scores) {
-		return ocrRecognition{}, true, fmt.Errorf("OCR service returned %d texts and %d scores", len(result.Texts), len(result.Scores))
-	}
-	texts := make([]string, 0, len(result.Texts))
-	var confidenceSum float64
-	for index, text := range result.Texts {
-		text = strings.TrimSpace(text)
-		if text == "" || result.Scores[index] < p.minConfidence {
-			continue
-		}
-		texts = append(texts, text)
-		confidenceSum += result.Scores[index]
-	}
-	if len(texts) == 0 {
-		return ocrRecognition{}, false, nil
-	}
-	return ocrRecognition{Text: strings.Join(texts, "\n"), Confidence: confidenceSum / float64(len(texts))}, false, nil
+	// Qwen-VL-OCR 返回纯文本；除落库前去除首尾空白外，不做语言、长度或内容规则校验。
+	return completion.Choices[0].Message.Content, nil
 }
 
 func (p *OCRProcessor) replaceOCRSegments(ctx context.Context, videoID string, segments []model.OCRSegment) error {
 	return p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// RabbitMQ 与 Outbox 均允许重复投递；原子替换保证任务重跑不会残留旧采样结果。
+		// RabbitMQ 与 Outbox 均允许重复投递；原子替换保证任务重跑不会残留旧识别结果。
 		if err := tx.Where("video_id = ?", videoID).Delete(&model.OCRSegment{}).Error; err != nil {
 			return fmt.Errorf("clear previous OCR segments: %w", err)
 		}

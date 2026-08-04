@@ -107,24 +107,16 @@ type ASRSegment struct {
 // TableName 显式指定原始转写表，避免和 RAG 最终使用的 video_segments 混淆。
 func (ASRSegment) TableName() string { return "asr_segments" }
 
-const (
-	OCRStatusSucceeded          = "succeeded"
-	OCRStatusNoText             = "no_text"
-	OCRStatusServiceUnavailable = "service_unavailable"
-)
-
 // OCRSegment 保存抽样画面上的原始 OCR 结果。
-// Text 只包含真实识别文字；无可用文字或服务不可用时保持空字符串，由 Status 说明原因。
+// Qwen-VL-OCR 不返回置信度；空文本在 Worker 内直接丢弃，因此数据库只保存可用原始证据。
 type OCRSegment struct {
-	ID         string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	TenantID   string    `gorm:"type:uuid;not null;index" json:"-"`
-	VideoID    string    `gorm:"type:uuid;not null;index" json:"video_id"`
-	StartMS    int64     `gorm:"not null" json:"start_ms"`
-	EndMS      int64     `gorm:"not null" json:"end_ms"`
-	Text       string    `gorm:"not null" json:"text"`
-	Confidence float64   `gorm:"not null" json:"confidence"`
-	Status     string    `gorm:"not null" json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID        string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID  string    `gorm:"type:uuid;not null;index" json:"-"`
+	VideoID   string    `gorm:"type:uuid;not null;index" json:"video_id"`
+	StartMS   int64     `gorm:"not null" json:"start_ms"`
+	EndMS     int64     `gorm:"not null" json:"end_ms"`
+	Text      string    `gorm:"not null" json:"text"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func (OCRSegment) TableName() string { return "ocr_segments" }
