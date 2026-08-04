@@ -25,7 +25,8 @@ import (
 )
 
 const (
-	asrChunkDuration = 30 * time.Second
+	// ASR 原始片段与第一版 RAG 索引窗口统一为 60 秒，减少跨层合并与时间边界差异。
+	asrChunkDuration = 60 * time.Second
 )
 
 type audioChunk struct {
@@ -230,8 +231,8 @@ func (p *ASRProcessor) transcribeAudio(ctx context.Context, audioPath string) (s
 	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
 }
 
-// buildAudioChunks 从视频 0 ms 起按固定 30 秒切分，生成连续的左闭右开区间；
-// 最后不足 30 秒的内容单独保留，确保整条视频时间轴既不遗漏也不重叠。
+// buildAudioChunks 从视频 0 ms 起按固定 60 秒切分，生成连续的左闭右开区间；
+// 最后不足 60 秒的内容单独保留，确保整条视频时间轴既不遗漏也不重叠。
 func buildAudioChunks(durationMS int64) []audioChunk {
 	if durationMS <= 0 {
 		return nil

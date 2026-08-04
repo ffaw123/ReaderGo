@@ -75,17 +75,17 @@ func TestBuildAudioChunksKeepsShortVideoAsTailChunk(t *testing.T) {
 	}
 }
 
-func TestBuildAudioChunksUsesExactThirtySecondChunk(t *testing.T) {
-	chunks := buildAudioChunks(30000)
-	want := []audioChunk{{StartMS: 0, EndMS: 30000}}
+func TestBuildAudioChunksUsesExactSixtySecondChunk(t *testing.T) {
+	chunks := buildAudioChunks(60000)
+	want := []audioChunk{{StartMS: 0, EndMS: 60000}}
 	if !reflect.DeepEqual(chunks, want) {
 		t.Errorf("chunks = %#v, want %#v", chunks, want)
 	}
 }
 
 func TestBuildAudioChunksKeepsRemainder(t *testing.T) {
-	chunks := buildAudioChunks(65000)
-	want := []audioChunk{{StartMS: 0, EndMS: 30000}, {StartMS: 30000, EndMS: 60000}, {StartMS: 60000, EndMS: 65000}}
+	chunks := buildAudioChunks(125000)
+	want := []audioChunk{{StartMS: 0, EndMS: 60000}, {StartMS: 60000, EndMS: 120000}, {StartMS: 120000, EndMS: 125000}}
 	if !reflect.DeepEqual(chunks, want) {
 		t.Errorf("chunks = %#v, want %#v", chunks, want)
 	}

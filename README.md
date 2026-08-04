@@ -26,7 +26,8 @@ ReaderGo/
 ├── docs/
 │   ├── 设计方案_v1.md              ← 视频理解 Agent 的产品与技术设计
 │   ├── RabbitMQ设计方案_v1.md      ← 当前 RabbitMQ、Outbox 与任务租约设计
-│   └── Kafka到RabbitMQ迁移指南.md  ← 消息层迁移约束与验收清单
+│   ├── Kafka到RabbitMQ迁移指南.md  ← 消息层迁移约束与验收清单
+│   └── RAG设计指南.md               ← 双路召回、RRF 融合与证据引用设计
 ├── migrations/
 │   ├── 001_init.sql                ← 核心表、状态枚举与 pgvector 初始化
 │   ├── 002_upload_sessions.sql     ← 本地分片上传会话表
