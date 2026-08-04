@@ -43,8 +43,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	ragIndexProcessor, err := worker.NewRAGIndexProcessor(database, configValue.RAGBaseURL, configValue.RAGAPIKey, configValue.RAGChatModel, configValue.RAGEmbeddingModel, configValue.RAGConcurrency, configValue.RAGRequestTimeout, configValue.OCRMinConfidence)
+	if err != nil {
+		log.Fatal(err)
+	}
 	writer := outbox.NewWriter(configValue.RabbitMQJobsExchange, configValue.RabbitMQDLXExchange)
-	handler := worker.New(database, worker.NewRouterProcessor(asrProcessor, ocrProcessor), writer, worker.Options{
+	handler := worker.New(database, worker.NewRouterProcessor(asrProcessor, ocrProcessor, ragIndexProcessor), writer, worker.Options{
 		WorkerID: "worker-" + uuid.NewString(), MaxAttempts: configValue.JobMaxAttempts,
 		RetryDelays: configValue.JobRetryDelays, LeaseTTL: configValue.JobLeaseTTL,
 		HeartbeatInterval: configValue.JobHeartbeatInterval,

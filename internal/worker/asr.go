@@ -26,7 +26,8 @@ import (
 
 const (
 	// ASR 原始片段与第一版 RAG 索引窗口统一为 60 秒，减少跨层合并与时间边界差异。
-	asrChunkDuration = 60 * time.Second
+	asrChunkDuration      = 60 * time.Second
+	asrSilenceThresholdDB = -50.0
 )
 
 type audioChunk struct {
@@ -64,8 +65,8 @@ func NewASRProcessor(db *gorm.DB, ffmpeg *media.FFmpeg, minIOEndpoint, minIOAcce
 	if strings.TrimSpace(modelName) == "" {
 		return nil, fmt.Errorf("ASR_MODEL is required")
 	}
-	if concurrency < 1 {
-		return nil, fmt.Errorf("ASR_CONCURRENCY must be positive")
+	if concurrency < 1 || concurrency > 10 {
+		return nil, fmt.Errorf("ASR_CONCURRENCY must be between 1 and 10")
 	}
 
 	objects, err := minio.New(minIOEndpoint, &minio.Options{
@@ -120,11 +121,16 @@ func (p *ASRProcessor) consumeASR(ctx context.Context, job queue.VideoJobMessage
 	if info.DurationMS <= 0 {
 		return fmt.Errorf("video %s has invalid duration %d ms", video.ID, info.DurationMS)
 	}
-	if info.AudioCodec == "" {
-		return fmt.Errorf("video %s does not contain an audio stream", video.ID)
-	}
 	if err := p.db.WithContext(ctx).Model(&model.Video{}).Where("id = ?", video.ID).Update("duration_ms", info.DurationMS).Error; err != nil {
 		return fmt.Errorf("store video duration: %w", err)
+	}
+	if info.AudioCodec == "" {
+		// 无音轨视频属于合法输入；清空可能由旧任务留下的 ASR 片段，并让 Vision/RAG 流程继续执行。
+		if err := p.replaceASRSegments(ctx, video.ID, nil); err != nil {
+			return err
+		}
+		log.Printf("ASR completed for video %s without an audio stream: 0 segments", video.ID)
+		return nil
 	}
 
 	chunks := buildAudioChunks(info.DurationMS)
@@ -170,6 +176,20 @@ func (p *ASRProcessor) transcribeChunks(ctx context.Context, videoPath, workDir 
 					}
 					cancel()
 					return
+				}
+				// 静音片段不调用模型；峰值阈值只过滤近似无声内容，避免把正常低音量语音误判为静音。
+				silent, err := p.ffmpeg.IsAudioSilent(workerCtx, audioPath, asrSilenceThresholdDB)
+				if err != nil {
+					select {
+					case errors <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+				if silent {
+					log.Printf("ASR skipped silent chunk [%d,%d) for video audio", chunk.StartMS, chunk.EndMS)
+					continue
 				}
 				transcript, err := p.transcribeAudio(workerCtx, audioPath)
 				if err != nil {

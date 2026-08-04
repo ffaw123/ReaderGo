@@ -2,6 +2,7 @@ package media
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -36,6 +37,31 @@ func TestParseSceneChangeTimestamps(t *testing.T) {
 		if got[index] != want[index] {
 			t.Errorf("timestamp %d = %d, want %d", index, got[index], want[index])
 		}
+	}
+}
+
+func TestParseMaxVolumeDB(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   float64
+	}{
+		{name: "measured", output: "[Parsed_volumedetect_0] max_volume: -37.4 dB", want: -37.4},
+		{name: "digital silence", output: "[Parsed_volumedetect_0] max_volume: -inf dB", want: math.Inf(-1)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseMaxVolumeDB(test.output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Errorf("max volume = %v, want %v", got, test.want)
+			}
+		})
+	}
+	if _, err := parseMaxVolumeDB("no volume summary"); err == nil {
+		t.Fatal("missing max_volume was accepted")
 	}
 }
 
@@ -83,6 +109,28 @@ func TestFFmpegSmoke(t *testing.T) {
 		if err != nil || fileInfo.Size() == 0 {
 			t.Fatalf("expected non-empty media output %q, err=%v", output, err)
 		}
+	}
+	audioPath := filepath.Join(dir, "audio.wav")
+	silent, err := tool.IsAudioSilent(ctx, audioPath, -50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if silent {
+		t.Fatal("generated sine wave was detected as silent")
+	}
+	silentPath := filepath.Join(dir, "silent.wav")
+	if _, err := tool.run(ctx, tool.path,
+		"-nostdin", "-y", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+		"-t", "1", "-c:a", "pcm_s16le", silentPath,
+	); err != nil {
+		t.Fatalf("create silent audio fixture: %v", err)
+	}
+	silent, err = tool.IsAudioSilent(ctx, silentPath, -50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !silent {
+		t.Fatal("generated silent audio was not detected as silent")
 	}
 	ocrDir := filepath.Join(dir, "ocr-frames")
 	if err := os.Mkdir(ocrDir, 0o755); err != nil {

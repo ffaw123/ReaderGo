@@ -129,6 +129,38 @@ type OCRSegment struct {
 
 func (OCRSegment) TableName() string { return "ocr_segments" }
 
+// VideoSegment 是 rag_index 生成的固定时间窗口；原始证据与检索代理分开保存。
+type VideoSegment struct {
+	ID             string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID       string    `gorm:"type:uuid;not null;index" json:"-"`
+	VideoID        string    `gorm:"type:uuid;not null;index" json:"video_id"`
+	StartMS        int64     `gorm:"not null" json:"start_ms"`
+	EndMS          int64     `gorm:"not null" json:"end_ms"`
+	Transcript     string    `gorm:"not null" json:"transcript"`
+	OCRText        string    `gorm:"not null" json:"ocr_text"`
+	VisualCaption  string    `gorm:"not null" json:"visual_caption"`
+	SegmentSummary string    `gorm:"not null" json:"segment_summary"`
+	KeyFacts       []string  `gorm:"serializer:json;type:jsonb;not null" json:"key_facts"`
+	Keywords       []string  `gorm:"serializer:json;type:jsonb;not null" json:"keywords"`
+	RetrievalText  string    `gorm:"not null" json:"retrieval_text"`
+	SourceHash     string    `gorm:"not null" json:"source_hash"`
+	PromptVersion  string    `gorm:"not null" json:"prompt_version"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// SegmentEmbedding 为每个检索片段保存一份主语义向量。
+// Processor 使用显式 vector 类型写入，避免把向量误存为 PostgreSQL 数组或 JSON。
+type SegmentEmbedding struct {
+	ID             string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID       string    `gorm:"type:uuid;not null;index" json:"-"`
+	VideoID        string    `gorm:"type:uuid;not null;index" json:"video_id"`
+	SegmentID      string    `gorm:"type:uuid;not null;uniqueIndex" json:"segment_id"`
+	EmbeddingModel string    `gorm:"not null" json:"embedding_model"`
+	Embedding      string    `gorm:"type:vector(1024);not null" json:"-"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 type UploadSession struct {
 	ID        string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	TenantID  string    `gorm:"type:uuid;not null;index" json:"-"`

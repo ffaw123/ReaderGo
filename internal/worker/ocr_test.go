@@ -127,7 +127,7 @@ func TestOCRRecognizeReturnsServiceUnavailableAfterThreeAttempts(t *testing.T) {
 
 func TestRouterRegistersOCRForExistingVisionTask(t *testing.T) {
 	ocr := &OCRProcessor{}
-	router := NewRouterProcessor(nil, ocr)
+	router := NewRouterProcessor(nil, ocr, nil)
 	if router.processors[model.TaskVision] != ocr {
 		t.Fatal("OCR processor was not registered for vision task")
 	}

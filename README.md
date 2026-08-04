@@ -48,7 +48,7 @@ ReaderGo/
 │   ├── outbox/                      ← 事务 Outbox 写入和可靠分发
 │   ├── queue/                       ← RabbitMQ 契约、拓扑、Confirm 发布与手动 ACK 消费
 │   ├── storage/multipart.go         ← MinIO 分片上传封装
-│   └── worker/worker.go             ← Worker 实例运行的具体逻辑-包括任务流程编排
+│   └── worker/                       ← ASR、OCR、RAG 索引消费者与任务流程编排
 │
 └── web/                            ← Vue 3 + Vite 前端
     ├── package.json                 ← 前端依赖与脚本
@@ -62,6 +62,10 @@ ReaderGo/
 ```
 
 请求处理主路径：`cmd/api → internal/api → PostgreSQL(message_outbox) → cmd/outbox → RabbitMQ → cmd/worker → internal/worker`。
+
+`asr` 会按 60 秒非重叠片段并发提取音频并调用转写接口，`ASR_CONCURRENCY` 默认和上限均为 10。每个 WAV 在请求模型前通过 FFmpeg `volumedetect` 检查峰值音量，不高于 `-50 dB` 的近似全静音片段会直接跳过；无音轨视频作为合法的空 ASR 结果成功完成。所有非静音片段成功后才原子替换该视频的原始 ASR 结果。
+
+`rag_index` 会在 ASR 与 OCR 均成功后，按 60 秒非重叠窗口生成检索摘要、关键事实、关键词和 1024 维主语义向量，并在短事务中原子替换该视频的旧索引。每个窗口独立调用结构化生成接口，默认通过 `RAG_CONCURRENCY=10` 限制并发；Embedding 按每批最多 10 个窗口拆分并同时请求。窗口总结与 Embedding 请求均由 SDK 对临时 HTTP 错误最多重试 3 次，HTTP 成功但响应完整性校验失败时会按 500ms、1s 额外重试当前窗口或当前 Embedding 批次 2 次。启动 Worker 前需要配置 `RAG_API_KEY`、`RAG_BASE_URL`、`RAG_CHAT_MODEL` 与 `RAG_EMBEDDING_MODEL`。
 
 ## 启动
 

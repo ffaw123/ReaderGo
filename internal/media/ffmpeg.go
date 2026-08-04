@@ -183,6 +183,42 @@ func (f *FFmpeg) ExtractFramesEvery(ctx context.Context, inputPath, outputPatter
 }
 
 var scenePTSRegex = regexp.MustCompile(`pts_time:([0-9]+(?:\.[0-9]+)?)`)
+var maxVolumeRegex = regexp.MustCompile(`max_volume:\s*(-inf|[-+]?[0-9]+(?:\.[0-9]+)?)\s*dB`)
+
+// IsAudioSilent 使用 volumedetect 检查整段音频的峰值音量。
+// 峰值不高于 thresholdDB 时视为全静音或近似全静音，调用方可跳过无意义的 ASR 请求。
+func (f *FFmpeg) IsAudioSilent(ctx context.Context, inputPath string, thresholdDB float64) (bool, error) {
+	if math.IsNaN(thresholdDB) || math.IsInf(thresholdDB, 0) || thresholdDB >= 0 {
+		return false, fmt.Errorf("audio silence threshold must be a finite negative dB value")
+	}
+	output, err := f.run(ctx, f.path,
+		"-nostdin", "-i", inputPath,
+		"-af", "volumedetect", "-f", "null", "-",
+	)
+	if err != nil {
+		return false, fmt.Errorf("detect audio silence in %q: %w", inputPath, err)
+	}
+	maxVolumeDB, err := parseMaxVolumeDB(string(output))
+	if err != nil {
+		return false, fmt.Errorf("detect audio silence in %q: %w", inputPath, err)
+	}
+	return maxVolumeDB <= thresholdDB, nil
+}
+
+func parseMaxVolumeDB(output string) (float64, error) {
+	match := maxVolumeRegex.FindStringSubmatch(output)
+	if len(match) != 2 {
+		return 0, fmt.Errorf("ffmpeg volumedetect output does not contain max_volume")
+	}
+	if match[1] == "-inf" {
+		return math.Inf(-1), nil
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse ffmpeg max_volume %q: %w", match[1], err)
+	}
+	return value, nil
+}
 
 // DetectSceneChanges 使用 FFmpeg 的 scene score 找出画面明显变化的时间点。
 // 返回值统一换算成相对视频起点的毫秒，供调用方与固定采样时间合并。

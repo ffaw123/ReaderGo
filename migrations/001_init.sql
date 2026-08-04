@@ -74,7 +74,7 @@ CREATE TABLE video_summaries (
   content text NOT NULL, 
   created_at timestamptz NOT NULL DEFAULT now()
 );
--- video_segments 是带时间戳的 RAG 最小证据单元，融合语音转写与画面描述。
+-- video_segments 保存 RAG 固定窗口中的原始证据与 LLM 生成的检索代理。
 CREATE TABLE video_segments (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 
   tenant_id uuid NOT NULL REFERENCES users(id), 
@@ -82,21 +82,32 @@ CREATE TABLE video_segments (
   start_ms bigint NOT NULL, 
   end_ms bigint NOT NULL, 
   transcript text NOT NULL DEFAULT '', 
+  ocr_text text NOT NULL DEFAULT '',
+  -- visual_caption 仅预留给未来画面描述，不承载 OCR 原文。
   visual_caption text NOT NULL DEFAULT '', 
-  retrieval_text text NOT NULL DEFAULT '', 
-  created_at timestamptz NOT NULL DEFAULT now()
+  segment_summary text NOT NULL DEFAULT '',
+  key_facts jsonb NOT NULL DEFAULT '[]'::jsonb,
+  keywords jsonb NOT NULL DEFAULT '[]'::jsonb,
+  retrieval_text text NOT NULL,
+  source_hash text NOT NULL,
+  prompt_version text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (start_ms >= 0 AND end_ms > start_ms),
+  UNIQUE (video_id, start_ms, end_ms)
 );
-CREATE INDEX video_segments_video_time_idx ON video_segments(video_id,start_ms);
--- segment_embeddings 保存第一版融合文本的 1536 维向量。
+CREATE INDEX video_segments_tenant_video_time_idx ON video_segments(tenant_id, video_id, start_ms);
+-- segment_embeddings 保存第一版融合文本的 1024 维向量。
 CREATE TABLE segment_embeddings (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 
   tenant_id uuid NOT NULL REFERENCES users(id), 
   video_id uuid NOT NULL REFERENCES videos(id) ON DELETE CASCADE, 
   segment_id uuid NOT NULL UNIQUE REFERENCES video_segments(id) ON DELETE CASCADE, 
   embedding_model text NOT NULL, 
-  embedding vector(1536), 
+  embedding vector(1024) NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX segment_embeddings_tenant_video_idx ON segment_embeddings(tenant_id, video_id);
 -- IVFFlat 索引加速余弦相似度向量检索；数据量较小时也保留正确性。
 CREATE INDEX segment_embeddings_vector_idx ON segment_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 -- 对话按视频和租户归属，禁止跨用户问答。
