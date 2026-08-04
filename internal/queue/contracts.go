@@ -8,11 +8,12 @@ import (
 )
 
 const (
-	RoutingKeyPrepare  = "video.prepare"
-	RoutingKeyASR      = "video.asr"
-	RoutingKeyVision   = "video.vision"
-	RoutingKeyRAGIndex = "video.rag_index"
-	RoutingKeySummary  = "video.summary"
+	RoutingKeyPrepare   = "video.prepare"
+	RoutingKeyASR       = "video.asr"
+	RoutingKeyVision    = "video.vision"
+	RoutingKeyRAGIndex  = "video.rag_index"
+	RoutingKeyEmbedding = "video.embedding"
+	RoutingKeySummary   = "video.summary"
 
 	UploadMethodLocalDirect = "local_direct"
 	UploadMethodURL         = "url"
@@ -77,6 +78,8 @@ func RoutingKeyForTask(taskType string) (string, error) {
 		return RoutingKeyVision, nil
 	case "rag_index":
 		return RoutingKeyRAGIndex, nil
+	case "embedding":
+		return RoutingKeyEmbedding, nil
 	case "summary":
 		return RoutingKeySummary, nil
 	default:

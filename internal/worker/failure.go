@@ -32,6 +32,14 @@ func userInputProcessError(err error) error {
 	return &terminalProcessError{err: err, deadLetter: false}
 }
 
+// permanentProcessError 表示任务级重试无法改善的处理器或模型契约错误，需要进入 DLQ 排查。
+func permanentProcessError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &terminalProcessError{err: err, deadLetter: true}
+}
+
 // decideFailureAction 同时考虑错误性质和当前任务次数，保证不可恢复错误不会消耗任务级重试。
 func decideFailureAction(processErr error, currentAttempt, maxAttempts int) failureAction {
 	var terminalErr *terminalProcessError

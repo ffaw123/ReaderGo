@@ -308,8 +308,10 @@ func (x *Consumer) prerequisitesSatisfied(db *gorm.DB, job *model.ProcessingJob,
 		if uploadMethod == queue.UploadMethodURL {
 			prerequisiteTypes = []string{model.TaskPrepare}
 		}
-	case model.TaskRAGIndex, model.TaskSummary:
+	case model.TaskRAGIndex:
 		prerequisiteTypes = []string{model.TaskASR, model.TaskVision}
+	case model.TaskEmbedding, model.TaskSummary:
+		prerequisiteTypes = []string{model.TaskRAGIndex}
 	default:
 		return false, fmt.Errorf("unknown task type %q", job.TaskType)
 	}
@@ -324,10 +326,8 @@ func (x *Consumer) prerequisitesSatisfied(db *gorm.DB, job *model.ProcessingJob,
 }
 
 func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([]model.ProcessingJob, error) {
-	var taskTypes []string
+	prerequisitesComplete := false
 	switch completed.TaskType {
-	case model.TaskPrepare:
-		taskTypes = []string{model.TaskASR, model.TaskVision}
 	case model.TaskASR, model.TaskVision:
 		var completeCount int64
 		if err := tx.Model(&model.ProcessingJob{}).
@@ -335,10 +335,9 @@ func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([
 			Count(&completeCount).Error; err != nil {
 			return nil, err
 		}
-		if completeCount == 2 {
-			taskTypes = []string{model.TaskRAGIndex, model.TaskSummary}
-		}
+		prerequisitesComplete = completeCount == 2
 	}
+	taskTypes := nextTaskTypesForCompletion(completed.TaskType, prerequisitesComplete)
 	next := make([]model.ProcessingJob, 0, len(taskTypes))
 	for _, taskType := range taskTypes {
 		candidate := model.ProcessingJob{TenantID: completed.TenantID, VideoID: completed.VideoID, TaskType: taskType, Attempt: 1, Status: model.JobStatusPending}
@@ -351,6 +350,21 @@ func (x *Consumer) createNextJobs(tx *gorm.DB, completed model.ProcessingJob) ([
 		}
 	}
 	return next, nil
+}
+
+func nextTaskTypesForCompletion(completedTaskType string, asrAndVisionComplete bool) []string {
+	switch completedTaskType {
+	case model.TaskPrepare:
+		return []string{model.TaskASR, model.TaskVision}
+	case model.TaskASR, model.TaskVision:
+		if asrAndVisionComplete {
+			return []string{model.TaskRAGIndex}
+		}
+	case model.TaskRAGIndex:
+		// RAG 分段成功落库后，向量化与全文摘要互不依赖，可以并行执行。
+		return []string{model.TaskEmbedding, model.TaskSummary}
+	}
+	return nil
 }
 
 func (x *Consumer) reconcileVideoStatusLocked(tx *gorm.DB, video *model.Video, uploadMethod string) (string, error) {
@@ -404,9 +418,9 @@ func deriveVideoStatus(currentStatus, uploadMethod string, jobs []model.Processi
 func requiredTaskTypesForUploadMethod(uploadMethod string) ([]string, error) {
 	switch uploadMethod {
 	case queue.UploadMethodLocalDirect:
-		return []string{model.TaskASR, model.TaskVision, model.TaskRAGIndex, model.TaskSummary}, nil
+		return []string{model.TaskASR, model.TaskVision, model.TaskRAGIndex, model.TaskEmbedding, model.TaskSummary}, nil
 	case queue.UploadMethodURL:
-		return []string{model.TaskPrepare, model.TaskASR, model.TaskVision, model.TaskRAGIndex, model.TaskSummary}, nil
+		return []string{model.TaskPrepare, model.TaskASR, model.TaskVision, model.TaskRAGIndex, model.TaskEmbedding, model.TaskSummary}, nil
 	default:
 		return nil, fmt.Errorf("unknown upload method %q", uploadMethod)
 	}

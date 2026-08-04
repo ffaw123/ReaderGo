@@ -8,6 +8,8 @@ import {
   ChevronDown,
   CircleHelp,
   Clock3,
+  Download,
+  Eye,
   FileVideo,
   Film,
   Hourglass,
@@ -41,6 +43,7 @@ const videos = ref([])
 const selectedId = ref('')
 const messages = ref([])
 const summary = ref('')
+const summaryOpen = ref(false)
 const loadingVideos = ref(false)
 const loadingMessages = ref(false)
 const sending = ref(false)
@@ -101,6 +104,14 @@ const statusMeta = computed(() => {
 })
 const sourceDisabled = computed(() => uploadSource.value === 'file' && selectedFile.value)
 const fileDisabled = computed(() => uploadSource.value === 'url' && uploadUrl.value.trim())
+const summaryExcerpt = computed(() =>
+  summary.value
+    .replace(/^#{1,6}\s+.*$/gm, '')
+    .replace(/^[-*]\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim(),
+)
+const summaryBlocks = computed(() => parseSummaryMarkdown(summary.value))
 
 function notify(message, type = 'success') {
   clearTimeout(toastTimer)
@@ -310,6 +321,61 @@ function clearContext() {
   notify(previewMode.value ? '当前预览对话已清空' : '已清空当前页面上下文；服务端删除接口待接入')
 }
 
+// 后端只生成受控标题、段落和列表；这里用 Vue 文本插值安全渲染，不注入模型返回的 HTML。
+function parseSummaryMarkdown(markdown) {
+  const blocks = []
+  const lines = String(markdown || '').replace(/\r\n?/g, '\n').split('\n')
+  let paragraph = []
+  const flushParagraph = () => {
+    const text = paragraph.join(' ').trim()
+    if (text) blocks.push({ type: 'paragraph', text })
+    paragraph = []
+  }
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    const heading = /^(#{1,4})\s+(.+)$/.exec(line)
+    if (heading) {
+      flushParagraph()
+      blocks.push({ type: 'heading', level: heading[1].length, text: heading[2].trim() })
+      continue
+    }
+    if (/^-\s+/.test(line)) {
+      flushParagraph()
+      const items = []
+      while (index < lines.length && /^-\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^-\s+/, '').trim())
+        index += 1
+      }
+      index -= 1
+      blocks.push({ type: 'list', items })
+      continue
+    }
+    if (!line.trim()) {
+      flushParagraph()
+      continue
+    }
+    paragraph.push(line.trim())
+  }
+  flushParagraph()
+  return blocks
+}
+
+function downloadSummary() {
+  if (!summary.value || !selectedVideo.value) return
+  const safeTitle = (selectedVideo.value.title || '视频摘要').replace(/[\\/:*?"<>|]/g, '_').trim() || '视频摘要'
+  const blob = new Blob([summary.value], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${safeTitle}-摘要.md`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+  notify('Markdown 摘要已开始下载')
+}
+
 function openUpload() {
   uploadOpen.value = true
   sidebarOpen.value = false
@@ -471,6 +537,7 @@ watch(
   selectedId,
   async () => {
     pauseSettled.value = true
+    summaryOpen.value = false
     await loadSelectedContent()
     clearInterval(statusTimer)
     statusTimer = setInterval(refreshStatus, 5000)
@@ -670,9 +737,14 @@ onBeforeUnmount(() => {
             <article class="summary-card">
               <header>
                 <span><Sparkles :size="15" /> AI 摘要</span>
-                <small v-if="summary">自动生成</small>
+                <div v-if="summary" class="summary-actions">
+                  <button type="button" title="预览 Markdown 摘要" @click="summaryOpen = true"><Eye :size="13" /> 预览</button>
+                  <button type="button" title="下载 Markdown 摘要" @click="downloadSummary"><Download :size="13" /> 下载</button>
+                </div>
               </header>
-              <p v-if="summary">{{ summary }}</p>
+              <button v-if="summary" type="button" class="summary-preview-trigger" @click="summaryOpen = true">
+                {{ summaryExcerpt }}
+              </button>
               <div v-else class="summary-placeholder">
                 <Hourglass :size="18" />
                 <span>
@@ -760,6 +832,37 @@ onBeforeUnmount(() => {
     </section>
 
     <Teleport to="body">
+      <div v-if="summaryOpen" class="modal-layer" @mousedown.self="summaryOpen = false">
+        <section class="summary-modal" role="dialog" aria-modal="true" aria-labelledby="summary-title">
+          <header class="modal-header">
+            <div>
+              <span class="modal-icon"><BookOpenText :size="21" /></span>
+              <span>
+                <h2 id="summary-title">视频章节摘要</h2>
+                <p>{{ selectedVideo?.title || '未命名视频' }} · Markdown 文档</p>
+              </span>
+            </div>
+            <button class="icon-button" aria-label="关闭摘要预览" @click="summaryOpen = false"><X :size="20" /></button>
+          </header>
+          <div class="markdown-preview">
+            <template v-for="(block, index) in summaryBlocks" :key="`${block.type}-${index}`">
+              <component :is="`h${block.level}`" v-if="block.type === 'heading'">{{ block.text }}</component>
+              <p v-else-if="block.type === 'paragraph'">{{ block.text }}</p>
+              <ul v-else-if="block.type === 'list'">
+                <li v-for="item in block.items" :key="item">{{ item }}</li>
+              </ul>
+            </template>
+          </div>
+          <footer class="summary-modal__footer">
+            <span>内容由 AI 基于视频证据生成，请结合原片判断。</span>
+            <div>
+              <button class="secondary-button" @click="summaryOpen = false">关闭</button>
+              <button class="primary-button" @click="downloadSummary"><Download :size="16" /> 下载 .md</button>
+            </div>
+          </footer>
+        </section>
+      </div>
+
       <div v-if="uploadOpen" class="modal-layer" @mousedown.self="closeUpload">
         <section class="upload-modal" role="dialog" aria-modal="true" aria-labelledby="upload-title">
           <header class="modal-header">

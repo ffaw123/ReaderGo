@@ -43,12 +43,20 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	ragIndexProcessor, err := worker.NewRAGIndexProcessor(database, configValue.RAGBaseURL, configValue.RAGAPIKey, configValue.RAGChatModel, configValue.RAGEmbeddingModel, configValue.RAGConcurrency, configValue.RAGRequestTimeout)
+	ragIndexProcessor, err := worker.NewRAGIndexProcessor(database, configValue.RAGBaseURL, configValue.RAGAPIKey, configValue.RAGChatModel, configValue.RAGConcurrency, configValue.RAGRequestTimeout)
+	if err != nil {
+		log.Fatal(err)
+	}
+	embeddingProcessor, err := worker.NewEmbeddingProcessor(database, configValue.RAGBaseURL, configValue.RAGAPIKey, configValue.RAGEmbeddingModel, configValue.RAGRequestTimeout)
+	if err != nil {
+		log.Fatal(err)
+	}
+	summaryProcessor, err := worker.NewSummaryProcessor(database, configValue.RAGBaseURL, configValue.RAGAPIKey, configValue.RAGChatModel, configValue.RAGRequestTimeout)
 	if err != nil {
 		log.Fatal(err)
 	}
 	writer := outbox.NewWriter(configValue.RabbitMQJobsExchange, configValue.RabbitMQDLXExchange)
-	handler := worker.New(database, worker.NewRouterProcessor(asrProcessor, ocrProcessor, ragIndexProcessor), writer, worker.Options{
+	handler := worker.New(database, worker.NewRouterProcessor(asrProcessor, ocrProcessor, ragIndexProcessor, embeddingProcessor, summaryProcessor), writer, worker.Options{
 		WorkerID: "worker-" + uuid.NewString(), MaxAttempts: configValue.JobMaxAttempts,
 		RetryDelays: configValue.JobRetryDelays, LeaseTTL: configValue.JobLeaseTTL,
 		HeartbeatInterval: configValue.JobHeartbeatInterval,

@@ -16,7 +16,7 @@ type ConsumerConfig struct {
 	Prefetch int
 }
 
-// RunConsumers 为五个阶段各开一个 channel，并在连接中断后重建拓扑和消费循环。
+// RunConsumers 为六个阶段各开一个 channel，并在连接中断后重建拓扑和消费循环。
 func RunConsumers(ctx context.Context, config ConsumerConfig, handler Handler) error {
 	backoff := time.Second
 	for ctx.Err() == nil {

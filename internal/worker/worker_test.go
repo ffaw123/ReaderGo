@@ -47,6 +47,7 @@ func TestDecideFailureActionClassifiesModelAndUserInputErrors(t *testing.T) {
 		{name: "missing model fails immediately", err: &openai.Error{StatusCode: http.StatusNotFound}, currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithDeadLetter},
 		{name: "transient error enters DLQ after final attempt", err: &openai.Error{StatusCode: http.StatusBadGateway}, currentAttempt: 4, maxAttempts: 4, want: failureActionFailWithDeadLetter},
 		{name: "invalid video skips DLQ", err: userInputProcessError(context.Canceled), currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithoutDeadLetter},
+		{name: "invalid structured output enters DLQ immediately", err: permanentProcessError(context.Canceled), currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithDeadLetter},
 	}
 
 	for _, test := range tests {
@@ -55,6 +56,30 @@ func TestDecideFailureActionClassifiesModelAndUserInputErrors(t *testing.T) {
 				t.Fatalf("decideFailureAction() = %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestRequiredTasksIncludeDecoupledEmbeddingStage(t *testing.T) {
+	required, err := requiredTaskTypesForUploadMethod(queue.UploadMethodLocalDirect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{model.TaskASR, model.TaskVision, model.TaskRAGIndex, model.TaskEmbedding, model.TaskSummary}
+	if !reflect.DeepEqual(required, want) {
+		t.Fatalf("required tasks = %#v, want %#v", required, want)
+	}
+}
+
+func TestNextTaskTypesFollowRAGThenParallelEmbeddingAndSummary(t *testing.T) {
+	if got := nextTaskTypesForCompletion(model.TaskVision, false); got != nil {
+		t.Fatalf("vision before ASR completion created tasks: %#v", got)
+	}
+	if got := nextTaskTypesForCompletion(model.TaskVision, true); !reflect.DeepEqual(got, []string{model.TaskRAGIndex}) {
+		t.Fatalf("ASR/Vision completion tasks = %#v", got)
+	}
+	want := []string{model.TaskEmbedding, model.TaskSummary}
+	if got := nextTaskTypesForCompletion(model.TaskRAGIndex, false); !reflect.DeepEqual(got, want) {
+		t.Fatalf("RAG completion tasks = %#v, want %#v", got, want)
 	}
 }
 

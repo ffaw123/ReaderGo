@@ -665,6 +665,11 @@ func (s *Server) summary(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if v.Status != model.VideoStatusReady {
+		// Embedding 与 Summary 并行期间禁止读取可能由旧任务留下的摘要，保持 ready 数据边界。
+		c.JSON(http.StatusNotFound, gin.H{"error": "summary not ready"})
+		return
+	}
 	var x model.VideoSummary
 	if e := s.db.Where("video_id = ?", v.ID).First(&x).Error; e != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "summary not ready"})

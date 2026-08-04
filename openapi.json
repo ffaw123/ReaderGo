@@ -89,7 +89,7 @@
         "type": "object",
         "properties": {
           "id":            { "type": "string", "format": "uuid" },
-          "task_type":     { "type": "string", "enum": ["prepare","asr","vision","rag_index","summary"] },
+          "task_type":     { "type": "string", "enum": ["prepare","asr","vision","rag_index","embedding","summary"] },
           "attempt":       { "type": "integer" },
           "status":        { "type": "string", "enum": ["pending","running","succeeded","failed"] },
           "error_message": { "type": "string" },
@@ -159,7 +159,7 @@
         "properties": {
           "id":         { "type": "string", "format": "uuid" },
           "video_id":   { "type": "string", "format": "uuid" },
-          "content":    { "type": "string", "description": "LLM 生成的视频摘要文本" },
+          "content":    { "type": "string", "description": "总体概览与语义章节组成的 Markdown 摘要文档，不包含技术时间窗口" },
           "created_at": { "type": "string", "format": "date-time" }
         }
       },
@@ -558,7 +558,7 @@
       "get": {
         "tags": ["Videos"],
         "summary": "获取视频 AI 摘要",
-        "description": "返回 LLM 对视频生成的摘要。仅当视频处理完成且摘要已写入后才返回内容。",
+        "description": "返回 LLM 基于 RAG 片段与原始证据生成的 Markdown 章节摘要。仅当视频处理完成且摘要已写入后才返回内容。",
         "operationId": "getVideoSummary",
         "security": [{ "BearerAuth": [] }],
         "parameters": [

@@ -25,6 +25,7 @@ var QueueSpecs = []QueueSpec{
 	{TaskType: "asr", RoutingKey: RoutingKeyASR, QueueName: "readergo.video.asr", DLQName: "readergo.video.asr.dlq"},
 	{TaskType: "vision", RoutingKey: RoutingKeyVision, QueueName: "readergo.video.vision", DLQName: "readergo.video.vision.dlq"},
 	{TaskType: "rag_index", RoutingKey: RoutingKeyRAGIndex, QueueName: "readergo.video.rag-index", DLQName: "readergo.video.rag-index.dlq"},
+	{TaskType: "embedding", RoutingKey: RoutingKeyEmbedding, QueueName: "readergo.video.embedding", DLQName: "readergo.video.embedding.dlq"},
 	{TaskType: "summary", RoutingKey: RoutingKeySummary, QueueName: "readergo.video.summary", DLQName: "readergo.video.summary.dlq"},
 }
 

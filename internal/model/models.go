@@ -14,11 +14,12 @@ const (
 	JobStatusSucceeded = "succeeded"
 	JobStatusFailed    = "failed"
 
-	TaskPrepare  = "prepare"
-	TaskASR      = "asr"
-	TaskVision   = "vision"
-	TaskRAGIndex = "rag_index"
-	TaskSummary  = "summary"
+	TaskPrepare   = "prepare"
+	TaskASR       = "asr"
+	TaskVision    = "vision"
+	TaskRAGIndex  = "rag_index"
+	TaskEmbedding = "embedding"
+	TaskSummary   = "summary"
 )
 
 // User 同时表示登录身份和第一版中的租户隔离边界。

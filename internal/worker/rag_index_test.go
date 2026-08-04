@@ -21,12 +21,12 @@ import (
 
 func TestNewRAGIndexProcessorAcceptsOneToTenConcurrentRequests(t *testing.T) {
 	for _, concurrency := range []int{1, 5, 10} {
-		if _, err := NewRAGIndexProcessor(&gorm.DB{}, "https://example.com/v1", "test-key", "chat-model", "embedding-model", concurrency, time.Minute); err != nil {
+		if _, err := NewRAGIndexProcessor(&gorm.DB{}, "https://example.com/v1", "test-key", "chat-model", concurrency, time.Minute); err != nil {
 			t.Errorf("concurrency %d was rejected: %v", concurrency, err)
 		}
 	}
 	for _, concurrency := range []int{0, 11} {
-		if _, err := NewRAGIndexProcessor(&gorm.DB{}, "https://example.com/v1", "test-key", "chat-model", "embedding-model", concurrency, time.Minute); err == nil {
+		if _, err := NewRAGIndexProcessor(&gorm.DB{}, "https://example.com/v1", "test-key", "chat-model", concurrency, time.Minute); err == nil {
 			t.Errorf("concurrency %d was accepted", concurrency)
 		}
 	}
@@ -108,7 +108,7 @@ func TestRAGCompatibleClientGeneratesStructuredSegmentsAndEmbeddings(t *testing.
 
 	processor := &RAGIndexProcessor{
 		client:    openai.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL(server.URL+"/v1"), option.WithMaxRetries(0)),
-		chatModel: "rag-chat", embeddingModel: "rag-embedding", concurrency: 2,
+		chatModel: "rag-chat", concurrency: 2,
 	}
 	if err := processor.summarizeWindows(context.Background(), windows); err != nil {
 		t.Fatal(err)
@@ -119,7 +119,12 @@ func TestRAGCompatibleClientGeneratesStructuredSegmentsAndEmbeddings(t *testing.
 	if !strings.Contains(windows[0].RetrievalText, "事实A") || strings.Contains(windows[0].RetrievalText, "原始证据") {
 		t.Errorf("retrieval text = %q", windows[0].RetrievalText)
 	}
-	vectors, err := processor.embedWindows(context.Background(), windows)
+	embedding := &EmbeddingProcessor{
+		client:         openai.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL(server.URL+"/v1"), option.WithMaxRetries(0)),
+		embeddingModel: "rag-embedding",
+	}
+	segments := []model.VideoSegment{{RetrievalText: windows[0].RetrievalText}, {RetrievalText: windows[1].RetrievalText}}
+	vectors, err := embedding.embedSegments(context.Background(), segments)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,15 +280,15 @@ func TestEmbedWindowsUsesTenItemBatchesAndRunsAllBatchesConcurrently(t *testing.
 	}))
 	defer server.Close()
 
-	windows := make([]*ragWindow, 25)
-	for index := range windows {
-		windows[index] = &ragWindow{RetrievalText: fmt.Sprintf("segment-%d", index)}
+	segments := make([]model.VideoSegment, 25)
+	for index := range segments {
+		segments[index] = model.VideoSegment{RetrievalText: fmt.Sprintf("segment-%d", index)}
 	}
-	processor := &RAGIndexProcessor{
+	processor := &EmbeddingProcessor{
 		client:         openai.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL(server.URL), option.WithMaxRetries(0)),
 		embeddingModel: "rag-embedding",
 	}
-	vectors, err := processor.embedWindows(context.Background(), windows)
+	vectors, err := processor.embedSegments(context.Background(), segments)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,12 +323,12 @@ func TestEmbedBatchRetriesMalformedAndInvalidResponsesTwice(t *testing.T) {
 	}))
 	defer server.Close()
 
-	processor := &RAGIndexProcessor{
+	processor := &EmbeddingProcessor{
 		client:         openai.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL(server.URL), option.WithMaxRetries(0)),
 		embeddingModel: "rag-embedding",
 	}
-	windows := []*ragWindow{{RetrievalText: "segment-0"}, {RetrievalText: "segment-1"}, {RetrievalText: "segment-2"}}
-	vectors, err := processor.embedWindows(context.Background(), windows)
+	segments := []model.VideoSegment{{RetrievalText: "segment-0"}, {RetrievalText: "segment-1"}, {RetrievalText: "segment-2"}}
+	vectors, err := processor.embedSegments(context.Background(), segments)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,11 +351,11 @@ func TestEmbedBatchDoesNotRetryDimensionMismatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	processor := &RAGIndexProcessor{
+	processor := &EmbeddingProcessor{
 		client:         openai.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL(server.URL), option.WithMaxRetries(0)),
 		embeddingModel: "rag-embedding",
 	}
-	if _, err := processor.embedWindows(context.Background(), []*ragWindow{{RetrievalText: "segment-0"}}); err == nil {
+	if _, err := processor.embedSegments(context.Background(), []model.VideoSegment{{RetrievalText: "segment-0"}}); err == nil {
 		t.Fatal("embedding dimension mismatch was accepted")
 	}
 	if calls.Load() != 1 {
@@ -360,9 +365,14 @@ func TestEmbedBatchDoesNotRetryDimensionMismatch(t *testing.T) {
 
 func TestRouterRegistersRAGIndexProcessor(t *testing.T) {
 	rag := &RAGIndexProcessor{}
-	router := NewRouterProcessor(nil, nil, rag)
+	embedding := &EmbeddingProcessor{}
+	summary := &SummaryProcessor{}
+	router := NewRouterProcessor(nil, nil, rag, embedding, summary)
 	if router.processors[model.TaskRAGIndex] != rag {
 		t.Fatal("RAG index processor was not registered")
+	}
+	if router.processors[model.TaskEmbedding] != embedding || router.processors[model.TaskSummary] != summary {
+		t.Fatal("embedding or summary processor was not registered")
 	}
 }
 

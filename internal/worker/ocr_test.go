@@ -202,7 +202,7 @@ func TestNewOCRProcessorAcceptsOneToTenConcurrentRequests(t *testing.T) {
 
 func TestRouterRegistersOCRForExistingVisionTask(t *testing.T) {
 	ocr := &OCRProcessor{}
-	router := NewRouterProcessor(nil, ocr, nil)
+	router := NewRouterProcessor(nil, ocr, nil, nil, nil)
 	if router.processors[model.TaskVision] != ocr {
 		t.Fatal("OCR processor was not registered for vision task")
 	}

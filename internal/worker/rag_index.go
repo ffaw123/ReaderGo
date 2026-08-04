@@ -9,11 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,17 +26,15 @@ import (
 )
 
 const (
-	ragWindowDuration      = 60 * time.Second
-	ragPromptVersion       = "rag-segment-v2"
-	ragEmbeddingDimensions = 1024
-	ragEmbeddingBatchSize  = 10
-	ragMaxSummaryRunes     = 2000
-	ragMaxFacts            = 20
-	ragMaxFactRunes        = 1000
-	ragMaxKeywords         = 30
-	ragMaxKeywordRunes     = 100
-	ragMaxRetries          = 3
-	ragMaxOutputRetries    = 2
+	ragWindowDuration   = 60 * time.Second
+	ragPromptVersion    = "rag-segment-v2"
+	ragMaxSummaryRunes  = 2000
+	ragMaxFacts         = 20
+	ragMaxFactRunes     = 1000
+	ragMaxKeywords      = 30
+	ragMaxKeywordRunes  = 100
+	ragMaxRetries       = 3
+	ragMaxOutputRetries = 2
 )
 
 var ragOutputRetryDelays = [...]time.Duration{500 * time.Millisecond, time.Second}
@@ -49,14 +45,13 @@ const ragSegmentSystemPrompt = `你是视频检索索引生成器。输入是一
 必须只返回一个 JSON 对象，格式为：{"segment_id":"输入ID","segment_summary":"简明主题摘要","key_facts":["上下文自足的事实句"],"keywords":["关键词"]}。
 返回的 segment_id 必须与输入完全一致；信息不足时 key_facts 或 keywords 返回空数组，不得编造。`
 
-// RAGIndexProcessor 将 ASR/OCR 原始结果转换为可检索片段和单一主语义向量。
+// RAGIndexProcessor 将 ASR/OCR 原始结果转换为可检索片段；向量由独立 embedding 任务生成。
 // 所有网络调用都发生在事务外，只有最终替换索引时使用短事务。
 type RAGIndexProcessor struct {
-	db             *gorm.DB
-	client         openai.Client
-	chatModel      string
-	embeddingModel string
-	concurrency    int
+	db          *gorm.DB
+	client      openai.Client
+	chatModel   string
+	concurrency int
 }
 
 type ragWindow struct {
@@ -95,7 +90,7 @@ type ragSegmentOutput struct {
 }
 
 // NewRAGIndexProcessor 校验独立的 RAG 配置并创建可复用的 OpenAI 兼容客户端。
-func NewRAGIndexProcessor(db *gorm.DB, baseURL, apiKey, chatModel, embeddingModel string, concurrency int, requestTimeout time.Duration) (*RAGIndexProcessor, error) {
+func NewRAGIndexProcessor(db *gorm.DB, baseURL, apiKey, chatModel string, concurrency int, requestTimeout time.Duration) (*RAGIndexProcessor, error) {
 	if db == nil {
 		return nil, fmt.Errorf("RAG index processor requires database")
 	}
@@ -106,8 +101,8 @@ func NewRAGIndexProcessor(db *gorm.DB, baseURL, apiKey, chatModel, embeddingMode
 	if strings.TrimSpace(apiKey) == "" {
 		return nil, fmt.Errorf("RAG_API_KEY is required")
 	}
-	if strings.TrimSpace(chatModel) == "" || strings.TrimSpace(embeddingModel) == "" {
-		return nil, fmt.Errorf("RAG_CHAT_MODEL and RAG_EMBEDDING_MODEL are required")
+	if strings.TrimSpace(chatModel) == "" {
+		return nil, fmt.Errorf("RAG_CHAT_MODEL is required")
 	}
 	if concurrency < 1 || concurrency > 10 {
 		return nil, fmt.Errorf("RAG_CONCURRENCY must be between 1 and 10")
@@ -123,8 +118,7 @@ func NewRAGIndexProcessor(db *gorm.DB, baseURL, apiKey, chatModel, embeddingMode
 		option.WithMaxRetries(0),
 	)
 	return &RAGIndexProcessor{
-		db: db, client: client, chatModel: strings.TrimSpace(chatModel),
-		embeddingModel: strings.TrimSpace(embeddingModel), concurrency: concurrency,
+		db: db, client: client, chatModel: strings.TrimSpace(chatModel), concurrency: concurrency,
 	}, nil
 }
 
@@ -164,11 +158,7 @@ func (p *RAGIndexProcessor) Process(ctx context.Context, job queue.VideoJobMessa
 	if err := p.summarizeWindows(ctx, windows); err != nil {
 		return err
 	}
-	vectors, err := p.embedWindows(ctx, windows)
-	if err != nil {
-		return err
-	}
-	if err := p.replaceIndex(ctx, video, windows, vectors); err != nil {
+	if err := p.replaceSegments(ctx, video, windows); err != nil {
 		return err
 	}
 	log.Printf("RAG index completed for video %s: %d segments", video.ID, len(windows))
@@ -434,117 +424,8 @@ func buildRAGRetrievalText(summary string, facts, keywords []string) string {
 	return builder.String()
 }
 
-// embedWindows 并发处理向量请求，请求与重试规则如下：
-//   - 按原窗口顺序每 10 个分为一批，所有批次同时请求，不额外限制 Embedding 批次数并发。
-//   - 每批的网络错误、HTTP 408/409/429/5xx 由 SDK 最多重试 3 次，即包含首次请求在内最多尝试 4 次。
-//   - HTTP 成功但响应 JSON、向量数量或 index 完整性校验失败时，只重试当前批次，按 500ms、1s 退避 2 次。
-//   - 向量维度不是 1024 属于模型或配置错误，不进行批次重试；任一批次最终失败会取消其他批次并交给任务级重试。
-//   - 全部批次成功后才返回按原窗口顺序排列的向量，数据库仍由 replaceIndex 统一原子写入。
-func (p *RAGIndexProcessor) embedWindows(ctx context.Context, windows []*ragWindow) ([][]float64, error) {
-	if len(windows) == 0 {
-		return [][]float64{}, nil
-	}
-
-	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	vectors := make([][]float64, len(windows))
-	batchCount := (len(windows) + ragEmbeddingBatchSize - 1) / ragEmbeddingBatchSize
-	errorsChannel := make(chan error, 1)
-	var wait sync.WaitGroup
-	wait.Add(batchCount)
-	for batchIndex, start := 0, 0; start < len(windows); batchIndex, start = batchIndex+1, start+ragEmbeddingBatchSize {
-		end := min(start+ragEmbeddingBatchSize, len(windows))
-		go func(batchIndex, start, end int) {
-			defer wait.Done()
-			batchVectors, err := p.embedBatchWithRetry(workerCtx, batchIndex+1, windows[start:end])
-			if err != nil {
-				// 其他批次因首个错误被取消后，不再覆盖真正的失败原因。
-				if workerCtx.Err() != nil && ctx.Err() == nil {
-					return
-				}
-				select {
-				case errorsChannel <- fmt.Errorf("embed RAG batch %d [%d:%d]: %w", batchIndex+1, start, end, err):
-					cancel()
-				default:
-				}
-				return
-			}
-			// 各批次只写入自己的连续区间，无需加锁，并保持与原窗口数组完全一致的顺序。
-			copy(vectors[start:end], batchVectors)
-		}(batchIndex, start, end)
-	}
-	wait.Wait()
-	select {
-	case err := <-errorsChannel:
-		return nil, err
-	default:
-		return vectors, ctx.Err()
-	}
-}
-
-func (p *RAGIndexProcessor) embedBatchWithRetry(ctx context.Context, batchIndex int, windows []*ragWindow) ([][]float64, error) {
-	for attempt := 0; ; attempt++ {
-		vectors, retryable, err := p.embedBatchOnce(ctx, windows)
-		if err == nil {
-			return vectors, nil
-		}
-		if !retryable {
-			return nil, err
-		}
-		if attempt >= ragMaxOutputRetries {
-			return nil, fmt.Errorf("embedding batch %d output remains invalid after %d attempts: %w", batchIndex, attempt+1, err)
-		}
-
-		delay := ragOutputRetryDelays[attempt]
-		log.Printf("RAG embedding batch %d output attempt %d/%d invalid, retrying in %s: %v", batchIndex, attempt+1, ragMaxOutputRetries+1, delay, err)
-		if err := waitRAGOutputRetry(ctx, delay); err != nil {
-			return nil, err
-		}
-	}
-}
-
-func (p *RAGIndexProcessor) embedBatchOnce(ctx context.Context, windows []*ragWindow) ([][]float64, bool, error) {
-	inputs := make([]string, len(windows))
-	for index, window := range windows {
-		inputs[index] = window.RetrievalText
-	}
-	response, err := p.client.Embeddings.New(ctx, openai.EmbeddingNewParams{
-		Model:      openai.EmbeddingModel(p.embeddingModel),
-		Input:      openai.EmbeddingNewParamsInputUnion{OfArrayOfStrings: inputs},
-		Dimensions: openai.Int(ragEmbeddingDimensions),
-	}, option.WithMaxRetries(ragMaxRetries))
-	if err != nil {
-		if isRAGResponseDecodeError(err) {
-			return nil, true, fmt.Errorf("decode RAG embedding response: %w", err)
-		}
-		// HTTP 和网络错误已经由 SDK 完成重试，不能再进入输出校验重试以免次数相乘。
-		return nil, false, fmt.Errorf("call RAG embedding service: %w", err)
-	}
-	if len(response.Data) != len(windows) {
-		return nil, true, fmt.Errorf("embedding service returned %d vectors, want %d", len(response.Data), len(windows))
-	}
-	vectors := make([][]float64, len(windows))
-	for _, item := range response.Data {
-		if item.Index < 0 || item.Index >= int64(len(windows)) || vectors[item.Index] != nil {
-			return nil, true, fmt.Errorf("embedding service returned invalid or duplicate index %d", item.Index)
-		}
-		if len(item.Embedding) != ragEmbeddingDimensions {
-			// 维度由模型和配置决定，重复请求不会改变结果，因此直接交给任务层处理。
-			return nil, false, fmt.Errorf("embedding %d has %d dimensions, want %d", item.Index, len(item.Embedding), ragEmbeddingDimensions)
-		}
-		vectors[item.Index] = item.Embedding
-	}
-	return vectors, false, nil
-}
-
-func isRAGResponseDecodeError(err error) bool {
-	var syntaxError *json.SyntaxError
-	var typeError *json.UnmarshalTypeError
-	return errors.As(err, &syntaxError) || errors.As(err, &typeError) || errors.Is(err, io.ErrUnexpectedEOF)
-}
-
-// replaceIndex 在片段和全部向量准备完毕后原子替换，任务重试不会留下重复或半成品索引。
-func (p *RAGIndexProcessor) replaceIndex(ctx context.Context, video model.Video, windows []*ragWindow, vectors [][]float64) error {
+// replaceSegments 在全部窗口生成完成后原子替换；旧向量通过外键级联删除，由后续 embedding 任务重建。
+func (p *RAGIndexProcessor) replaceSegments(ctx context.Context, video model.Video, windows []*ragWindow) error {
 	segments := make([]model.VideoSegment, len(windows))
 	for index, window := range windows {
 		segments[index] = model.VideoSegment{
@@ -561,38 +442,6 @@ func (p *RAGIndexProcessor) replaceIndex(ctx context.Context, video model.Video,
 		if err := tx.CreateInBatches(segments, 100).Error; err != nil {
 			return fmt.Errorf("store RAG segments: %w", err)
 		}
-		for index, segment := range segments {
-			vector, err := formatPGVector(vectors[index])
-			if err != nil {
-				return fmt.Errorf("format embedding for segment %s: %w", segment.ID, err)
-			}
-			// 显式转换为 pgvector，避免驱动把字符串按 text 或 JSON 类型写入。
-			if err := tx.Exec(`INSERT INTO segment_embeddings
-				(id, tenant_id, video_id, segment_id, embedding_model, embedding, created_at)
-				VALUES (?, ?, ?, ?, ?, ?::vector, ?)`,
-				uuid.NewString(), video.TenantID, video.ID, segment.ID, p.embeddingModel, vector, time.Now().UTC()).Error; err != nil {
-				return fmt.Errorf("store embedding for segment %s: %w", segment.ID, err)
-			}
-		}
 		return nil
 	})
-}
-
-func formatPGVector(vector []float64) (string, error) {
-	if len(vector) != ragEmbeddingDimensions {
-		return "", fmt.Errorf("vector has %d dimensions, want %d", len(vector), ragEmbeddingDimensions)
-	}
-	var builder strings.Builder
-	builder.WriteByte('[')
-	for index, value := range vector {
-		if math.IsNaN(value) || math.IsInf(value, 0) {
-			return "", fmt.Errorf("vector contains a non-finite value at index %d", index)
-		}
-		if index > 0 {
-			builder.WriteByte(',')
-		}
-		builder.WriteString(strconv.FormatFloat(value, 'g', -1, 64))
-	}
-	builder.WriteByte(']')
-	return builder.String(), nil
 }
