@@ -149,13 +149,17 @@ func (p *RAGIndexProcessor) Process(ctx context.Context, job queue.VideoJobMessa
 		Order("start_ms ASC, end_ms ASC").Find(&ocrSegments).Error; err != nil {
 		return fmt.Errorf("load OCR evidence for video %s: %w", video.ID, err)
 	}
+	if !hasUsableRAGEvidence(asrSegments, ocrSegments) {
+		return userInputProcessError(errors.New("未从视频中识别到有效语音或画面文字，请上传包含清晰语音或可识别文字的视频"))
+	}
 
 	windows, err := buildRAGWindows(ctx, video.DurationMS, asrSegments, ocrSegments)
 	if err != nil {
 		return err
 	}
 	if len(windows) == 0 {
-		return fmt.Errorf("video %s has no usable ASR or OCR evidence; refusing to create an empty RAG index", video.ID)
+		// 原始证据存在却无法落入视频时间轴，属于数据契约异常，应保留任务重试与最终 DLQ。
+		return fmt.Errorf("video %s has ASR or OCR evidence but no valid RAG windows", video.ID)
 	}
 	if err := p.summarizeWindows(ctx, windows); err != nil {
 		return err
@@ -169,6 +173,20 @@ func (p *RAGIndexProcessor) Process(ctx context.Context, job queue.VideoJobMessa
 	}
 	log.Printf("RAG index completed for video %s: %d segments", video.ID, len(windows))
 	return nil
+}
+
+func hasUsableRAGEvidence(asrSegments []model.ASRSegment, ocrSegments []model.OCRSegment) bool {
+	for _, segment := range asrSegments {
+		if strings.TrimSpace(segment.Transcript) != "" {
+			return true
+		}
+	}
+	for _, segment := range ocrSegments {
+		if strings.TrimSpace(segment.Text) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // buildRAGWindows 按视频绝对时间轴创建固定 60 秒窗口；空窗口不会进入索引。

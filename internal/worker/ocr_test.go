@@ -47,19 +47,39 @@ func TestDeduplicateFramesAlwaysMergesSameTimestamp(t *testing.T) {
 	}
 }
 
-func TestBuildOCRSegmentsDropsOnlyEmptyResults(t *testing.T) {
+func TestBuildOCRSegmentsDropsInvalidResults(t *testing.T) {
 	video := model.Video{ID: "video-id", TenantID: "tenant-id"}
-	frames := []ocrFrame{{TimestampMS: 0}, {TimestampMS: 15000}, {TimestampMS: 30000}}
-	results := []string{"  ", "模型返回的任意文字", "  原样文字!?  "}
-	segments := buildOCRSegments(video, 45000, frames, results)
+	frames := []ocrFrame{{TimestampMS: 0}, {TimestampMS: 15000}, {TimestampMS: 30000}, {TimestampMS: 45000}}
+	results := []string{"  ", `$\text { 一 }$`, "模型返回的有效文字", "  原样文字!?  "}
+	segments := buildOCRSegments(video, 60000, frames, results)
 	if len(segments) != 2 {
-		t.Fatalf("segments = %#v, want two non-empty segments", segments)
+		t.Fatalf("segments = %#v, want two validated segments", segments)
 	}
-	if segments[0].StartMS != 15000 || segments[0].EndMS != 30000 || segments[0].Text != "模型返回的任意文字" {
+	if segments[0].StartMS != 30000 || segments[0].EndMS != 45000 || segments[0].Text != "模型返回的有效文字" {
 		t.Errorf("first segment = %#v", segments[0])
 	}
-	if segments[1].StartMS != 30000 || segments[1].EndMS != 45000 || segments[1].Text != "原样文字!?" {
+	if segments[1].StartMS != 45000 || segments[1].EndMS != 60000 || segments[1].Text != "原样文字!?" {
 		t.Errorf("second segment = %#v", segments[1])
+	}
+}
+
+func TestValidateOCRResultRejectsPlaceholdersAndLowValueText(t *testing.T) {
+	rejected := []string{"", "   ", ocrNoTextToken, "```NO_TEXT```", "没有文字", "...", `＄\text { 一 }＄`, `$\text { 一 }$`, "A"}
+	for _, value := range rejected {
+		if text, valid := validateOCRResult(value); valid {
+			t.Errorf("validateOCRResult(%q) = (%q, true), want rejected", value, text)
+		}
+	}
+
+	accepted := map[string]string{
+		"  有效文字!?  ": "有效文字!?",
+		"A1":         "A1",
+		"Hello\n世界":  "Hello\n世界",
+	}
+	for input, want := range accepted {
+		if text, valid := validateOCRResult(input); !valid || text != want {
+			t.Errorf("validateOCRResult(%q) = (%q, %t), want (%q, true)", input, text, valid, want)
+		}
 	}
 }
 
@@ -100,6 +120,9 @@ func TestOCRRecognizeImageUsesQwenVLOCRContract(t *testing.T) {
 		}
 		if request.Messages[0].Content[1].Type != "text" || request.Messages[0].Content[1].Text != ocrUserPrompt {
 			t.Errorf("unexpected OCR prompt: %#v", request.Messages[0].Content[1])
+		}
+		if !strings.Contains(request.Messages[0].Content[1].Text, ocrNoTextToken) || !strings.Contains(request.Messages[0].Content[1].Text, "Do not infer") {
+			t.Errorf("OCR prompt does not define strict no-text behavior: %q", request.Messages[0].Content[1].Text)
 		}
 		writeOCRCompletion(t, w, "原样文字!?")
 	}))

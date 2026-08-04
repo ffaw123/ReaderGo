@@ -90,7 +90,12 @@ const statusMeta = computed(() => {
       percent: 64,
       tone: 'paused',
     },
-    failed: { label: '处理失败', detail: '请检查视频源后重试', percent: 100, tone: 'danger' },
+    failed: {
+      label: '处理失败',
+      detail: selectedVideo.value?.error_message || '请检查视频源后重试',
+      percent: 100,
+      tone: 'danger',
+    },
   }
   return statuses[selectedVideo.value?.status] || statuses.uploading
 })
@@ -189,6 +194,7 @@ async function refreshStatus() {
   try {
     const status = await api.getVideoStatus(selectedVideo.value.id, true)
     selectedVideo.value.status = status.status
+    selectedVideo.value.error_message = status.error_message || ''
     pauseSettled.value = status.pause_settled !== false
     if (status.status === 'ready') await loadSelectedContent()
   } catch {

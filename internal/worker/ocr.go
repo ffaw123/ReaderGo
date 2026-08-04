@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"readergo/internal/media"
 	"readergo/internal/model"
@@ -31,9 +32,14 @@ const (
 	ocrFixedSampleInterval = 15 * time.Second
 	ocrMaxRetries          = 2
 	ocrRequestTimeout      = 60 * time.Second
+	ocrNoTextToken         = "NO_TEXT"
+	ocrMinInformativeRunes = 2
 )
 
-const ocrUserPrompt = "Please output only the text content from the image without any additional descriptions or formatting."
+const ocrUserPrompt = "You are a strict OCR engine. Extract only text that is clearly visible and readable in the image. " +
+	"Do not infer, complete, translate, describe, or guess text. Preserve the original characters and line breaks. " +
+	"Return plain text only, without Markdown, code fences, LaTeX, labels, or explanations. " +
+	"If there is no clearly readable text, return exactly " + ocrNoTextToken + "."
 
 type ocrFrame struct {
 	TimestampMS int64
@@ -169,9 +175,10 @@ func buildOCRSegments(video model.Video, durationMS int64, frames []ocrFrame, re
 		if index >= len(results) {
 			break
 		}
-		text := strings.TrimSpace(results[index])
-		// Qwen-VL-OCR 不返回置信度；只有空文本不代表有效视频证据，直接丢弃且不写入占位记录。
-		if text == "" {
+		text, valid := validateOCRResult(results[index])
+		if !valid {
+			// 空白、无文字占位回复和低价值单字符结果均不进入数据库，避免误触发后续 RAG。
+			log.Printf("OCR discarded empty, placeholder, or low-value result at %d ms for video %s", frame.TimestampMS, video.ID)
 			continue
 		}
 		endMS := durationMS
@@ -188,6 +195,63 @@ func buildOCRSegments(video model.Video, durationMS int64, frames []ocrFrame, re
 		})
 	}
 	return segments
+}
+
+// validateOCRResult 只保留至少两个可检索字符的纯 OCR 结果。
+// 校验视图会忽略 LaTeX 命令名，因此 `$\text { 一 }$` 只计为一个汉字并被丢弃；通过后仍保存模型原文。
+func validateOCRResult(value string) (string, bool) {
+	text := strings.TrimSpace(value)
+	if text == "" || isOCRNoTextReply(text) {
+		return "", false
+	}
+
+	validationText := stripOCRFormattingCommands(text)
+	informativeRunes := 0
+	for _, char := range validationText {
+		if unicode.IsLetter(char) || unicode.IsDigit(char) {
+			informativeRunes++
+			if informativeRunes >= ocrMinInformativeRunes {
+				return text, true
+			}
+		}
+	}
+	return "", false
+}
+
+func isOCRNoTextReply(value string) bool {
+	var normalized strings.Builder
+	for _, char := range value {
+		if unicode.IsLetter(char) || unicode.IsDigit(char) {
+			normalized.WriteRune(unicode.ToLower(char))
+		}
+	}
+	switch normalized.String() {
+	case "notext", "noreadabletext", "novisibletext", "theimagecontainsnotext",
+		"无文字", "没有文字", "未检测到文字", "未识别到文字", "无可识别文字",
+		"图片中没有文字", "图像中没有文字", "图片无文字", "图像无文字":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripOCRFormattingCommands(value string) string {
+	var result strings.Builder
+	skippingCommand := false
+	for _, char := range value {
+		if skippingCommand {
+			if unicode.IsLetter(char) {
+				continue
+			}
+			skippingCommand = false
+		}
+		if char == '\\' {
+			skippingCommand = true
+			continue
+		}
+		result.WriteRune(char)
+	}
+	return result.String()
 }
 
 func (p *OCRProcessor) deduplicateFrames(ctx context.Context, samples []media.FrameSample) ([]ocrFrame, error) {

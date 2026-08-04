@@ -223,11 +223,27 @@ func TestSummarizeWindowDoesNotRetryPermanentFailure(t *testing.T) {
 		client:    openai.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL(server.URL), option.WithMaxRetries(0)),
 		chatModel: "rag-chat", concurrency: 1,
 	}
-	if err := processor.summarizeWindows(context.Background(), []*ragWindow{{ID: "segment-auth", Evidence: "证据"}}); err == nil {
+	err := processor.summarizeWindows(context.Background(), []*ragWindow{{ID: "segment-auth", Evidence: "证据"}})
+	if err == nil {
 		t.Fatal("permanent API failure was accepted")
 	}
 	if calls.Load() != 1 {
 		t.Errorf("calls = %d, want 1", calls.Load())
+	}
+	if action := decideFailureAction(err, 1, 4); action != failureActionFailWithDeadLetter {
+		t.Errorf("401 failure action = %d, want immediate failure with DLQ", action)
+	}
+}
+
+func TestHasUsableRAGEvidenceRequiresNonWhitespaceText(t *testing.T) {
+	if hasUsableRAGEvidence([]model.ASRSegment{{Transcript: " \n\t "}}, []model.OCRSegment{{Text: "  "}}) {
+		t.Fatal("whitespace-only evidence was accepted")
+	}
+	if !hasUsableRAGEvidence([]model.ASRSegment{{Transcript: "有效语音"}}, nil) {
+		t.Fatal("non-empty ASR evidence was rejected")
+	}
+	if !hasUsableRAGEvidence(nil, []model.OCRSegment{{Text: "画面文字"}}) {
+		t.Fatal("non-empty OCR evidence was rejected")
 	}
 }
 

@@ -68,10 +68,10 @@ func (x *Consumer) Handle(ctx context.Context, message queue.VideoJobMessage) er
 			// 连接或进程退出时保留 running，Reconciler 会在租约过期后可靠恢复。
 			return ctx.Err()
 		}
-		if err := x.handleProcessFailure(ctx, job, message.UploadMethod, processErr.Error()); err != nil {
+		if err := x.handleProcessFailure(ctx, job, message.UploadMethod, processErr); err != nil {
 			return err
 		}
-		log.Printf("job %s attempt %d failed and was persisted for retry or DLQ: %v", job.ID, job.Attempt, processErr)
+		log.Printf("job %s attempt %d failed and was persisted according to its failure policy: %v", job.ID, job.Attempt, processErr)
 		return nil
 	}
 	return x.completeJob(ctx, job, message.UploadMethod)
@@ -241,7 +241,8 @@ func (x *Consumer) completeJob(ctx context.Context, job model.ProcessingJob, upl
 	})
 }
 
-func (x *Consumer) handleProcessFailure(ctx context.Context, job model.ProcessingJob, uploadMethod, errorMessage string) error {
+func (x *Consumer) handleProcessFailure(ctx context.Context, job model.ProcessingJob, uploadMethod string, processErr error) error {
+	errorMessage := processErr.Error()
 	return x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var video model.Video
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", job.VideoID).Error; err != nil {
@@ -260,7 +261,8 @@ func (x *Consumer) handleProcessFailure(ctx context.Context, job model.Processin
 				"status": model.JobStatusPending, "error_message": "", "lease_owner": "", "lease_expires_at": nil,
 			}).Error
 		}
-		if current.Attempt < x.options.MaxAttempts {
+		action := decideFailureAction(processErr, current.Attempt, x.options.MaxAttempts)
+		if action == failureActionRetry {
 			current.Attempt++
 			if err := tx.Model(&current).Updates(map[string]any{
 				"status": model.JobStatusPending, "attempt": current.Attempt, "error_message": errorMessage,
@@ -277,6 +279,10 @@ func (x *Consumer) handleProcessFailure(ctx context.Context, job model.Processin
 		}
 		if _, err := x.reconcileVideoStatusLocked(tx, &video, uploadMethod); err != nil {
 			return err
+		}
+		if action == failureActionFailWithoutDeadLetter {
+			// 用户输入问题已经通过视频状态反馈，无需污染供运维排障使用的 DLQ。
+			return nil
 		}
 		return x.outbox.EnqueueDeadLetter(tx, current, uploadMethod)
 	})

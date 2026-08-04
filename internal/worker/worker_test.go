@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -24,6 +25,36 @@ func TestRetryDelayUsesConfiguredAttemptBackoff(t *testing.T) {
 	}
 	if got := consumer.retryDelay(3); got != 30*time.Minute {
 		t.Fatalf("retryDelay(3) = %s, want 30m", got)
+	}
+}
+
+func TestDecideFailureActionClassifiesModelAndUserInputErrors(t *testing.T) {
+	tests := []struct {
+		name           string
+		err            error
+		currentAttempt int
+		maxAttempts    int
+		want           failureAction
+	}{
+		{name: "429 remains retryable", err: &openai.Error{StatusCode: http.StatusTooManyRequests}, currentAttempt: 1, maxAttempts: 4, want: failureActionRetry},
+		{name: "5xx remains retryable", err: &openai.Error{StatusCode: http.StatusServiceUnavailable}, currentAttempt: 1, maxAttempts: 4, want: failureActionRetry},
+		{name: "timeout remains retryable", err: context.DeadlineExceeded, currentAttempt: 1, maxAttempts: 4, want: failureActionRetry},
+		{name: "network error remains retryable", err: &url.Error{Op: "Post", URL: "https://model.example/v1", Err: context.DeadlineExceeded}, currentAttempt: 1, maxAttempts: 4, want: failureActionRetry},
+		{name: "401 fails immediately", err: &openai.Error{StatusCode: http.StatusUnauthorized}, currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithDeadLetter},
+		{name: "403 fails immediately", err: &openai.Error{StatusCode: http.StatusForbidden}, currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithDeadLetter},
+		{name: "invalid parameters fail immediately", err: &openai.Error{StatusCode: http.StatusBadRequest}, currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithDeadLetter},
+		{name: "unprocessable parameters fail immediately", err: &openai.Error{StatusCode: http.StatusUnprocessableEntity}, currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithDeadLetter},
+		{name: "missing model fails immediately", err: &openai.Error{StatusCode: http.StatusNotFound}, currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithDeadLetter},
+		{name: "transient error enters DLQ after final attempt", err: &openai.Error{StatusCode: http.StatusBadGateway}, currentAttempt: 4, maxAttempts: 4, want: failureActionFailWithDeadLetter},
+		{name: "invalid video skips DLQ", err: userInputProcessError(context.Canceled), currentAttempt: 1, maxAttempts: 4, want: failureActionFailWithoutDeadLetter},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := decideFailureAction(test.err, test.currentAttempt, test.maxAttempts); got != test.want {
+				t.Fatalf("decideFailureAction() = %d, want %d", got, test.want)
+			}
+		})
 	}
 }
 
