@@ -169,7 +169,10 @@ func (p *EmbeddingProcessor) embedBatchOnce(ctx context.Context, segments []mode
 			return nil, true, fmt.Errorf("embedding service returned invalid or duplicate index %d", item.Index)
 		}
 		if len(item.Embedding) != ragEmbeddingDimensions {
-			return nil, false, fmt.Errorf("embedding %d has %d dimensions, want %d", item.Index, len(item.Embedding), ragEmbeddingDimensions)
+			// 向量维度由模型配置和数据库 vector(1024) 契约共同决定，重复执行任务无法自行恢复。
+			return nil, false, permanentProcessError(
+				fmt.Errorf("embedding %d has %d dimensions, want %d", item.Index, len(item.Embedding), ragEmbeddingDimensions),
+			)
 		}
 		vectors[item.Index] = item.Embedding
 	}

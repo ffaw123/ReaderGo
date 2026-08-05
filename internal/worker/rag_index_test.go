@@ -355,11 +355,15 @@ func TestEmbedBatchDoesNotRetryDimensionMismatch(t *testing.T) {
 		client:         openai.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL(server.URL), option.WithMaxRetries(0)),
 		embeddingModel: "rag-embedding",
 	}
-	if _, err := processor.embedSegments(context.Background(), []model.VideoSegment{{RetrievalText: "segment-0"}}); err == nil {
+	_, err := processor.embedSegments(context.Background(), []model.VideoSegment{{RetrievalText: "segment-0"}})
+	if err == nil {
 		t.Fatal("embedding dimension mismatch was accepted")
 	}
 	if calls.Load() != 1 {
 		t.Errorf("calls = %d, want 1", calls.Load())
+	}
+	if action := decideFailureAction(err, 1, 4); action != failureActionFailWithDeadLetter {
+		t.Errorf("dimension mismatch failure action = %d, want immediate failure with DLQ", action)
 	}
 }
 

@@ -241,6 +241,13 @@ func (x *Consumer) completeJob(ctx context.Context, job model.ProcessingJob, upl
 	})
 }
 
+// handleProcessFailure 是 Processor 错误进入任务状态机后的统一路由入口。
+// 它在同一事务中锁定视频和任务，并按“暂停优先、可恢复错误重试、不可恢复错误终止”的顺序处理：
+//   - 暂停：running 回到 pending，不消耗 attempt，也不投递 DLQ；
+//   - 重试：attempt 加一并写入延迟 Outbox，等待任务重新执行；
+//   - 终止：任务和视频进入 failed，用户输入问题只反馈 error_message，其余错误投递 DLQ。
+//
+// 状态变更与 Outbox 写入保持原子性，避免任务状态已经变化但对应消息没有可靠生成。
 func (x *Consumer) handleProcessFailure(ctx context.Context, job model.ProcessingJob, uploadMethod string, processErr error) error {
 	errorMessage := processErr.Error()
 	return x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -253,6 +260,7 @@ func (x *Consumer) handleProcessFailure(ctx context.Context, job model.Processin
 			return err
 		}
 		if current.Status != model.JobStatusRunning || current.LeaseOwner != job.LeaseOwner {
+			// 旧 Worker 已失去租约或任务已被其他流程收口时，不允许覆盖新的任务终态。
 			return nil
 		}
 		if video.Status == model.VideoStatusPaused {
@@ -261,8 +269,10 @@ func (x *Consumer) handleProcessFailure(ctx context.Context, job model.Processin
 				"status": model.JobStatusPending, "error_message": "", "lease_owner": "", "lease_expires_at": nil,
 			}).Error
 		}
+		// 错误类型优先于次数判断：用户输入错误和永久错误不消耗任务级重试，普通错误才检查 attempt。
 		action := decideFailureAction(processErr, current.Attempt, x.options.MaxAttempts)
 		if action == failureActionRetry {
+			// pending 状态与下一次任务消息在同一事务中提交，避免出现有状态、无重试消息的悬空任务。
 			current.Attempt++
 			if err := tx.Model(&current).Updates(map[string]any{
 				"status": model.JobStatusPending, "attempt": current.Attempt, "error_message": errorMessage,
@@ -272,6 +282,7 @@ func (x *Consumer) handleProcessFailure(ctx context.Context, job model.Processin
 			}
 			return x.outbox.EnqueueJob(tx, current, uploadMethod, time.Now().UTC().Add(x.retryDelay(current.Attempt-1)))
 		}
+		// 两种终止动作都先落任务失败并聚合视频状态，差别仅在于是否需要进入运维 DLQ。
 		if err := tx.Model(&current).Updates(map[string]any{
 			"status": model.JobStatusFailed, "error_message": errorMessage, "lease_owner": "", "lease_expires_at": nil,
 		}).Error; err != nil {
@@ -284,6 +295,7 @@ func (x *Consumer) handleProcessFailure(ctx context.Context, job model.Processin
 			// 用户输入问题已经通过视频状态反馈，无需污染供运维排障使用的 DLQ。
 			return nil
 		}
+		// 永久错误或耗尽重试的临时错误写入 DLX Outbox，由 Dispatcher 可靠发布到对应 DLQ。
 		return x.outbox.EnqueueDeadLetter(tx, current, uploadMethod)
 	})
 }
