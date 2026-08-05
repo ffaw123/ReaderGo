@@ -224,6 +224,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .summary-actions { display: flex; align-items: center; gap: 4px; }
 .summary-actions button { display: inline-flex; height: 27px; padding: 0 7px; align-items: center; gap: 4px; border: 0; border-radius: 7px; color: #6f7c77; background: transparent; cursor: pointer; font-size: 9px; }
 .summary-actions button:hover { color: #315c4a; background: #edf2ed; }
+.summary-early-note { margin: 9px 0 0; color: #5f816f; font-size: 9px; }
 .summary-preview-trigger { display: -webkit-box; width: 100%; margin: 12px 0 0; padding: 0; overflow: hidden; border: 0; color: #626d68; background: transparent; text-align: left; cursor: pointer; font-size: 10px; line-height: 1.75; -webkit-box-orient: vertical; -webkit-line-clamp: 4; }
 .summary-preview-trigger:hover { color: #385a4c; }
 .summary-placeholder { display: flex; min-height: 92px; align-items: center; justify-content: center; gap: 10px; color: #a0a7a3; }

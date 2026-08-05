@@ -659,19 +659,36 @@ func (s *Server) videoStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "pause_settled": pauseSettled, "jobs": jobs})
 }
 
-// summary 只有处理完成并写入摘要后才返回内容。
+// summary 在独立的 Summary 任务成功后即可返回内容，不要求并行的 Embedding 已经完成。
+// 视频总体 ready 仍由完整任务集合统一协调，摘要接口只开放已经落库并确认成功的阶段结果。
 func (s *Server) summary(c *gin.Context) {
 	v, ok := s.ownedVideo(c)
 	if !ok {
 		return
 	}
-	if v.Status != model.VideoStatusReady {
-		// Embedding 与 Summary 并行期间禁止读取可能由旧任务留下的摘要，保持 ready 数据边界。
+	var summaryJob model.ProcessingJob
+	if e := s.db.Select("status").Where(
+		"tenant_id = ? AND video_id = ? AND task_type = ?",
+		auth.UserID(c), v.ID, model.TaskSummary,
+	).First(&summaryJob).Error; e != nil {
+		if !errors.Is(e, gorm.ErrRecordNotFound) {
+			fail(c, e)
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "summary not ready"})
+		return
+	}
+	if summaryJob.Status != model.JobStatusSucceeded {
+		// 不能仅凭 video_summaries 中存在记录开放读取，避免重跑期间返回旧摘要。
 		c.JSON(http.StatusNotFound, gin.H{"error": "summary not ready"})
 		return
 	}
 	var x model.VideoSummary
 	if e := s.db.Where("video_id = ?", v.ID).First(&x).Error; e != nil {
+		if !errors.Is(e, gorm.ErrRecordNotFound) {
+			fail(c, e)
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "summary not ready"})
 		return
 	}

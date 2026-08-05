@@ -84,8 +84,13 @@ const canPauseSelected = computed(() => {
 })
 const statusMeta = computed(() => {
   const statuses = {
-    ready: { label: '分析完成', detail: '所有内容已可检索', percent: 100, tone: 'success' },
-    processing: { label: '正在处理视频', detail: '正在解析内容、建立索引和生成摘要', percent: 64, tone: 'working' },
+    ready: { label: '视频处理完成', detail: '所有内容已可检索', percent: 100, tone: 'success' },
+    processing: {
+      label: '正在处理视频',
+      detail: summary.value ? '摘要已可查看，正在完成检索索引' : '正在解析内容、建立索引和生成摘要',
+      percent: 64,
+      tone: 'working',
+    },
     uploading: { label: '等待上传完成', detail: '文件分片正在传输', percent: 16, tone: 'working' },
     paused: {
       label: pauseSettled.value ? '处理已暂停' : '正在暂停处理',
@@ -200,13 +205,31 @@ async function loadSelectedContent() {
   loadingMessages.value = false
 }
 
+function summaryJobSucceeded(jobs) {
+  return Array.isArray(jobs) && jobs.some((job) => job.task_type === 'summary' && job.status === 'succeeded')
+}
+
+async function loadCompletedSummary(videoId) {
+  try {
+    const result = await api.getSummary(videoId)
+    // 用户切换视频时丢弃旧请求结果，避免把上一个视频的摘要显示到当前页面。
+    if (selectedVideo.value?.id === videoId) summary.value = result.content || ''
+  } catch {
+    // 任务状态与摘要读取之间只存在很短的提交窗口，下一轮状态轮询会继续尝试。
+  }
+}
+
 async function refreshStatus() {
   if (previewMode.value || !selectedVideo.value || ['ready', 'failed'].includes(selectedVideo.value.status)) return
   try {
-    const status = await api.getVideoStatus(selectedVideo.value.id, true)
+    const videoId = selectedVideo.value.id
+    const status = await api.getVideoStatus(videoId, true)
+    if (selectedVideo.value?.id !== videoId) return
     selectedVideo.value.status = status.status
     selectedVideo.value.error_message = status.error_message || ''
     pauseSettled.value = status.pause_settled !== false
+    // Summary 与 Embedding 并行；摘要任务一完成就立即读取，不等待视频总体进入 ready。
+    if (!summary.value && summaryJobSucceeded(status.jobs)) await loadCompletedSummary(videoId)
     if (status.status === 'ready') await loadSelectedContent()
   } catch {
     // 轮询失败不打断用户；显式操作时再展示错误。
@@ -538,6 +561,8 @@ watch(
   async () => {
     pauseSettled.value = true
     summaryOpen.value = false
+    // 切换视频时立即清空旧摘要，避免新请求完成前短暂展示上一个视频的内容。
+    summary.value = ''
     await loadSelectedContent()
     clearInterval(statusTimer)
     statusTimer = setInterval(refreshStatus, 5000)
@@ -742,6 +767,7 @@ onBeforeUnmount(() => {
                   <button type="button" title="下载 Markdown 摘要" @click="downloadSummary"><Download :size="13" /> 下载</button>
                 </div>
               </header>
+              <p v-if="summary && !isReady" class="summary-early-note">摘要已生成，视频索引仍在处理中</p>
               <button v-if="summary" type="button" class="summary-preview-trigger" @click="summaryOpen = true">
                 {{ summaryExcerpt }}
               </button>
@@ -749,7 +775,7 @@ onBeforeUnmount(() => {
                 <Hourglass :size="18" />
                 <span>
                   <strong>摘要正在准备中</strong>
-                  <small>处理完成后会在这里提炼核心内容</small>
+                  <small>摘要生成后即可查看，无需等待索引完成</small>
                 </span>
               </div>
             </article>

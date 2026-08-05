@@ -66,7 +66,7 @@ ReaderGo/
 
 `vision` 会按 15 秒固定采样和场景变化采样抽帧，感知哈希去重后通过百炼 OpenAI 兼容接口调用 `qwen-vl-ocr`。使用 `OCR_API_KEY`、`OCR_BASE_URL` 和 `OCR_MODEL` 配置独立服务，`OCR_CONCURRENCY` 默认和上限均为 10。提示词要求模型仅提取清晰可见文字，无文字时固定返回 `NO_TEXT`，并禁止猜测或输出 Markdown/LaTeX。Qwen-VL-OCR 不返回置信度，因此落库前会丢弃空文本、无文字占位回复、纯标点/格式标记和不足两个有效字符的低价值结果；`ocr_segments` 不保存处理状态或置信度。
 
-`rag_index` 会在 ASR 与 OCR 均成功后，按 60 秒非重叠窗口生成检索摘要、关键事实、关键词和检索文本，并在短事务中原子替换 `video_segments`。每个窗口独立调用结构化生成接口，默认通过 `RAG_CONCURRENCY=10` 限制并发。`rag_index` 成功后再并行创建 `embedding` 与 `summary`：Embedding 按每批最多 10 个片段请求 1024 维向量并原子替换 `segment_embeddings`；Summary 同时读取窗口的结构化理解与原始 ASR/OCR，按内容发展合并相邻单元，生成“总体概览 + 语义章节 + 章节要点”的 Markdown 文档，不向用户暴露 60 秒技术边界。前端摘要卡支持点击预览和下载 `.md`。
+`rag_index` 会在 ASR 与 OCR 均成功后，按 60 秒非重叠窗口生成检索摘要、关键事实、关键词和检索文本，并在短事务中原子替换 `video_segments`。每个窗口独立调用结构化生成接口，默认通过 `RAG_CONCURRENCY=10` 限制并发。`rag_index` 成功后再并行创建 `embedding` 与 `summary`：Embedding 按每批最多 10 个片段请求 1024 维向量并原子替换 `segment_embeddings`；Summary 同时读取窗口的结构化理解与原始 ASR/OCR，按内容发展合并相邻单元，生成“总体概览 + 语义章节 + 章节要点”的 Markdown 文档，不向用户暴露 60 秒技术边界。Summary 任务一旦成功，前端即可提前预览和下载 `.md`；视频仍需 Embedding 等全部阶段成功后才显示为 `ready`。
 
 RAG 分段、Embedding 和 Summary 共用 `RAG_API_KEY`、`RAG_BASE_URL` 与 `RAG_REQUEST_TIMEOUT`；分段与 Summary 使用 `RAG_CHAT_MODEL`，Embedding 使用 `RAG_EMBEDDING_MODEL`。模型 HTTP 临时错误由 SDK 最多重试 3 次；HTTP 成功但结构或完整性校验失败时按 500ms、1s 在当前任务内额外重试 2 次。Summary 连续三次返回无效结构后直接进入 DLQ，避免再叠加任务级模型调用。
 

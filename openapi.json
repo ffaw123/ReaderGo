@@ -558,7 +558,7 @@
       "get": {
         "tags": ["Videos"],
         "summary": "获取视频 AI 摘要",
-        "description": "返回 LLM 基于 RAG 片段与原始证据生成的 Markdown 章节摘要。仅当视频处理完成且摘要已写入后才返回内容。",
+        "description": "返回 LLM 基于 RAG 片段与原始证据生成的 Markdown 章节摘要。Summary 任务成功且摘要已写入后即可返回，不要求并行的 Embedding 完成；视频总体仍需所有阶段成功后才进入 ready。",
         "operationId": "getVideoSummary",
         "security": [{ "BearerAuth": [] }],
         "parameters": [
@@ -580,7 +580,7 @@
             }
           },
           "404": {
-            "description": "视频不存在或摘要尚未生成",
+            "description": "视频不存在、Summary 任务尚未成功或摘要尚未写入",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
         }
