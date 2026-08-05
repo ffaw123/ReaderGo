@@ -258,6 +258,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .message header { display: flex; align-items: center; gap: 9px; }
 .message header strong { color: #263630; font-size: 11px; }
 .message header small { color: #a0a6a3; font-size: 8px; }
+.message-notice { display: flex; width: fit-content; margin-top: 8px; padding: 6px 8px; align-items: center; gap: 6px; border-radius: 7px; color: #61736b; background: #f0f3ee; font-size: 8px; }
+.message-notice button { padding: 0; border: 0; color: #39705a; background: transparent; cursor: pointer; font: inherit; font-weight: 700; }
 .message p { margin: 8px 0 0; color: #4b5954; font-size: 11px; line-height: 1.85; white-space: pre-wrap; }
 .citations { display: flex; margin-top: 12px; flex-wrap: wrap; gap: 7px; }
 .citations button { display: inline-flex; height: 28px; padding: 0 9px; align-items: center; gap: 5px; border: 1px solid #cfddd4; border-radius: 8px; color: #456e5d; background: #eff5f0; font-size: 8px; cursor: pointer; }

@@ -26,7 +26,8 @@ ReaderGo/
 │   ├── 设计方案_v1.md              ← 视频理解 Agent 的产品与技术设计
 │   ├── RabbitMQ设计方案_v1.md      ← 当前 RabbitMQ、Outbox 与任务租约设计
 │   ├── Kafka到RabbitMQ迁移指南.md  ← 消息层迁移约束与验收清单
-│   └── RAG设计指南.md               ← 双路召回、RRF 融合与证据引用设计
+│   ├── RAG设计指南.md               ← 三路召回、RRF 融合与证据引用设计
+│   └── AI对话功能实现指南.md        ← 渐进式意图识别与回答路径设计
 ├── migrations/
 │   ├── 001_init.sql                ← 核心表、状态枚举与 pgvector 初始化
 │   ├── 002_upload_sessions.sql     ← 本地分片上传会话表
@@ -34,7 +35,7 @@ ReaderGo/
 │   └── 004_ocr_segments.sql        ← OCR 可用抽样画面文字表
 │
 ├── cmd/                            ← 可独立启动的应用入口
-│   ├── api/main.go                 ← HTTP API 服务入口，只写业务数据与 Outbox
+│   ├── api/main.go                 ← HTTP API、同步 AI 对话与视频任务入口
 │   ├── outbox/main.go              ← Outbox Dispatcher 与 Confirm Publisher
 │   └── worker/main.go              ← RabbitMQ 消费、任务执行和租约回收入口
 │
@@ -44,6 +45,7 @@ ReaderGo/
 │   ├── config/config.go             ← 环境变量加载与配置校验
 │   ├── db/db.go                     ← GORM PostgreSQL 连接
 │   ├── model/models.go              ← 数据模型和状态、任务常量
+│   ├── chat/                         ← 快捷回复、意图路由、三路检索与各回答路径
 │   ├── outbox/                      ← 事务 Outbox 写入和可靠分发
 │   ├── queue/                       ← RabbitMQ 契约、拓扑、Confirm 发布与手动 ACK 消费
 │   ├── storage/multipart.go         ← MinIO 分片上传封装
@@ -60,7 +62,7 @@ ReaderGo/
         └── styles.css               ← 全局样式
 ```
 
-请求处理主路径：`cmd/api → internal/api → PostgreSQL(message_outbox) → cmd/outbox → RabbitMQ → cmd/worker → internal/worker`。
+视频异步处理主路径：`cmd/api → internal/api → PostgreSQL(message_outbox) → cmd/outbox → RabbitMQ → cmd/worker → internal/worker`。对话主路径为 `cmd/api → internal/chat → 意图/回答/Embedding 兼容接口 + PostgreSQL`，不经过 RabbitMQ。
 
 `asr` 会按 60 秒非重叠片段并发提取音频并调用转写接口，`ASR_CONCURRENCY` 默认和上限均为 10。每个 WAV 在请求模型前通过 FFmpeg `volumedetect` 检查峰值音量，不高于 `-50 dB` 的近似全静音片段会直接跳过；无音轨视频作为合法的空 ASR 结果成功完成。所有非静音片段成功后才原子替换该视频的原始 ASR 结果。
 
@@ -69,6 +71,8 @@ ReaderGo/
 `rag_index` 会在 ASR 与 OCR 均成功后，按 60 秒非重叠窗口生成检索摘要、关键事实、关键词和检索文本，并在短事务中原子替换 `video_segments`。每个窗口独立调用结构化生成接口，默认通过 `RAG_CONCURRENCY=10` 限制并发。`rag_index` 成功后再并行创建 `embedding` 与 `summary`：Embedding 按每批最多 10 个片段请求 1024 维向量并原子替换 `segment_embeddings`；Summary 同时读取窗口的结构化理解与原始 ASR/OCR，按内容发展合并相邻单元，生成“总体概览 + 语义章节 + 章节要点”的 Markdown 文档，不向用户暴露 60 秒技术边界。Summary 任务一旦成功，前端即可提前预览和下载 `.md`；视频仍需 Embedding 等全部阶段成功后才显示为 `ready`。
 
 RAG 分段、Embedding 和 Summary 共用 `RAG_API_KEY`、`RAG_BASE_URL` 与 `RAG_REQUEST_TIMEOUT`；分段与 Summary 使用 `RAG_CHAT_MODEL`，Embedding 使用 `RAG_EMBEDDING_MODEL`。模型 HTTP 临时错误由 SDK 最多重试 3 次；HTTP 成功但结构或完整性校验失败时按 500ms、1s 在当前任务内额外重试 2 次。Summary 连续三次返回无效结构后直接进入 DLQ，避免再叠加任务级模型调用。
+
+对话回答使用独立的 `CHAT_API_KEY`、`CHAT_BASE_URL`、`CHAT_MODEL`，内部意图识别另用 `INTENT_API_KEY`、`INTENT_BASE_URL`、`INTENT_MODEL`，两者都不复用后台 RAG 生成模型。意图模型配置只存在于服务端，前端不会暴露；未来可以把 Base URL 切换到本地 OpenAI 兼容服务。具体视频问答同时执行语义向量、原文精确匹配和内存 BM25 三路召回：精确与 BM25 均直接读取当前视频的 `asr_segments`/`ocr_segments`，映射到统一时间窗口后通过 RRF 排序，并只允许引用本次候选窗口。
 
 模型接口的 `429`、超时、网络错误和 `5xx` 会继续进入任务级重试，重试耗尽后任务失败并投递 DLQ；`401`、`403`、无效参数（通常为 `400/422`）和模型不存在（通常为 `404`）会立即将任务标记为失败并投递 DLQ，不消耗任务级重试。若 ASR 与 OCR 均未产生有效文字，RAG 会直接把视频标记为失败并提示用户上传包含清晰语音或可识别文字的视频，此类用户输入问题不会创建下游任务或进入 DLQ。
 
@@ -94,7 +98,7 @@ Copy-Item .env.example .env
 .\batch\start.bat
 ```
 
-脚本会启动 Docker 依赖（PostgreSQL、RabbitMQ、MinIO 和 Redis），并分别打开 Outbox Dispatcher、Worker、API、前端四个终端。首次运行时，只有在 `web/node_modules` 不存在的情况下才会执行 `npm install`。启动 Worker 前需要在 `.env` 中填写独立的 ASR、OCR 和 RAG 模型凭据。前端默认访问地址为 <http://localhost:5173>，API 地址为 <http://localhost:8080>，RabbitMQ 管理界面为 <http://localhost:15672>。
+脚本会启动 Docker 依赖（PostgreSQL、RabbitMQ、MinIO 和 Redis），并分别打开 Outbox Dispatcher、Worker、API、前端四个终端。首次运行时，只有在 `web/node_modules` 不存在的情况下才会执行 `npm install`。启动前需要在 `.env` 中填写 ASR、OCR、RAG、Chat 回答和 Intent 意图识别各自的模型配置。前端默认访问地址为 <http://localhost:5173>，API 地址为 <http://localhost:8080>，RabbitMQ 管理界面为 <http://localhost:15672>。
 
 ### 手动启动
 

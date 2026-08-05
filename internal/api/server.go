@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"readergo/internal/auth"
+	chatservice "readergo/internal/chat"
 	"readergo/internal/model"
 	"readergo/internal/outbox"
 	"readergo/internal/queue"
@@ -26,6 +28,7 @@ import (
 type Server struct {
 	db       *gorm.DB
 	auth     *auth.Service
+	chat     *chatservice.Service
 	outbox   *outbox.Writer
 	uploads  *storage.MultipartStore
 	partSize int64
@@ -321,8 +324,8 @@ func firstPartNumbers(partCount int) []int {
 }
 
 // New 使用数据库、鉴权、事务 Outbox 和视频上传组件创建 API 服务。
-func New(db *gorm.DB, authService *auth.Service, outboxWriter *outbox.Writer, uploads *storage.MultipartStore, partSize int64) *Server {
-	return &Server{db: db, auth: authService, outbox: outboxWriter, uploads: uploads, partSize: partSize}
+func New(db *gorm.DB, authService *auth.Service, chatService *chatservice.Service, outboxWriter *outbox.Writer, uploads *storage.MultipartStore, partSize int64) *Server {
+	return &Server{db: db, auth: authService, chat: chatService, outbox: outboxWriter, uploads: uploads, partSize: partSize}
 }
 
 // Router 注册公开鉴权路由和必须携带 JWT 的业务路由。
@@ -723,25 +726,41 @@ func (s *Server) ownedConversation(c *gin.Context) (model.Conversation, bool) {
 	return x, true
 }
 
-// createMessage 当前先保存用户问题；后续 RAG Worker 将追加 assistant 消息与引用。
+// createMessage 同步完成快捷回复、意图识别、单路径回答和消息持久化。
 func (s *Server) createMessage(c *gin.Context) {
 	x, ok := s.ownedConversation(c)
 	if !ok {
 		return
 	}
 	var in struct {
-		Content string `json:"content" binding:"required,max=10000"`
+		ClientMessageID string `json:"client_message_id" binding:"required"`
+		Content         string `json:"content" binding:"required"`
 	}
 	if c.ShouldBindJSON(&in) != nil {
-		bad(c, "content is required")
+		bad(c, "client_message_id and content are required")
 		return
 	}
-	m := model.Message{ConversationID: x.ID, Role: "user", Content: in.Content, Citations: []byte("[]")}
-	if e := s.db.Create(&m).Error; e != nil {
-		fail(c, e)
+	if _, err := uuid.Parse(in.ClientMessageID); err != nil {
+		bad(c, "client_message_id must be a UUID")
 		return
 	}
-	c.JSON(http.StatusAccepted, m)
+	content, err := s.chat.ValidateContent(in.Content)
+	if err != nil {
+		bad(c, err.Error())
+		return
+	}
+	result, err := s.chat.Reply(c.Request.Context(), chatservice.ReplyInput{
+		TenantID: auth.UserID(c), Conversation: x, ClientMessageID: in.ClientMessageID, Content: content,
+	})
+	if err != nil {
+		if errors.Is(err, chatservice.ErrConversationBusy) {
+			c.JSON(http.StatusConflict, gin.H{"error": "conversation is generating another reply"})
+			return
+		}
+		fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
 }
 
 // messages 按创建时间返回已授权会话中的完整消息历史。
@@ -751,7 +770,8 @@ func (s *Server) messages(c *gin.Context) {
 		return
 	}
 	var all []model.Message
-	if e := s.db.Where("conversation_id = ?", x.ID).Order("created_at").Find(&all).Error; e != nil {
+	if e := s.db.Where("conversation_id = ? AND (role <> ? OR generation_status = ?)", x.ID, "user", "completed").
+		Order("created_at ASC, id ASC").Find(&all).Error; e != nil {
 		fail(c, e)
 		return
 	}
@@ -763,5 +783,6 @@ func bad(c *gin.Context, msg string) { c.JSON(http.StatusBadRequest, gin.H{"erro
 
 // fail 不向客户端泄露底层数据库或基础设施错误详情。
 func fail(c *gin.Context, e error) {
+	log.Printf("api request failed: %v", e)
 	c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 }

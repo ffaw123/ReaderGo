@@ -124,10 +124,17 @@ func (p *SummaryProcessor) Process(ctx context.Context, job queue.VideoJobMessag
 		return err
 	}
 	markdown := buildSummaryMarkdown(video.Title, output)
-	summary := model.VideoSummary{VideoID: video.ID, Content: markdown, CreatedAt: time.Now().UTC()}
+	chaptersJSON := model.NewJSONDocument(output.Chapters)
+	summary := model.VideoSummary{
+		VideoID: video.ID, Overview: output.Overview, Chapters: chaptersJSON,
+		Content: markdown, PromptVersion: summaryPromptVersion, CreatedAt: time.Now().UTC(),
+	}
 	if err := p.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "video_id"}},
-		DoUpdates: clause.Assignments(map[string]any{"content": markdown, "created_at": summary.CreatedAt}),
+		Columns: []clause.Column{{Name: "video_id"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"overview": output.Overview, "chapters": chaptersJSON, "content": markdown,
+			"prompt_version": summaryPromptVersion, "created_at": summary.CreatedAt,
+		}),
 	}).Create(&summary).Error; err != nil {
 		return fmt.Errorf("store summary for video %s: %w", video.ID, err)
 	}

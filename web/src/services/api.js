@@ -46,10 +46,10 @@ export const api = {
       body: JSON.stringify({ title }),
     }),
   listMessages: (conversationId) => request(`/api/conversations/${conversationId}/messages`),
-  sendMessage: (conversationId, content) =>
+  sendMessage: (conversationId, content, clientMessageId) =>
     request(`/api/conversations/${conversationId}/messages`, {
       method: 'POST',
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, client_message_id: clientMessageId }),
     }),
   createUpload: (file, title) =>
     request('/api/uploads', {

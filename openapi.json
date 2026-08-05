@@ -157,10 +157,13 @@
       "VideoSummary": {
         "type": "object",
         "properties": {
-          "id":         { "type": "string", "format": "uuid" },
-          "video_id":   { "type": "string", "format": "uuid" },
-          "content":    { "type": "string", "description": "总体概览与语义章节组成的 Markdown 摘要文档，不包含技术时间窗口" },
-          "created_at": { "type": "string", "format": "date-time" }
+          "id":             { "type": "string", "format": "uuid" },
+          "video_id":       { "type": "string", "format": "uuid" },
+          "overview":       { "type": "string", "description": "供渐进式意图识别和概览问答使用的总体概览" },
+          "chapters":       { "type": "array", "items": { "type": "object" }, "description": "结构化章节数据" },
+          "content":        { "type": "string", "description": "总体概览与语义章节组成的 Markdown 摘要文档，不包含技术时间窗口" },
+          "prompt_version": { "type": "string" },
+          "created_at":     { "type": "string", "format": "date-time" }
         }
       },
       "Conversation": {
@@ -186,15 +189,72 @@
           "conversation_id": { "type": "string", "format": "uuid" },
           "role":            { "type": "string", "enum": ["user","assistant","system"] },
           "content":         { "type": "string" },
-          "citations":       { "type": "array", "items": { "type": "object" }, "description": "引用来源 JSON 数组" },
+          "citations":       { "type": "array", "items": { "$ref": "#/components/schemas/Citation" } },
+          "metadata":        { "$ref": "#/components/schemas/MessageMetadata" },
+          "client_message_id": { "type": "string", "format": "uuid", "description": "仅用户消息返回，用于幂等重试" },
           "created_at":      { "type": "string", "format": "date-time" }
+        }
+      },
+      "Citation": {
+        "type": "object",
+        "properties": {
+          "segment_id": { "type": "string", "format": "uuid" },
+          "start_ms":   { "type": "integer", "format": "int64" },
+          "end_ms":     { "type": "integer", "format": "int64" },
+          "label":      { "type": "string", "example": "12:40" }
+        }
+      },
+      "RouteAction": {
+        "type": "object",
+        "properties": {
+          "type":  { "type": "string", "enum": ["OPEN_SUMMARY"] },
+          "label": { "type": "string" }
+        }
+      },
+      "MessageMetadata": {
+        "type": "object",
+        "properties": {
+          "mode": { "type": "string", "enum": ["preset","general","general_unaware","summary","rag","clarify","capability_pending","capability_failed"] },
+          "intent": { "type": "string", "enum": ["GENERAL_CHAT","VIDEO_OVERVIEW","VIDEO_DETAIL","AMBIGUOUS"] },
+          "intent_confidence": { "type": "number", "format": "double" },
+          "ambiguity_reason": { "type": "string" },
+          "notice": { "type": "string" },
+          "action": { "$ref": "#/components/schemas/RouteAction" },
+          "summary_state": { "type": "string", "enum": ["unknown","processing","ready","failed"] },
+          "rag_state": { "type": "string", "enum": ["unknown","processing","ready","failed"] }
         }
       },
       "CreateMessageRequest": {
         "type": "object",
-        "required": ["content"],
+        "required": ["client_message_id", "content"],
         "properties": {
-          "content": { "type": "string", "maxLength": 10000, "description": "用户问题内容，最长 10000 字符" }
+          "client_message_id": { "type": "string", "format": "uuid", "description": "客户端为每次逻辑发送生成的幂等 UUID，重试时保持不变" },
+          "content": { "type": "string", "maxLength": 4000, "description": "用户问题内容，默认最长 4000 字符" }
+        }
+      },
+      "ChatRoute": {
+        "type": "object",
+        "properties": {
+          "mode": { "type": "string" },
+          "intent": { "type": "string" },
+          "notice": { "type": "string" },
+          "action": { "$ref": "#/components/schemas/RouteAction" }
+        }
+      },
+      "ChatCapabilities": {
+        "type": "object",
+        "properties": {
+          "summary": { "type": "string", "enum": ["unknown","processing","ready","failed"] },
+          "rag": { "type": "string", "enum": ["unknown","processing","ready","failed"] }
+        }
+      },
+      "ChatReplyResponse": {
+        "type": "object",
+        "properties": {
+          "user_message": { "$ref": "#/components/schemas/Message" },
+          "assistant_message": { "$ref": "#/components/schemas/Message" },
+          "route": { "$ref": "#/components/schemas/ChatRoute" },
+          "capabilities": { "$ref": "#/components/schemas/ChatCapabilities" }
         }
       },
       "MessageListResponse": {
@@ -660,7 +720,7 @@
       "post": {
         "tags": ["Conversations"],
         "summary": "发送用户消息",
-        "description": "在指定对话中发送一条用户消息。后续 RAG Worker 将生成 assistant 回复与引用。",
+        "description": "同步执行快捷匹配、渐进式意图路由和单路径回答。具体视频问题使用语义、精确、BM25 三路召回与 RRF，并返回经过校验的引用。",
         "operationId": "createMessage",
         "security": [{ "BearerAuth": [] }],
         "parameters": [
@@ -677,25 +737,29 @@
           "content": {
             "application/json": {
               "schema": { "$ref": "#/components/schemas/CreateMessageRequest" },
-              "example": { "content": "这个视频讲的是什么？" }
+              "example": { "client_message_id": "0198a080-0200-7000-8000-000000000001", "content": "这个视频讲的是什么？" }
             }
           }
         },
         "responses": {
-          "202": {
-            "description": "消息已保存",
+          "200": {
+            "description": "用户消息与助手回答已保存；同一 client_message_id 重试返回相同结果",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Message" }
+                "schema": { "$ref": "#/components/schemas/ChatReplyResponse" }
               }
             }
           },
           "400": {
-            "description": "content 为空或超过 10000 字符",
+            "description": "client_message_id 无效，或 content 为空/超过服务端限制",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "404": {
             "description": "对话不存在",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "同一会话已有回答正在生成",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
         }

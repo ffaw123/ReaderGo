@@ -47,6 +47,7 @@ const summaryOpen = ref(false)
 const loadingVideos = ref(false)
 const loadingMessages = ref(false)
 const sending = ref(false)
+const retryMessage = ref(null)
 const uploadOpen = ref(false)
 const accountOpen = ref(false)
 const sidebarOpen = ref(false)
@@ -152,6 +153,24 @@ function rememberVideo(video, conversationId = '') {
 
 function getConversationId(video) {
   return video.conversationId || getCachedEntries().find((item) => item.id === video.id)?.conversationId || ''
+}
+
+function messageSourceLabel(message) {
+  const labels = {
+    preset: '快捷回复',
+    general: '通用知识',
+    general_unaware: '未参考视频',
+    summary: '基于视频摘要',
+    rag: '基于视频片段',
+    clarify: '需要澄清',
+    capability_pending: '内容处理中',
+    capability_failed: '处理能力不可用',
+  }
+  return labels[message?.metadata?.mode] || 'ReaderGo 回答'
+}
+
+function handleMessageAction(action) {
+  if (action?.type === 'OPEN_SUMMARY' && summary.value) summaryOpen.value = true
 }
 
 async function loadVideos() {
@@ -290,8 +309,11 @@ async function sendMessage() {
   if (!content || sending.value || !selectedVideo.value) return
   draft.value = ''
   sending.value = true
+  const clientMessageId = retryMessage.value?.content === content
+    ? retryMessage.value.id
+    : crypto.randomUUID()
   const optimistic = {
-    id: `local-${Date.now()}`,
+    id: `local-${clientMessageId}`,
     role: 'user',
     content,
     created_at: new Date().toISOString(),
@@ -307,19 +329,25 @@ async function sendMessage() {
         id: `demo-${Date.now()}`,
         role: 'assistant',
         content:
-          '这是预览模式下的示例回答。连接 ReaderGo 后端后，这里会结合视频转写、关键画面与时间轴生成答案，并返回可点击的原片引用。',
-        citations: [{ time: '12:24', label: '相关片段' }],
+          '这是预览模式下的示例回答。连接 ReaderGo 后端后，这里会结合视频转写、关键画面与时间轴生成答案，并返回带时间戳的原片引用。',
+        citations: [{ segment_id: 'demo-segment', start_ms: 744000, end_ms: 804000, label: '12:24' }],
         created_at: new Date().toISOString(),
       })
     } else {
       const conversationId = await ensureConversation(selectedVideo.value)
-      const saved = await api.sendMessage(conversationId, content)
-      messages.value = messages.value.map((message) => (message.id === optimistic.id ? saved : message))
-      notify('问题已提交，回答生成接口接入后会显示在这里')
+      // client_message_id 让网络重试返回同一组消息，不会重复调用模型。
+      const response = await api.sendMessage(conversationId, content, clientMessageId)
+      messages.value = messages.value.map((message) =>
+        message.id === optimistic.id ? response.user_message : message,
+      )
+      messages.value.push(response.assistant_message)
+      retryMessage.value = null
     }
   } catch (error) {
     messages.value = messages.value.filter((message) => message.id !== optimistic.id)
     draft.value = content
+    // 请求可能已在服务端完成；保持同一 ID 可安全取回首次结果。
+    retryMessage.value = { id: clientMessageId, content }
     notify(error.message, 'error')
   } finally {
     sending.value = false
@@ -339,9 +367,24 @@ function scrollChat() {
   if (chatScroll.value) chatScroll.value.scrollTop = chatScroll.value.scrollHeight
 }
 
-function clearContext() {
-  messages.value = []
-  notify(previewMode.value ? '当前预览对话已清空' : '已清空当前页面上下文；服务端删除接口待接入')
+async function clearContext() {
+  if (previewMode.value) {
+    messages.value = []
+    notify('当前预览对话已清空')
+    return
+  }
+  if (!selectedVideo.value || sending.value) return
+  try {
+    // 新建会话即可清空后续模型上下文，同时保留旧会话记录而不执行不可恢复删除。
+    const conversation = await api.createConversation(selectedVideo.value.id, selectedVideo.value.title || '视频讨论')
+    selectedVideo.value.conversationId = conversation.id
+    rememberVideo(selectedVideo.value, conversation.id)
+    messages.value = []
+    retryMessage.value = null
+    notify('已开始新的对话上下文')
+  } catch (error) {
+    notify(error.message, 'error')
+  }
 }
 
 // 后端只生成受控标题、段落和列表；这里用 Vue 文本插值安全渲染，不注入模型返回的 HTML。
@@ -817,17 +860,28 @@ onBeforeUnmount(() => {
                 <div>
                   <header>
                     <strong>{{ message.role === 'assistant' ? 'ReaderGo' : '你' }}</strong>
-                    <small>{{ message.role === 'assistant' ? '基于视频内容' : '刚刚' }}</small>
+                    <small>{{ message.role === 'assistant' ? messageSourceLabel(message) : '刚刚' }}</small>
                   </header>
+                  <div v-if="message.role === 'assistant' && message.metadata?.notice" class="message-notice">
+                    <Info :size="12" />
+                    <span>{{ message.metadata.notice }}</span>
+                    <button
+                      v-if="message.metadata.action"
+                      type="button"
+                      @click="handleMessageAction(message.metadata.action)"
+                    >
+                      {{ message.metadata.action.label }}
+                    </button>
+                  </div>
                   <p>{{ message.content }}</p>
                   <div v-if="message.citations?.length" class="citations">
-                    <button v-for="citation in message.citations" :key="citation.time">
-                      <Play :size="11" fill="currentColor" /> {{ citation.time }} · {{ citation.label }}
+                    <button v-for="citation in message.citations" :key="citation.segment_id" :title="`视频片段 ${citation.label}`">
+                      <Play :size="11" fill="currentColor" /> {{ citation.label }} · 相关片段
                     </button>
                   </div>
                 </div>
               </article>
-              <article v-if="sending && previewMode" class="message message--assistant">
+              <article v-if="sending" class="message message--assistant">
                 <span class="message-avatar"><Sparkles :size="16" /></span>
                 <div class="typing"><i></i><i></i><i></i></div>
               </article>
@@ -839,7 +893,7 @@ onBeforeUnmount(() => {
               <textarea
                 v-model="draft"
                 rows="1"
-                maxlength="10000"
+                maxlength="4000"
                 :placeholder="isReady ? '询问关于这段视频的任何问题…' : '先记下一个问题…'"
                 @keydown="handleComposerKeydown"
               ></textarea>

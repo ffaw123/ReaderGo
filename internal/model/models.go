@@ -171,10 +171,13 @@ type UploadSession struct {
 
 // VideoSummary 保存一个视频唯一的最终 LLM 摘要。
 type VideoSummary struct {
-	ID        string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
-	VideoID   string    `gorm:"type:uuid;uniqueIndex" json:"video_id"`
-	Content   string    `json:"content"`
-	CreatedAt time.Time `json:"created_at"`
+	ID            string       `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	VideoID       string       `gorm:"type:uuid;uniqueIndex" json:"video_id"`
+	Overview      string       `gorm:"not null" json:"overview"`
+	Chapters      JSONDocument `gorm:"type:jsonb;not null" json:"chapters"`
+	Content       string       `json:"content"`
+	PromptVersion string       `gorm:"not null" json:"prompt_version"`
+	CreatedAt     time.Time    `json:"created_at"`
 }
 
 // Conversation 将一段多轮问答限定在单个视频范围内。
@@ -189,10 +192,15 @@ type Conversation struct {
 
 // Message 保存用户问题与未来的助手回答，并以 JSON 保存时间戳引用。
 type Message struct {
-	ID             string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	ConversationID string    `gorm:"type:uuid;not null" json:"conversation_id"`
-	Role           string    `json:"role"`
-	Content        string    `json:"content"`
-	Citations      []byte    `gorm:"type:jsonb" json:"citations"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID                  string       `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	ConversationID      string       `gorm:"type:uuid;not null" json:"conversation_id"`
+	Role                string       `json:"role"`
+	Content             string       `json:"content"`
+	Citations           JSONDocument `gorm:"type:jsonb;not null" json:"citations"`
+	Metadata            JSONDocument `gorm:"type:jsonb;not null" json:"metadata"`
+	ClientMessageID     *string      `json:"client_message_id,omitempty"`
+	ReplyToMessageID    *string      `gorm:"type:uuid" json:"-"`
+	GenerationStatus    string       `gorm:"not null" json:"-"`
+	GenerationStartedAt time.Time    `gorm:"not null" json:"-"`
+	CreatedAt           time.Time    `json:"created_at"`
 }

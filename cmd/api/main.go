@@ -5,6 +5,7 @@ import (
 	"log"
 	"readergo/internal/api"
 	"readergo/internal/auth"
+	"readergo/internal/chat"
 	"readergo/internal/config"
 	"readergo/internal/db"
 	"readergo/internal/outbox"
@@ -30,7 +31,18 @@ func main() {
 	if e = uploads.EnsureBucket(context.Background()); e != nil {
 		log.Fatal(e)
 	}
-	// API 只原子写入任务和 Outbox，网络发布由独立 Dispatcher 完成。
+	// 用户回答模型、内部意图模型与 RAG 查询向量服务分别使用独立配置。
+	chatService, e := chat.NewService(d, chat.ServiceConfig{
+		ChatAPIKey: c.ChatAPIKey, ChatBaseURL: c.ChatBaseURL, ChatModel: c.ChatModel, ChatRequestTimeout: c.ChatRequestTimeout,
+		IntentAPIKey: c.IntentAPIKey, IntentBaseURL: c.IntentBaseURL, IntentModel: c.IntentModel, IntentRequestTimeout: c.IntentRequestTimeout,
+		IntentConfidenceThreshold: c.IntentConfidenceThreshold,
+		EmbeddingAPIKey:           c.RAGAPIKey, EmbeddingBaseURL: c.RAGBaseURL, EmbeddingModel: c.RAGEmbeddingModel, EmbeddingRequestTimeout: c.RAGRequestTimeout,
+		RAGMinSimilarity: c.ChatRAGMinSimilarity, MaxInputRunes: c.ChatMaxInputRunes, HistoryTurns: c.ChatHistoryTurns,
+	})
+	if e != nil {
+		log.Fatal(e)
+	}
+	// 视频任务仍只写入 Outbox；同步对话则由 chatService 在当前请求中完成。
 	writer := outbox.NewWriter(c.RabbitMQJobsExchange, c.RabbitMQDLXExchange)
-	log.Fatal(api.New(d, auth.New(c.JWTSecret, c.JWTTTLHours), writer, uploads, int64(c.UploadPartSizeMiB)*1024*1024).Router().Run(c.HTTPAddr))
+	log.Fatal(api.New(d, auth.New(c.JWTSecret, c.JWTTTLHours), chatService, writer, uploads, int64(c.UploadPartSizeMiB)*1024*1024).Router().Run(c.HTTPAddr))
 }

@@ -44,6 +44,15 @@ type Config struct {
 	RAGAPIKey, RAGBaseURL, RAGChatModel, RAGEmbeddingModel string
 	RAGConcurrency                                         int
 	RAGRequestTimeout                                      time.Duration
+	// Chat 回答模型与后台 RAG 处理完全隔离，便于面向用户单独控制成本和供应商。
+	ChatAPIKey, ChatBaseURL, ChatModel string
+	ChatRequestTimeout                 time.Duration
+	// Intent 模型不通过用户界面暴露配置，后续可以无缝替换成本地 OpenAI 兼容服务。
+	IntentAPIKey, IntentBaseURL, IntentModel string
+	IntentRequestTimeout                     time.Duration
+	IntentConfidenceThreshold                float64
+	ChatRAGMinSimilarity                     float64
+	ChatMaxInputRunes, ChatHistoryTurns      int
 	// UploadPartSizeMiB 限制为 16-64 MiB，以平衡重试成本和请求数量。
 	UploadPartSizeMiB, UploadURLTTLMinutes int
 }
@@ -67,12 +76,83 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	intentConfidenceThreshold, err := strictFloatValue("INTENT_CONFIDENCE_THRESHOLD", 0.75)
+	if err != nil {
+		return Config{}, err
+	}
+	chatRAGMinSimilarity, err := strictFloatValue("CHAT_RAG_MIN_SIMILARITY", 0.25)
+	if err != nil {
+		return Config{}, err
+	}
+	chatMaxInputRunes, err := strictIntValue("CHAT_MAX_INPUT_RUNES", 4000)
+	if err != nil {
+		return Config{}, err
+	}
+	chatHistoryTurns, err := strictIntValue("CHAT_HISTORY_TURNS", 3)
+	if err != nil {
+		return Config{}, err
+	}
 	c := Config{
-		HTTPAddr: value("HTTP_ADDR", ":8080"), DatabaseURL: os.Getenv("DATABASE_URL"), JWTSecret: os.Getenv("JWT_SECRET"), JWTTTLHours: intValue("JWT_TTL_HOURS", 24),
-		MinIOEndpoint: os.Getenv("MINIO_ENDPOINT"), MinIOAccessKey: os.Getenv("MINIO_ACCESS_KEY"), MinIOSecretKey: os.Getenv("MINIO_SECRET_KEY"), MinIOBucket: value("MINIO_BUCKET", "videos"), MinIOSecure: boolValue("MINIO_SECURE", false),
-		RabbitMQURL: value("RABBITMQ_URL", "amqp://readergo:readergo-secret@localhost:5672/readergo"), RabbitMQJobsExchange: value("RABBITMQ_JOBS_EXCHANGE", "readergo.video.jobs"), RabbitMQDLXExchange: value("RABBITMQ_DLX_EXCHANGE", "readergo.video.dlx"), RabbitMQPrefetch: rabbitPrefetch, RabbitMQConsumerTimeout: durationMillisecondsValue("RABBITMQ_CONSUMER_TIMEOUT_MS", 6*time.Hour),
-		JobMaxAttempts: jobMaxAttempts, JobRetryDelays: retryDelays, JobLeaseTTL: durationValue("JOB_LEASE_TTL", 2*time.Minute), JobHeartbeatInterval: durationValue("JOB_HEARTBEAT_INTERVAL", 30*time.Second), OutboxPollInterval: durationMillisecondsValue("OUTBOX_POLL_INTERVAL_MS", 500*time.Millisecond), OutboxBatchSize: outboxBatchSize,
-		FFmpegPath: value("FFMPEG_PATH", "ffmpeg"), ASRAPIKey: os.Getenv("ASR_API_KEY"), ASRBaseURL: value("ASR_BASE_URL", "https://api.xiaomimimo.com/v1"), ASRModel: value("ASR_MODEL", "mimo-v2.5-asr"), ASRConcurrency: intValue("ASR_CONCURRENCY", 10), OCRAPIKey: os.Getenv("OCR_API_KEY"), OCRBaseURL: os.Getenv("OCR_BASE_URL"), OCRModel: value("OCR_MODEL", "qwen-vl-ocr"), OCRSceneThreshold: floatValue("OCR_SCENE_THRESHOLD", 0.3), OCRHashDistance: intValue("OCR_HASH_DISTANCE", 5), OCRConcurrency: intValue("OCR_CONCURRENCY", 10), RAGAPIKey: os.Getenv("RAG_API_KEY"), RAGBaseURL: value("RAG_BASE_URL", "https://api.openai.com/v1"), RAGChatModel: value("RAG_CHAT_MODEL", "gpt-4.1-mini"), RAGEmbeddingModel: value("RAG_EMBEDDING_MODEL", "text-embedding-3-small"), RAGConcurrency: intValue("RAG_CONCURRENCY", 10), RAGRequestTimeout: durationValue("RAG_REQUEST_TIMEOUT", 2*time.Minute), UploadPartSizeMiB: intValue("UPLOAD_PART_SIZE_MIB", 32), UploadURLTTLMinutes: intValue("UPLOAD_URL_TTL_MINUTES", 15),
+		HTTPAddr:    value("HTTP_ADDR", ":8080"),
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		JWTSecret:   os.Getenv("JWT_SECRET"),
+		JWTTTLHours: intValue("JWT_TTL_HOURS", 24),
+
+		MinIOEndpoint:  os.Getenv("MINIO_ENDPOINT"),
+		MinIOAccessKey: os.Getenv("MINIO_ACCESS_KEY"),
+		MinIOSecretKey: os.Getenv("MINIO_SECRET_KEY"),
+		MinIOBucket:    value("MINIO_BUCKET", "videos"),
+		MinIOSecure:    boolValue("MINIO_SECURE", false),
+
+		RabbitMQURL:             value("RABBITMQ_URL", "amqp://readergo:readergo-secret@localhost:5672/readergo"),
+		RabbitMQJobsExchange:    value("RABBITMQ_JOBS_EXCHANGE", "readergo.video.jobs"),
+		RabbitMQDLXExchange:     value("RABBITMQ_DLX_EXCHANGE", "readergo.video.dlx"),
+		RabbitMQPrefetch:        rabbitPrefetch,
+		RabbitMQConsumerTimeout: durationMillisecondsValue("RABBITMQ_CONSUMER_TIMEOUT_MS", 6*time.Hour),
+
+		JobMaxAttempts:       jobMaxAttempts,
+		JobRetryDelays:       retryDelays,
+		JobLeaseTTL:          durationValue("JOB_LEASE_TTL", 2*time.Minute),
+		JobHeartbeatInterval: durationValue("JOB_HEARTBEAT_INTERVAL", 30*time.Second),
+		OutboxPollInterval:   durationMillisecondsValue("OUTBOX_POLL_INTERVAL_MS", 500*time.Millisecond),
+		OutboxBatchSize:      outboxBatchSize,
+
+		FFmpegPath:     value("FFMPEG_PATH", "ffmpeg"),
+		ASRAPIKey:      os.Getenv("ASR_API_KEY"),
+		ASRBaseURL:     value("ASR_BASE_URL", "https://api.xiaomimimo.com/v1"),
+		ASRModel:       value("ASR_MODEL", "mimo-v2.5-asr"),
+		ASRConcurrency: intValue("ASR_CONCURRENCY", 10),
+
+		OCRAPIKey:         os.Getenv("OCR_API_KEY"),
+		OCRBaseURL:        os.Getenv("OCR_BASE_URL"),
+		OCRModel:          value("OCR_MODEL", "qwen-vl-ocr"),
+		OCRSceneThreshold: floatValue("OCR_SCENE_THRESHOLD", 0.3),
+		OCRHashDistance:   intValue("OCR_HASH_DISTANCE", 5),
+		OCRConcurrency:    intValue("OCR_CONCURRENCY", 10),
+
+		RAGAPIKey:         os.Getenv("RAG_API_KEY"),
+		RAGBaseURL:        value("RAG_BASE_URL", "https://api.openai.com/v1"),
+		RAGChatModel:      value("RAG_CHAT_MODEL", "gpt-4.1-mini"),
+		RAGEmbeddingModel: value("RAG_EMBEDDING_MODEL", "text-embedding-3-small"),
+		RAGConcurrency:    intValue("RAG_CONCURRENCY", 10),
+		RAGRequestTimeout: durationValue("RAG_REQUEST_TIMEOUT", 2*time.Minute),
+
+		ChatAPIKey:           os.Getenv("CHAT_API_KEY"),
+		ChatBaseURL:          value("CHAT_BASE_URL", "https://api.openai.com/v1"),
+		ChatModel:            value("CHAT_MODEL", "gpt-4.1-mini"),
+		ChatRequestTimeout:   durationValue("CHAT_REQUEST_TIMEOUT", time.Minute),
+		ChatRAGMinSimilarity: chatRAGMinSimilarity,
+		ChatMaxInputRunes:    chatMaxInputRunes,
+		ChatHistoryTurns:     chatHistoryTurns,
+
+		IntentAPIKey:              os.Getenv("INTENT_API_KEY"),
+		IntentBaseURL:             value("INTENT_BASE_URL", "https://api.openai.com/v1"),
+		IntentModel:               value("INTENT_MODEL", "gpt-4.1-mini"),
+		IntentRequestTimeout:      durationValue("INTENT_REQUEST_TIMEOUT", 20*time.Second),
+		IntentConfidenceThreshold: intentConfidenceThreshold,
+
+		UploadPartSizeMiB:   intValue("UPLOAD_PART_SIZE_MIB", 32),
+		UploadURLTTLMinutes: intValue("UPLOAD_URL_TTL_MINUTES", 15),
 	}
 	if c.DatabaseURL == "" || len(c.JWTSecret) < 32 || c.MinIOEndpoint == "" || c.MinIOAccessKey == "" || c.MinIOSecretKey == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL, MinIO credentials, and a JWT_SECRET of at least 32 characters are required")
@@ -120,6 +200,18 @@ func Load() (Config, error) {
 	}
 	if c.RAGRequestTimeout <= 0 {
 		return Config{}, fmt.Errorf("RAG_REQUEST_TIMEOUT must be positive")
+	}
+	if c.ChatRequestTimeout <= 0 || c.IntentRequestTimeout <= 0 {
+		return Config{}, fmt.Errorf("CHAT_REQUEST_TIMEOUT and INTENT_REQUEST_TIMEOUT must be positive")
+	}
+	if c.IntentConfidenceThreshold <= 0 || c.IntentConfidenceThreshold > 1 {
+		return Config{}, fmt.Errorf("INTENT_CONFIDENCE_THRESHOLD must be greater than 0 and at most 1")
+	}
+	if c.ChatRAGMinSimilarity < -1 || c.ChatRAGMinSimilarity > 1 {
+		return Config{}, fmt.Errorf("CHAT_RAG_MIN_SIMILARITY must be between -1 and 1")
+	}
+	if c.ChatMaxInputRunes < 1 || c.ChatMaxInputRunes > 20000 || c.ChatHistoryTurns < 1 || c.ChatHistoryTurns > 10 {
+		return Config{}, fmt.Errorf("CHAT_MAX_INPUT_RUNES and CHAT_HISTORY_TURNS are outside the supported range")
 	}
 	// 预签名 URL 的过期时间远短于上传会话，客户端可在失效后重新申请同一分片的 URL。
 	if c.UploadURLTTLMinutes < 1 || c.UploadURLTTLMinutes > 60 {
@@ -169,6 +261,14 @@ func floatValue(k string, fallback float64) float64 {
 		return fallback
 	}
 	return v
+}
+
+func strictFloatValue(k string, fallback float64) (float64, error) {
+	parsed, err := strconv.ParseFloat(value(k, strconv.FormatFloat(fallback, 'f', -1, 64)), 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number", k)
+	}
+	return parsed, nil
 }
 
 func durationValue(k string, fallback time.Duration) time.Duration {

@@ -71,7 +71,10 @@ CREATE INDEX message_outbox_pending_idx ON message_outbox(status, available_at, 
 CREATE TABLE video_summaries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 
   video_id uuid NOT NULL UNIQUE REFERENCES videos(id) ON DELETE CASCADE, 
+  overview text NOT NULL DEFAULT '',
+  chapters jsonb NOT NULL DEFAULT '[]'::jsonb,
   content text NOT NULL, 
+  prompt_version text NOT NULL DEFAULT '',
   created_at timestamptz NOT NULL DEFAULT now()
 );
 -- video_segments 保存 RAG 固定窗口中的原始证据与 LLM 生成的检索代理。
@@ -124,6 +127,16 @@ CREATE TABLE messages (
   conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, 
   role text NOT NULL CHECK (role IN ('user','assistant','system')), 
   content text NOT NULL, 
-  citations jsonb NOT NULL DEFAULT '[]', 
+  citations jsonb NOT NULL DEFAULT '[]'::jsonb,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  client_message_id text,
+  reply_to_message_id uuid REFERENCES messages(id) ON DELETE CASCADE,
+  generation_status text NOT NULL DEFAULT 'completed' CHECK (generation_status IN ('generating','completed','failed')),
+  generation_started_at timestamptz NOT NULL DEFAULT now(),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX messages_conversation_client_id_idx
+  ON messages(conversation_id, client_message_id) WHERE client_message_id IS NOT NULL;
+CREATE UNIQUE INDEX messages_reply_to_idx
+  ON messages(reply_to_message_id) WHERE reply_to_message_id IS NOT NULL;
+CREATE INDEX messages_conversation_created_idx ON messages(conversation_id, created_at, id);
