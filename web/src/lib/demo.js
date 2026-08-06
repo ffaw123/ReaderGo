@@ -1,11 +1,21 @@
+// 预览模式复用真实任务字段，让进度步骤与后端模式保持一致。
+const succeededDemoJobs = [
+  { task_type: 'rag_index', status: 'succeeded' },
+  { task_type: 'summary', status: 'succeeded' },
+  { task_type: 'embedding', status: 'succeeded' },
+]
+
 export const demoVideos = [
   {
     id: 'demo-product',
     title: '如何打造真正好用的 AI 产品',
     status: 'ready',
     duration_ms: 2_748_000,
+    processing_duration_ms: 214_000,
+    index_segment_count: 46,
     created_at: new Date(Date.now() - 1000 * 60 * 38).toISOString(),
     source_url: 'https://example.com/ai-product',
+    jobs: succeededDemoJobs.map((job) => ({ ...job })),
     summary: `# 如何打造真正好用的 AI 产品
 
 ## 总体概览
@@ -33,8 +43,15 @@ export const demoVideos = [
     title: '从零建立个人研究工作流',
     status: 'processing',
     duration_ms: 1_935_000,
+    processing_duration_ms: 104_000,
+    index_segment_count: 32,
     created_at: new Date(Date.now() - 1000 * 60 * 60 * 20).toISOString(),
     source_url: 'https://example.com/research',
+    jobs: [
+      { task_type: 'rag_index', status: 'succeeded' },
+      { task_type: 'summary', status: 'running' },
+      { task_type: 'embedding', status: 'pending' },
+    ],
     summary: '',
     conversationId: 'demo-research-conversation',
   },
@@ -43,8 +60,11 @@ export const demoVideos = [
     title: '深度阅读：注意力与信息筛选',
     status: 'ready',
     duration_ms: 3_360_000,
+    processing_duration_ms: 247_000,
+    index_segment_count: 56,
     created_at: new Date(Date.now() - 1000 * 60 * 60 * 48).toISOString(),
     source_url: 'https://example.com/deep-reading',
+    jobs: succeededDemoJobs.map((job) => ({ ...job })),
     summary: `# 深度阅读：注意力与信息筛选
 
 ## 总体概览

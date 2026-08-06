@@ -43,6 +43,7 @@ const videos = ref([])
 const selectedId = ref('')
 const messages = ref([])
 const summary = ref('')
+const processingJobs = ref([])
 const summaryOpen = ref(false)
 const loadingVideos = ref(false)
 const loadingMessages = ref(false)
@@ -76,6 +77,44 @@ const filteredVideos = computed(() => {
 const userName = computed(() => session.value?.user?.display_name || session.value?.user?.email?.split('@')[0] || '探索者')
 const userInitial = computed(() => userName.value.slice(0, 1).toUpperCase())
 const isReady = computed(() => selectedVideo.value?.status === 'ready')
+const activeProcessingJobs = computed(() =>
+  previewMode.value ? selectedVideo.value?.jobs || [] : processingJobs.value,
+)
+
+function taskSucceeded(taskType) {
+  return activeProcessingJobs.value.some((job) => job.task_type === taskType && job.status === 'succeeded')
+}
+
+const uploadStageSucceeded = computed(() => {
+  const video = selectedVideo.value
+  if (!video) return false
+
+  const jobs = activeProcessingJobs.value
+  const prepareJobs = jobs.filter((job) => job.task_type === 'prepare')
+  // URL 视频以上游 prepare 任务为准；本地直传没有 prepare，进入后续任务即说明上传成功。
+  if (prepareJobs.length) return prepareJobs.some((job) => job.status === 'succeeded')
+  if (jobs.some((job) => job.task_type !== 'prepare')) return true
+  return ['processing', 'paused', 'ready'].includes(video.status)
+})
+
+const processSteps = computed(() => {
+  const pipelineReady = isReady.value
+  return [
+    { key: 'upload', label: '视频上传', done: uploadStageSucceeded.value || pipelineReady },
+    // 产品展示中的“转写内容”按要求对应 rag_index 任务。
+    { key: 'transcript', label: '转写内容', done: taskSucceeded('rag_index') || pipelineReady },
+    { key: 'summary', label: '生成摘要', done: taskSucceeded('summary') || pipelineReady },
+    { key: 'index', label: '建立索引', done: taskSucceeded('embedding') || pipelineReady },
+  ]
+})
+const processPercent = computed(
+  () => (processSteps.value.filter((step) => step.done).length / processSteps.value.length) * 100,
+)
+const indexSegmentDisplay = computed(() => {
+  const count = Number(selectedVideo.value?.index_segment_count)
+  const segmentsReady = taskSucceeded('rag_index') || isReady.value
+  return segmentsReady && Number.isFinite(count) ? count.toLocaleString() : '—'
+})
 const canPauseSelected = computed(() => {
   const video = selectedVideo.value
   if (!video) return false
@@ -84,25 +123,26 @@ const canPauseSelected = computed(() => {
   return video.status === 'uploading' && /^https?:\/\//i.test(video.source_url || '')
 })
 const statusMeta = computed(() => {
+  const percent = processPercent.value
   const statuses = {
     ready: { label: '视频处理完成', detail: '所有内容已可检索', percent: 100, tone: 'success' },
     processing: {
       label: '正在处理视频',
       detail: summary.value ? '摘要已可查看，正在完成检索索引' : '正在解析内容、建立索引和生成摘要',
-      percent: 64,
+      percent,
       tone: 'working',
     },
-    uploading: { label: '等待上传完成', detail: '文件分片正在传输', percent: 16, tone: 'working' },
+    uploading: { label: '等待上传完成', detail: '文件分片正在传输', percent, tone: 'working' },
     paused: {
       label: pauseSettled.value ? '处理已暂停' : '正在暂停处理',
       detail: pauseSettled.value ? '点击继续后将从未完成的阶段恢复' : '正在安全停止运行中的任务',
-      percent: 64,
+      percent,
       tone: 'paused',
     },
     failed: {
       label: '处理失败',
       detail: selectedVideo.value?.error_message || '请检查视频源后重试',
-      percent: 100,
+      percent,
       tone: 'danger',
     },
   }
@@ -238,18 +278,25 @@ async function loadCompletedSummary(videoId) {
   }
 }
 
-async function refreshStatus() {
-  if (previewMode.value || !selectedVideo.value || ['ready', 'failed'].includes(selectedVideo.value.status)) return
+async function refreshStatus(force = false) {
+  if (previewMode.value || !selectedVideo.value) return
+  if (!force && ['ready', 'failed'].includes(selectedVideo.value.status)) return
   try {
     const videoId = selectedVideo.value.id
+    const wasReady = selectedVideo.value.status === 'ready'
     const status = await api.getVideoStatus(videoId, true)
     if (selectedVideo.value?.id !== videoId) return
     selectedVideo.value.status = status.status
     selectedVideo.value.error_message = status.error_message || ''
+    // 指标区只消费状态接口返回的真实流水线耗时与落库片段数量。
+    selectedVideo.value.processing_duration_ms = status.processing_duration_ms ?? null
+    selectedVideo.value.index_segment_count = status.index_segment_count ?? null
+    // 保存各后台任务的真实状态，进度步骤不再依赖固定百分比推断。
+    processingJobs.value = Array.isArray(status.jobs) ? status.jobs : []
     pauseSettled.value = status.pause_settled !== false
     // Summary 与 Embedding 并行；摘要任务一完成就立即读取，不等待视频总体进入 ready。
     if (!summary.value && summaryJobSucceeded(status.jobs)) await loadCompletedSummary(videoId)
-    if (status.status === 'ready') await loadSelectedContent()
+    if (status.status === 'ready' && !wasReady) await loadSelectedContent()
   } catch {
     // 轮询失败不打断用户；显式操作时再展示错误。
   }
@@ -582,9 +629,14 @@ function logout() {
 }
 
 function formatDuration(duration) {
-  if (!duration) return '等待识别'
-  const totalMinutes = Math.round(duration / 60000)
-  return `${Math.floor(totalMinutes / 60)}:${String(totalMinutes % 60).padStart(2, '0')}`
+  const milliseconds = Number(duration)
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return '—'
+
+  // 处理时长保留到秒并累计总分钟，避免显示无必要的小时位。
+  const totalSeconds = Math.floor(milliseconds / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
 function formatRelative(date) {
@@ -604,12 +656,14 @@ watch(
   async () => {
     pauseSettled.value = true
     summaryOpen.value = false
+    processingJobs.value = []
     // 切换视频时立即清空旧摘要，避免新请求完成前短暂展示上一个视频的内容。
     summary.value = ''
     await loadSelectedContent()
     clearInterval(statusTimer)
     statusTimer = setInterval(refreshStatus, 5000)
-    await refreshStatus()
+    // 即使视频已经结束，也强制读取一次任务详情，以便逐项展示成功标记。
+    await refreshStatus(true)
     await nextTick()
     scrollChat()
   },
@@ -654,11 +708,11 @@ onBeforeUnmount(() => {
           <span>我的视频</span>
           <small>{{ videos.length }}</small>
         </div>
-        <label class="sidebar-search">
+        <div class="sidebar-search">
           <Search :size="15" />
-          <input v-model="search" placeholder="搜索视频" />
-          <kbd>⌘ K</kbd>
-        </label>
+          <input v-model="search" aria-label="搜索视频" placeholder="搜索视频" />
+          <button type="button" :disabled="!search" @click="search = ''">清除</button>
+        </div>
 
         <div v-if="loadingVideos" class="sidebar-loading">
           <LoaderCircle :size="18" class="spin" /> 正在载入知识库
@@ -779,10 +833,9 @@ onBeforeUnmount(() => {
               </div>
               <div class="progress-track"><span :style="{ width: `${statusMeta.percent}%` }"></span></div>
               <div class="process-steps">
-                <span class="is-done"><Check :size="12" /> 获取视频</span>
-                <span :class="{ 'is-done': statusMeta.percent >= 45 }"><Check v-if="statusMeta.percent >= 45" :size="12" /> 转写内容</span>
-                <span :class="{ 'is-done': statusMeta.percent >= 75 }"><Check v-if="statusMeta.percent >= 75" :size="12" /> 理解画面</span>
-                <span :class="{ 'is-done': isReady }"><Check v-if="isReady" :size="12" /> 建立索引</span>
+                <span v-for="step in processSteps" :key="step.key" :class="{ 'is-done': step.done }">
+                  <Check v-if="step.done" :size="12" /> {{ step.label }}
+                </span>
               </div>
             </div>
           </div>
@@ -790,16 +843,12 @@ onBeforeUnmount(() => {
           <div class="insight-secondary">
             <div class="metric-row">
               <div class="metric">
-                <span><Clock3 :size="16" /> 时长</span>
-                <strong>{{ formatDuration(selectedVideo.duration_ms) }}</strong>
+                <span><Clock3 :size="16" /> 处理时长</span>
+                <strong>{{ formatDuration(selectedVideo.processing_duration_ms) }}</strong>
               </div>
               <div class="metric">
-                <span><BookOpenText :size="16" /> 内容片段</span>
-                <strong>{{ isReady ? '128' : '—' }}</strong>
-              </div>
-              <div class="metric">
-                <span><Zap :size="16" /> 可引用节点</span>
-                <strong>{{ isReady ? '36' : '—' }}</strong>
+                <span><BookOpenText :size="16" /> 索引片段</span>
+                <strong>{{ indexSegmentDisplay }}</strong>
               </div>
             </div>
             <article class="summary-card">
@@ -860,7 +909,7 @@ onBeforeUnmount(() => {
                 <div>
                   <header>
                     <strong>{{ message.role === 'assistant' ? 'ReaderGo' : '你' }}</strong>
-                    <small>{{ message.role === 'assistant' ? messageSourceLabel(message) : '刚刚' }}</small>
+                    <small v-if="message.role === 'assistant'">{{ messageSourceLabel(message) }}</small>
                   </header>
                   <div v-if="message.role === 'assistant' && message.metadata?.notice" class="message-notice">
                     <Info :size="12" />

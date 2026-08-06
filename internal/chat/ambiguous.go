@@ -19,17 +19,19 @@ func ambiguousReply(decision IntentDecision) generatedReply {
 	}
 }
 
+// 当能力未构建完成时调用
 func capabilityReply(decision IntentDecision, capabilities Capabilities, intentLatency time.Duration) generatedReply {
 	mode := ModeCapabilityPending
 	content := "相关视频内容仍在处理中，请稍后再试。"
-	if decision.RequiredCapability == CapabilitySummary {
+	switch decision.RequiredCapability {
+	case CapabilitySummary:
 		if capabilities.SummaryState == CapabilityStateFailed {
 			mode = ModeCapabilityFailed
 			content = "视频摘要生成失败，暂时无法回答概览问题。你可以查看视频处理状态后重试。"
 		} else {
 			content = "视频摘要仍在生成中，暂时无法回答概览问题，请稍后再试。"
 		}
-	} else if decision.RequiredCapability == CapabilityRAG {
+	case CapabilityRAG:
 		if capabilities.RAGState == CapabilityStateFailed {
 			mode = ModeCapabilityFailed
 			content = "视频详细检索构建失败，暂时无法回答具体内容问题。你可以查看视频处理状态后重试。"

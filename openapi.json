@@ -138,6 +138,8 @@
           "status":         { "type": "string", "enum": ["uploading","processing","paused","ready","failed"] },
           "error_message":  { "type": "string" },
           "pause_settled":  { "type": "boolean", "description": "paused 时表示所有 running 任务是否已经安全停止" },
+          "processing_duration_ms": { "type": "integer", "format": "int64", "description": "后台流水线的实际墙钟耗时；运行中持续增长，终态或暂停时冻结" },
+          "index_segment_count": { "type": "integer", "format": "int64", "description": "rag_index 已实际写入 video_segments 的片段数量" },
           "jobs": {
             "type": "array",
             "description": "仅在 details=true 时返回；各阶段的任务详情。",

@@ -659,7 +659,44 @@ func (s *Server) videoStatus(c *gin.Context) {
 		fail(c, result.Error)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage, "pause_settled": pauseSettled, "jobs": jobs})
+	var indexSegmentCount int64
+	// 索引片段必须按租户与视频双重限定，避免跨租户统计并保证返回真实落库数量。
+	if err := s.db.Model(&model.VideoSegment{}).
+		Where("tenant_id = ? AND video_id = ?", auth.UserID(c), v.ID).
+		Count(&indexSegmentCount).Error; err != nil {
+		fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"video_id": v.ID, "status": v.Status, "error_message": v.ErrorMessage,
+		"pause_settled": pauseSettled, "jobs": jobs,
+		"processing_duration_ms": processingDurationMS(v.Status, jobs, time.Now().UTC()),
+		"index_segment_count":    indexSegmentCount,
+	})
+}
+
+// processingDurationMS 返回整条后台流水线的墙钟耗时；运行中持续增长，终态或暂停时冻结。
+func processingDurationMS(videoStatus string, jobs []model.ProcessingJob, now time.Time) int64 {
+	if len(jobs) == 0 {
+		return 0
+	}
+	startedAt := jobs[0].CreatedAt
+	finishedAt := jobs[0].UpdatedAt
+	for _, job := range jobs[1:] {
+		if job.CreatedAt.Before(startedAt) {
+			startedAt = job.CreatedAt
+		}
+		if job.UpdatedAt.After(finishedAt) {
+			finishedAt = job.UpdatedAt
+		}
+	}
+	if videoStatus == model.VideoStatusUploading || videoStatus == model.VideoStatusProcessing {
+		finishedAt = now
+	}
+	if finishedAt.Before(startedAt) {
+		return 0
+	}
+	return finishedAt.Sub(startedAt).Milliseconds()
 }
 
 // summary 在独立的 Summary 任务成功后即可返回内容，不要求并行的 Embedding 已经完成。
