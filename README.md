@@ -139,3 +139,7 @@ npm run dev
 > 使用 `stop-v.bat` 前请确认不需要保留本地数据，删除的数据卷无法恢复。
 
 > 部署前请将 `.env` 中的 `JWT_SECRET` 修改为高熵私密值；修改后，已有 Token 将全部失效。
+
+## License
+
+本项目基于 MIT License 开源。
