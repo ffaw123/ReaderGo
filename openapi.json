@@ -721,8 +721,8 @@
       },
       "post": {
         "tags": ["Conversations"],
-        "summary": "发送用户消息",
-        "description": "同步执行快捷匹配、渐进式意图路由和单路径回答。具体视频问题使用语义、精确、BM25 三路召回与 RRF，并返回经过校验的引用。",
+        "summary": "发送用户消息并流式接收回答",
+        "description": "以 SSE 流执行快捷匹配、意图路由和单路径回答。delta 事件携带回答增量，done 事件携带已持久化的完整 ChatReplyResponse，error 事件表示流开始后的生成错误。意图识别仍使用非流式模型调用；具体视频问题使用语义、精确、BM25 三路召回与 RRF，并返回经过校验的引用。",
         "operationId": "createMessage",
         "security": [{ "BearerAuth": [] }],
         "parameters": [
@@ -745,10 +745,11 @@
         },
         "responses": {
           "200": {
-            "description": "用户消息与助手回答已保存；同一 client_message_id 重试返回相同结果",
+            "description": "SSE 回答流；同一 client_message_id 重试会流式返回相同的已保存结果",
             "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ChatReplyResponse" }
+              "text/event-stream": {
+                "schema": { "type": "string" },
+                "example": "event: delta\ndata: {\"content\":\"你好\"}\n\nevent: done\ndata: {\"user_message\":{},\"assistant_message\":{},\"route\":{},\"capabilities\":{}}\n\n"
               }
             }
           },

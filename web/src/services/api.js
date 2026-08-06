@@ -31,6 +31,80 @@ async function request(path, options = {}) {
   return payload
 }
 
+async function streamRequest(path, options, onDelta) {
+  const session = getSession()
+  const headers = new Headers(options.headers || {})
+  headers.set('Content-Type', 'application/json')
+  headers.set('Accept', 'text/event-stream')
+  if (session?.access_token) headers.set('Authorization', `Bearer ${session.access_token}`)
+
+  const response = await fetch(`${API_BASE}${path}`, { ...options, headers })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null)
+    if (response.status === 401 && !path.startsWith('/api/auth/')) {
+      localStorage.removeItem('readergo_session')
+      window.location.assign('/login')
+    }
+    throw new Error(payload?.error || `请求失败（${response.status}）`)
+  }
+  if (!response.body) throw new Error('浏览器无法读取回答流')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let result = null
+
+  const consumeEvent = (block) => {
+    let event = 'message'
+    const data = []
+    block.split(/\r?\n/).forEach((line) => {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
+    })
+    if (!data.length) return
+    const payload = JSON.parse(data.join('\n'))
+    if (event === 'delta') onDelta?.(payload.content || '')
+    if (event === 'done') result = payload
+    if (event === 'error') throw new Error(payload.error || '回答生成失败，请重试')
+  }
+
+  const consumeBuffer = (finished = false) => {
+    // SSE 事件以空行分隔；兼容服务端或代理使用 LF/CRLF 两种换行。
+    while (true) {
+      const lfIndex = buffer.indexOf('\n\n')
+      const crlfIndex = buffer.indexOf('\r\n\r\n')
+      const indexes = [lfIndex, crlfIndex].filter((index) => index >= 0)
+      if (!indexes.length) break
+      const index = Math.min(...indexes)
+      const separatorLength = index === crlfIndex ? 4 : 2
+      consumeEvent(buffer.slice(0, index))
+      buffer = buffer.slice(index + separatorLength)
+    }
+    if (finished && buffer.trim()) {
+      consumeEvent(buffer)
+      buffer = ''
+    }
+  }
+
+  let finished = false
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      consumeBuffer()
+    }
+    buffer += decoder.decode()
+    consumeBuffer(true)
+    finished = true
+  } finally {
+    if (!finished) await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+  if (!result) throw new Error('回答流意外中断，请重试')
+  return result
+}
+
 export const api = {
   login: (body) => request('/api/auth/login', { method: 'POST', body: JSON.stringify(body) }),
   register: (body) => request('/api/auth/register', { method: 'POST', body: JSON.stringify(body) }),
@@ -46,11 +120,15 @@ export const api = {
       body: JSON.stringify({ title }),
     }),
   listMessages: (conversationId) => request(`/api/conversations/${conversationId}/messages`),
-  sendMessage: (conversationId, content, clientMessageId) =>
-    request(`/api/conversations/${conversationId}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({ content, client_message_id: clientMessageId }),
-    }),
+  sendMessage: (conversationId, content, clientMessageId, onDelta) =>
+    streamRequest(
+      `/api/conversations/${conversationId}/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ content, client_message_id: clientMessageId }),
+      },
+      onDelta,
+    ),
   createUpload: (file, title) =>
     request('/api/uploads', {
       method: 'POST',

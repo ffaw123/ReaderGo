@@ -70,6 +70,7 @@ let statusTimer
 let toastTimer
 
 const selectedVideo = computed(() => videos.value.find((video) => video.id === selectedId.value) || null)
+const hasStreamingAssistant = computed(() => messages.value.some((message) => message.streaming))
 const filteredVideos = computed(() => {
   const keyword = search.value.toLowerCase()
   return videos.value.filter((video) => video.title.toLowerCase().includes(keyword))
@@ -365,6 +366,7 @@ async function sendMessage() {
     content,
     created_at: new Date().toISOString(),
   }
+  const streamingAssistantId = `stream-${clientMessageId}`
   messages.value.push(optimistic)
   await nextTick()
   scrollChat()
@@ -383,15 +385,37 @@ async function sendMessage() {
     } else {
       const conversationId = await ensureConversation(selectedVideo.value)
       // client_message_id 让网络重试返回同一组消息，不会重复调用模型。
-      const response = await api.sendMessage(conversationId, content, clientMessageId)
+      const response = await api.sendMessage(conversationId, content, clientMessageId, (delta) => {
+        if (!delta) return
+        let assistant = messages.value.find((message) => message.id === streamingAssistantId)
+        if (!assistant) {
+          // 第一段到达时用临时消息替换等待动画，后续原位追加以形成打字效果。
+          assistant = {
+            id: streamingAssistantId,
+            role: 'assistant',
+            content: '',
+            citations: [],
+            metadata: {},
+            streaming: true,
+            created_at: new Date().toISOString(),
+          }
+          messages.value.push(assistant)
+        }
+        assistant.content += delta
+        nextTick().then(scrollChat)
+      })
       messages.value = messages.value.map((message) =>
         message.id === optimistic.id ? response.user_message : message,
       )
-      messages.value.push(response.assistant_message)
+      const streamedIndex = messages.value.findIndex((message) => message.id === streamingAssistantId)
+      if (streamedIndex >= 0) messages.value[streamedIndex] = response.assistant_message
+      else messages.value.push(response.assistant_message)
       retryMessage.value = null
     }
   } catch (error) {
-    messages.value = messages.value.filter((message) => message.id !== optimistic.id)
+    messages.value = messages.value.filter(
+      (message) => message.id !== optimistic.id && message.id !== streamingAssistantId,
+    )
     draft.value = content
     // 请求可能已在服务端完成；保持同一 ID 可安全取回首次结果。
     retryMessage.value = { id: clientMessageId, content }
@@ -930,7 +954,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </article>
-              <article v-if="sending" class="message message--assistant">
+              <article v-if="sending && !hasStreamingAssistant" class="message message--assistant">
                 <span class="message-avatar"><Sparkles :size="16" /></span>
                 <div class="typing"><i></i><i></i><i></i></div>
               </article>

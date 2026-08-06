@@ -2,6 +2,47 @@ package chat
 
 import "testing"
 
+func TestPartialJSONAnswerDecodesOnlyAnswerContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		answer   string
+		complete bool
+	}{
+		{name: "partial text", content: `{"answer":"第一段`, answer: "第一段"},
+		{name: "escaped newline", content: `{"answer":"第一行\n第二行`, answer: "第一行\n第二行"},
+		{name: "partial escape", content: `{"answer":"内容\u4e`, answer: "内容"},
+		{name: "surrogate pair", content: `{"answer":"表情\ud83d\ude00","used_segment_ids":[]}`, answer: "表情😀", complete: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			answer, found, complete, err := partialJSONAnswer(test.content)
+			if err != nil {
+				t.Fatalf("partialJSONAnswer: %v", err)
+			}
+			if !found || answer != test.answer || complete != test.complete {
+				t.Fatalf("got answer=%q found=%v complete=%v", answer, found, complete)
+			}
+		})
+	}
+}
+
+func TestRAGAnswerStreamerDoesNotExposeJSONEnvelope(t *testing.T) {
+	var streamed string
+	streamer := ragAnswerStreamer{onDelta: func(delta string) error {
+		streamed += delta
+		return nil
+	}}
+	for _, delta := range []string{`{"ans`, `wer":"你好`, `\n世界","used_segment_ids":[]}`} {
+		if err := streamer.Accept(delta); err != nil {
+			t.Fatalf("accept: %v", err)
+		}
+	}
+	if streamed != "你好\n世界" {
+		t.Fatalf("streamed = %q", streamed)
+	}
+}
+
 func TestDecodeRAGAnswerValidatesCandidateIDs(t *testing.T) {
 	windows := []ragWindow{{
 		SegmentID: "allowed", StartMS: 120000, EndMS: 180000,

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -763,7 +764,7 @@ func (s *Server) ownedConversation(c *gin.Context) (model.Conversation, bool) {
 	return x, true
 }
 
-// createMessage 同步完成快捷回复、意图识别、单路径回答和消息持久化。
+// createMessage 使用 SSE 推送回答增量，并在 done 事件中返回已持久化的完整消息。
 func (s *Server) createMessage(c *gin.Context) {
 	x, ok := s.ownedConversation(c)
 	if !ok {
@@ -786,10 +787,42 @@ func (s *Server) createMessage(c *gin.Context) {
 		bad(c, err.Error())
 		return
 	}
-	result, err := s.chat.Reply(c.Request.Context(), chatservice.ReplyInput{
+	streamStarted := false
+	startStream := func() {
+		if streamStarted {
+			return
+		}
+		streamStarted = true
+		c.Header("Content-Type", "text/event-stream; charset=utf-8")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("X-Accel-Buffering", "no")
+		c.Status(http.StatusOK)
+	}
+	writeEvent := func(event string, payload any) error {
+		startStream()
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		// 每个事件写完立即 Flush，让浏览器无需等待整个模型回答完成。
+		if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, encoded); err != nil {
+			return err
+		}
+		c.Writer.Flush()
+		return nil
+	}
+
+	result, err := s.chat.ReplyStream(c.Request.Context(), chatservice.ReplyInput{
 		TenantID: auth.UserID(c), Conversation: x, ClientMessageID: in.ClientMessageID, Content: content,
+	}, func(delta string) error {
+		return writeEvent("delta", gin.H{"content": delta})
 	})
 	if err != nil {
+		if streamStarted {
+			log.Printf("stream chat reply failed: %v", err)
+			_ = writeEvent("error", gin.H{"error": "回答生成失败，请重试"})
+			return
+		}
 		if errors.Is(err, chatservice.ErrConversationBusy) {
 			c.JSON(http.StatusConflict, gin.H{"error": "conversation is generating another reply"})
 			return
@@ -797,7 +830,9 @@ func (s *Server) createMessage(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, result)
+	if err := writeEvent("done", result); err != nil {
+		log.Printf("write completed chat stream failed: %v", err)
+	}
 }
 
 // messages 按创建时间返回已授权会话中的完整消息历史。

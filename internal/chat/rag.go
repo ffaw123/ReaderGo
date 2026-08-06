@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 )
 
@@ -51,7 +53,7 @@ type ragAnswerOutput struct {
 	UsedSegmentIDs []string `json:"used_segment_ids"`
 }
 
-func (s *Service) answerRAG(ctx context.Context, tenantID, videoID string, history []HistoryTurn, currentInput string, decision IntentDecision) (generatedReply, error) {
+func (s *Service) answerRAG(ctx context.Context, tenantID, videoID string, history []HistoryTurn, currentInput string, decision IntentDecision, onDelta func(string) error) (generatedReply, error) {
 	retrievalStarted := time.Now()
 	retrieved, err := s.retriever.Retrieve(ctx, tenantID, videoID, decision.RewrittenQuery)
 	if err != nil {
@@ -59,12 +61,13 @@ func (s *Service) answerRAG(ctx context.Context, tenantID, videoID string, histo
 	}
 	retrievalLatency := time.Since(retrievalStarted)
 	if len(retrieved.Candidates) == 0 {
-		return generatedReply{
+		reply := generatedReply{
 			Content:  "当前视频内容中未找到足够依据。",
 			Route:    RouteInfo{Mode: ModeRAG, Intent: decision.Intent, Notice: "此回答基于视频片段检索结果。"},
 			Decision: decision, AnswerPromptVersion: ragAnswerPromptVersion,
 			Latency: map[string]time.Duration{"retrieval": retrievalLatency},
-		}, nil
+		}
+		return reply, emitReplyContent(reply, onDelta)
 	}
 
 	windows := buildRAGWindows(retrieved)
@@ -76,7 +79,7 @@ func (s *Service) answerRAG(ctx context.Context, tenantID, videoID string, histo
 		return generatedReply{}, fmt.Errorf("encode RAG answer input: %w", err)
 	}
 	generationStarted := time.Now()
-	output, err := s.generateRAGAnswer(ctx, string(payload), windows)
+	output, err := s.generateRAGAnswer(ctx, string(payload), windows, onDelta)
 	if err != nil {
 		return generatedReply{}, err
 	}
@@ -131,20 +134,170 @@ func truncateRunes(value string, maximum int) string {
 	return string(runes[:maximum])
 }
 
-func (s *Service) generateRAGAnswer(ctx context.Context, payload string, windows []ragWindow) (ragAnswerOutput, error) {
+func (s *Service) generateRAGAnswer(ctx context.Context, payload string, windows []ragWindow, onDelta func(string) error) (ragAnswerOutput, error) {
 	var validationErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		content, err := s.answerClient.complete(ctx, ragAnswerSystemPrompt, payload, true)
+		streamer := ragAnswerStreamer{onDelta: onDelta}
+		content, err := s.answerClient.complete(ctx, ragAnswerSystemPrompt, payload, true, streamer.Accept)
 		if err != nil {
 			return ragAnswerOutput{}, fmt.Errorf("generate RAG answer: %w", err)
 		}
 		output, err := decodeRAGAnswer(content, windows)
 		if err == nil {
+			if err := streamer.Finish(output.Answer); err != nil {
+				return ragAnswerOutput{}, fmt.Errorf("stream RAG answer: %w", err)
+			}
 			return output, nil
 		}
 		validationErr = err
+		// 首次输出一旦已经发送给用户便不能撤回，因此仅在尚未发送内容时重试。
+		if onDelta != nil && streamer.emitted != "" {
+			break
+		}
 	}
 	return ragAnswerOutput{}, fmt.Errorf("RAG answer output remains invalid: %w", validationErr)
+}
+
+type ragAnswerStreamer struct {
+	raw     strings.Builder
+	emitted string
+	onDelta func(string) error
+}
+
+func (s *ragAnswerStreamer) Accept(delta string) error {
+	s.raw.WriteString(delta)
+	answer, found, _, err := partialJSONAnswer(s.raw.String())
+	if err != nil || !found {
+		return err
+	}
+	return s.emitNewSuffix(answer)
+}
+
+func (s *ragAnswerStreamer) Finish(answer string) error {
+	return s.emitNewSuffix(answer)
+}
+
+func (s *ragAnswerStreamer) emitNewSuffix(answer string) error {
+	if !strings.HasPrefix(answer, s.emitted) {
+		return errors.New("RAG answer changed after it was streamed")
+	}
+	delta := strings.TrimPrefix(answer, s.emitted)
+	if delta == "" {
+		return nil
+	}
+	if s.onDelta != nil {
+		if err := s.onDelta(delta); err != nil {
+			return err
+		}
+	}
+	s.emitted = answer
+	return nil
+}
+
+// partialJSONAnswer 从尚未接收完整的 JSON 中安全解码 answer 字符串，避免向用户展示协议字段。
+func partialJSONAnswer(content string) (string, bool, bool, error) {
+	keyIndex := strings.Index(content, `"answer"`)
+	if keyIndex < 0 {
+		return "", false, false, nil
+	}
+	index := keyIndex + len(`"answer"`)
+	for index < len(content) && (content[index] == ' ' || content[index] == '\t' || content[index] == '\r' || content[index] == '\n') {
+		index++
+	}
+	if index == len(content) {
+		return "", false, false, nil
+	}
+	if content[index] != ':' {
+		return "", false, false, errors.New("RAG answer field is malformed")
+	}
+	index++
+	for index < len(content) && (content[index] == ' ' || content[index] == '\t' || content[index] == '\r' || content[index] == '\n') {
+		index++
+	}
+	if index == len(content) {
+		return "", false, false, nil
+	}
+	if content[index] != '"' {
+		return "", false, false, errors.New("RAG answer is not a JSON string")
+	}
+	index++
+
+	var decoded strings.Builder
+	for index < len(content) {
+		value := content[index]
+		if value == '"' {
+			return decoded.String(), true, true, nil
+		}
+		if value != '\\' {
+			if value < 0x20 {
+				return "", true, false, errors.New("RAG answer contains an unescaped control character")
+			}
+			r, size := utf8.DecodeRuneInString(content[index:])
+			if r == utf8.RuneError && size == 1 {
+				if !utf8.FullRuneInString(content[index:]) {
+					return decoded.String(), true, false, nil
+				}
+				return "", true, false, errors.New("RAG answer contains invalid UTF-8")
+			}
+			decoded.WriteRune(r)
+			index += size
+			continue
+		}
+
+		if index+1 >= len(content) {
+			return decoded.String(), true, false, nil
+		}
+		escaped := content[index+1]
+		switch escaped {
+		case '"', '\\', '/':
+			decoded.WriteByte(escaped)
+			index += 2
+		case 'b', 'f', 'n', 'r', 't':
+			decoded.WriteByte(map[byte]byte{'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}[escaped])
+			index += 2
+		case 'u':
+			first, next, complete, err := decodeJSONUnicodeEscape(content, index)
+			if err != nil {
+				return "", true, false, err
+			}
+			if !complete {
+				return decoded.String(), true, false, nil
+			}
+			decoded.WriteRune(first)
+			index = next
+		default:
+			return "", true, false, errors.New("RAG answer contains an invalid escape")
+		}
+	}
+	return decoded.String(), true, false, nil
+}
+
+func decodeJSONUnicodeEscape(content string, index int) (rune, int, bool, error) {
+	if index+6 > len(content) {
+		return 0, index, false, nil
+	}
+	value, err := strconv.ParseUint(content[index+2:index+6], 16, 16)
+	if err != nil {
+		return 0, index, false, errors.New("RAG answer contains an invalid unicode escape")
+	}
+	first := rune(value)
+	if first < 0xD800 || first > 0xDFFF {
+		return first, index + 6, true, nil
+	}
+	if first >= 0xDC00 {
+		return 0, index, false, errors.New("RAG answer contains an unexpected low surrogate")
+	}
+	if index+12 > len(content) {
+		return 0, index, false, nil
+	}
+	if content[index+6:index+8] != `\u` {
+		return 0, index, false, errors.New("RAG answer contains an unpaired high surrogate")
+	}
+	secondValue, err := strconv.ParseUint(content[index+8:index+12], 16, 16)
+	if err != nil || secondValue < 0xDC00 || secondValue > 0xDFFF {
+		return 0, index, false, errors.New("RAG answer contains an invalid surrogate pair")
+	}
+	return utf16.DecodeRune(first, rune(secondValue)), index + 12, true, nil
 }
 
 func decodeRAGAnswer(content string, windows []ragWindow) (ragAnswerOutput, error) {
@@ -157,8 +310,7 @@ func decodeRAGAnswer(content string, windows []ragWindow) (ragAnswerOutput, erro
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return output, errors.New("RAG answer contains trailing data")
 	}
-	output.Answer = strings.TrimSpace(output.Answer)
-	if output.Answer == "" || utf8.RuneCountInString(output.Answer) > ragMaxAnswerRunes {
+	if strings.TrimSpace(output.Answer) == "" || utf8.RuneCountInString(output.Answer) > ragMaxAnswerRunes {
 		return output, errors.New("RAG answer is empty or oversized")
 	}
 	allowed := make(map[string]struct{}, len(windows))

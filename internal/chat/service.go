@@ -27,7 +27,7 @@ type Service struct {
 	repository    *repository
 	shortcuts     shortcutMatcher
 	intent        *intentClassifier
-	answerClient  *textClient
+	answerClient  *streamingTextClient
 	retriever     *retriever
 	maxInputRunes int
 	historyTurns  int
@@ -37,7 +37,7 @@ func NewService(db *gorm.DB, config ServiceConfig) (*Service, error) {
 	if db == nil {
 		return nil, errors.New("chat service requires database")
 	}
-	answerClient, err := newTextClient("CHAT", config.ChatBaseURL, config.ChatAPIKey, config.ChatModel, config.ChatRequestTimeout)
+	answerClient, err := newStreamingTextClient("CHAT", config.ChatBaseURL, config.ChatAPIKey, config.ChatModel, config.ChatRequestTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +82,15 @@ func (s *Service) ValidateContent(content string) (string, error) {
 }
 
 func (s *Service) Reply(ctx context.Context, in ReplyInput) (result ReplyResult, returnErr error) {
+	return s.reply(ctx, in, nil)
+}
+
+// ReplyStream 在生成回答时逐段调用 onDelta，并在模型输出校验通过后保存完整消息。
+func (s *Service) ReplyStream(ctx context.Context, in ReplyInput, onDelta func(string) error) (result ReplyResult, returnErr error) {
+	return s.reply(ctx, in, onDelta)
+}
+
+func (s *Service) reply(ctx context.Context, in ReplyInput, onDelta func(string) error) (result ReplyResult, returnErr error) {
 	content, err := s.ValidateContent(in.Content)
 	if err != nil {
 		return result, err
@@ -92,7 +101,16 @@ func (s *Service) Reply(ctx context.Context, in ReplyInput) (result ReplyResult,
 		return result, err
 	}
 	if begin.AssistantMessage != nil {
-		return replyResultFromExisting(begin.UserMessage, *begin.AssistantMessage)
+		result, err := replyResultFromExisting(begin.UserMessage, *begin.AssistantMessage)
+		if err != nil {
+			return result, err
+		}
+		if onDelta != nil && result.AssistantMessage.Content != "" {
+			if err := onDelta(result.AssistantMessage.Content); err != nil {
+				return ReplyResult{}, err
+			}
+		}
+		return result, nil
 	}
 	// 生成失败时保留用户问题并标记为可重试，客户端用同一 client_message_id 重试。
 	defer func() {
@@ -101,7 +119,7 @@ func (s *Service) Reply(ctx context.Context, in ReplyInput) (result ReplyResult,
 		}
 	}()
 
-	reply, err := s.generateReply(ctx, in)
+	reply, err := s.generateReply(ctx, in, onDelta)
 	if err != nil {
 		return result, err
 	}
@@ -117,14 +135,15 @@ func (s *Service) Reply(ctx context.Context, in ReplyInput) (result ReplyResult,
 	}, nil
 }
 
-func (s *Service) generateReply(ctx context.Context, in ReplyInput) (generatedReply, error) {
+func (s *Service) generateReply(ctx context.Context, in ReplyInput, onDelta func(string) error) (generatedReply, error) {
 	if preset, ok := s.shortcuts.Match(in.Content); ok {
 		decision := IntentDecision{Intent: IntentGeneralChat, Confidence: 1, AmbiguityReason: AmbiguityNone, RequiredCapability: CapabilityNone}
-		return generatedReply{
+		reply := generatedReply{
 			Content: preset.Content, Route: RouteInfo{Mode: ModePreset, Intent: IntentGeneralChat}, Decision: decision,
 			Capabilities:        CapabilityView{Summary: CapabilityStateUnknown, RAG: CapabilityStateUnknown},
 			AnswerPromptVersion: "preset-" + preset.Rule + "-v1",
-		}, nil
+		}
+		return reply, emitReplyContent(reply, onDelta)
 	}
 
 	history, err := s.repository.LoadHistory(ctx, in.Conversation.ID, s.historyTurns)
@@ -138,7 +157,7 @@ func (s *Service) generateReply(ctx context.Context, in ReplyInput) (generatedRe
 
 	if !capabilities.SummaryReady() && !capabilities.RAGReady() {
 		started := time.Now()
-		answer, err := s.answerGeneral(ctx, history, in.Content, true)
+		answer, err := s.answerGeneral(ctx, history, in.Content, true, onDelta)
 		if err != nil {
 			return generatedReply{}, err
 		}
@@ -172,13 +191,13 @@ func (s *Service) generateReply(ctx context.Context, in ReplyInput) (generatedRe
 		reply.Capabilities = capabilities.View()
 		reply.IntentPromptVersion = intentPromptVersion
 		reply.Latency = map[string]time.Duration{"intent": intentLatency}
-		return reply, nil
+		return reply, emitReplyContent(reply, onDelta)
 	}
 
 	switch decision.Intent {
 	case IntentGeneralChat:
 		started := time.Now()
-		answer, err := s.answerGeneral(ctx, history, in.Content, false)
+		answer, err := s.answerGeneral(ctx, history, in.Content, false, onDelta)
 		if err != nil {
 			return generatedReply{}, err
 		}
@@ -191,10 +210,11 @@ func (s *Service) generateReply(ctx context.Context, in ReplyInput) (generatedRe
 		}, nil
 	case IntentVideoOverview:
 		if !capabilities.SummaryReady() {
-			return capabilityReply(decision, capabilities, intentLatency), nil
+			reply := capabilityReply(decision, capabilities, intentLatency)
+			return reply, emitReplyContent(reply, onDelta)
 		}
 		started := time.Now()
-		answer, err := s.answerSummary(ctx, history, in.Content, capabilities.VideoTitle, capabilities.Summary)
+		answer, err := s.answerSummary(ctx, history, in.Content, capabilities.VideoTitle, capabilities.Summary, onDelta)
 		if err != nil {
 			return generatedReply{}, err
 		}
@@ -207,9 +227,10 @@ func (s *Service) generateReply(ctx context.Context, in ReplyInput) (generatedRe
 		}, nil
 	case IntentVideoDetail:
 		if !capabilities.RAGReady() {
-			return capabilityReply(decision, capabilities, intentLatency), nil
+			reply := capabilityReply(decision, capabilities, intentLatency)
+			return reply, emitReplyContent(reply, onDelta)
 		}
-		reply, err := s.answerRAG(ctx, in.TenantID, in.Conversation.VideoID, history, in.Content, decision)
+		reply, err := s.answerRAG(ctx, in.TenantID, in.Conversation.VideoID, history, in.Content, decision, onDelta)
 		if err != nil {
 			return generatedReply{}, err
 		}
@@ -218,6 +239,14 @@ func (s *Service) generateReply(ctx context.Context, in ReplyInput) (generatedRe
 		reply.Latency["intent"] = intentLatency
 		return reply, nil
 	default:
-		return ambiguousReply(IntentDecision{Intent: IntentAmbiguous, AmbiguityReason: AmbiguityClassifierError}), nil
+		reply := ambiguousReply(IntentDecision{Intent: IntentAmbiguous, AmbiguityReason: AmbiguityClassifierError})
+		return reply, emitReplyContent(reply, onDelta)
 	}
+}
+
+func emitReplyContent(reply generatedReply, onDelta func(string) error) error {
+	if onDelta == nil || reply.Content == "" {
+		return nil
+	}
+	return onDelta(reply.Content)
 }
