@@ -50,7 +50,6 @@ type segmentCandidate struct {
 
 type retrievalResult struct {
 	Candidates []segmentCandidate
-	Sources    []sourceDocument
 }
 
 func newRetriever(db *gorm.DB, baseURL, apiKey, modelName string, timeout time.Duration, minSimilarity float64) (*retriever, error) {
@@ -76,10 +75,7 @@ func (r *retriever) Retrieve(ctx context.Context, tenantID, videoID, query strin
 	if err != nil {
 		return retrievalResult{}, err
 	}
-	sources, err := r.loadSources(ctx, tenantID, videoID)
-	if err != nil {
-		return retrievalResult{}, err
-	}
+	documents := buildSegmentTextDocuments(segments)
 	vector, err := r.embedQuery(ctx, query)
 	if err != nil {
 		return retrievalResult{}, err
@@ -88,12 +84,12 @@ func (r *retriever) Retrieve(ctx context.Context, tenantID, videoID, query strin
 	if err != nil {
 		return retrievalResult{}, err
 	}
-	// 源记录先完整评分，再映射并截取窗口级 Top K，避免同一窗口的多条 OCR 命中挤占名额。
-	exact := rankExact(query, sources, 0)
-	bm25 := rankBM25(query, sources, 0)
+	// 在线检索直接使用 video_segments 中的 ASR/OCR 快照，避免重复读取和映射原始结果表。
+	exact := rankExact(query, documents, 0)
+	bm25 := rankBM25(query, documents, 0)
 	candidates := fuseRetrievalChannels(segments, dense, exact, bm25)
 	candidates = expandNeighborWindows(segments, candidates)
-	return retrievalResult{Candidates: candidates, Sources: sources}, nil
+	return retrievalResult{Candidates: candidates}, nil
 }
 
 func (r *retriever) loadSegments(ctx context.Context, tenantID, videoID string) ([]model.VideoSegment, error) {
@@ -105,34 +101,17 @@ func (r *retriever) loadSegments(ctx context.Context, tenantID, videoID string) 
 	return segments, nil
 }
 
-func (r *retriever) loadSources(ctx context.Context, tenantID, videoID string) ([]sourceDocument, error) {
-	var asr []model.ASRSegment
-	if err := r.db.WithContext(ctx).Where("tenant_id = ? AND video_id = ?", tenantID, videoID).
-		Order("start_ms ASC, end_ms ASC, id ASC").Find(&asr).Error; err != nil {
-		return nil, fmt.Errorf("load ASR source documents: %w", err)
-	}
-	var ocr []model.OCRSegment
-	if err := r.db.WithContext(ctx).Where("tenant_id = ? AND video_id = ?", tenantID, videoID).
-		Order("start_ms ASC, end_ms ASC, id ASC").Find(&ocr).Error; err != nil {
-		return nil, fmt.Errorf("load OCR source documents: %w", err)
-	}
-	documents := make([]sourceDocument, 0, len(asr)+len(ocr))
-	for _, item := range asr {
-		documents = append(documents, sourceDocument{SourceType: "asr", SourceID: item.ID, StartMS: item.StartMS, EndMS: item.EndMS, Text: item.Transcript})
-	}
-	for _, item := range ocr {
-		documents = append(documents, sourceDocument{SourceType: "ocr", SourceID: item.ID, StartMS: item.StartMS, EndMS: item.EndMS, Text: item.Text})
-	}
-	sort.SliceStable(documents, func(i, j int) bool {
-		if documents[i].StartMS == documents[j].StartMS {
-			if documents[i].EndMS == documents[j].EndMS {
-				return documents[i].SourceID < documents[j].SourceID
-			}
-			return documents[i].EndMS < documents[j].EndMS
+func buildSegmentTextDocuments(segments []model.VideoSegment) []segmentTextDocument {
+	documents := make([]segmentTextDocument, 0, len(segments)*2)
+	for _, segment := range segments {
+		if text := strings.TrimSpace(segment.Transcript); text != "" {
+			documents = append(documents, segmentTextDocument{SegmentID: segment.ID, SourceType: "asr", Text: text})
 		}
-		return documents[i].StartMS < documents[j].StartMS
-	})
-	return documents, nil
+		if text := strings.TrimSpace(segment.OCRText); text != "" {
+			documents = append(documents, segmentTextDocument{SegmentID: segment.ID, SourceType: "ocr", Text: text})
+		}
+	}
+	return documents
 }
 
 func (r *retriever) embedQuery(ctx context.Context, query string) ([]float64, error) {
@@ -195,7 +174,7 @@ func formatVector(vector []float64) (string, error) {
 	return builder.String(), nil
 }
 
-func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, exact, bm25 []rankedSource) []segmentCandidate {
+func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, exact, bm25 []rankedSegmentText) []segmentCandidate {
 	candidates := make(map[string]*segmentCandidate, len(segments))
 	segmentByID := make(map[string]model.VideoSegment, len(segments))
 	for _, segment := range segments {
@@ -214,7 +193,7 @@ func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, e
 			ensure(segment).DenseRank = index + 1
 		}
 	}
-	exactWindowRanks := sourceWindowRanks(segments, exact, retrievalChannelTopK)
+	exactWindowRanks := segmentWindowRanks(segments, exact, retrievalChannelTopK)
 	for segmentID, rank := range exactWindowRanks {
 		segment := segmentByID[segmentID]
 		candidate := ensure(segment)
@@ -222,7 +201,7 @@ func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, e
 			candidate.ExactRank = rank
 		}
 	}
-	bm25WindowRanks := sourceWindowRanks(segments, bm25, retrievalChannelTopK)
+	bm25WindowRanks := segmentWindowRanks(segments, bm25, retrievalChannelTopK)
 	for segmentID, rank := range bm25WindowRanks {
 		segment := segmentByID[segmentID]
 		candidate := ensure(segment)
@@ -256,14 +235,12 @@ func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, e
 	return result
 }
 
-func sourceWindowRanks(segments []model.VideoSegment, hits []rankedSource, limit int) map[string]int {
+func segmentWindowRanks(segments []model.VideoSegment, hits []rankedSegmentText, limit int) map[string]int {
 	bestScores := make(map[string]float64)
 	for _, hit := range hits {
-		for _, segment := range segments {
-			// 左闭右开时间范围只要存在交集，就把原文命中映射到统一 RAG 窗口。
-			if hit.Document.StartMS < segment.EndMS && hit.Document.EndMS > segment.StartMS && hit.Score > bestScores[segment.ID] {
-				bestScores[segment.ID] = hit.Score
-			}
+		// 同一窗口的 ASR 和 OCR 独立评分，窗口排名只采用其中更高的得分。
+		if hit.Score > bestScores[hit.Document.SegmentID] {
+			bestScores[hit.Document.SegmentID] = hit.Score
 		}
 	}
 	type scoredWindow struct {
@@ -292,7 +269,7 @@ func sourceWindowRanks(segments []model.VideoSegment, hits []rankedSource, limit
 		if index == 0 || window.Score != ranked[index-1].Score {
 			currentRank = index + 1
 		}
-		// 同一条跨窗口原文会产生相同得分，两侧窗口应共享排名而不是受时间顺序惩罚。
+		// 得分相同的窗口共享排名，时间顺序只用于保证结果稳定。
 		ranks[window.ID] = currentRank
 	}
 	return ranks

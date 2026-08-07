@@ -102,22 +102,25 @@ func buildRAGWindows(result retrievalResult) []ragWindow {
 			SegmentSummary: candidate.Segment.SegmentSummary, KeyFacts: candidate.Segment.KeyFacts,
 		}
 		windowRemaining := min(ragMaxWindowEvidence, remaining)
-		for _, source := range result.Sources {
-			if windowRemaining <= 0 || source.StartMS >= candidate.Segment.EndMS || source.EndMS <= candidate.Segment.StartMS {
-				continue
+		appendEvidence := func(sourceType, value string) {
+			if windowRemaining <= 0 {
+				return
 			}
-			text := truncateRunes(strings.TrimSpace(source.Text), windowRemaining)
+			text := truncateRunes(strings.TrimSpace(value), windowRemaining)
 			if text == "" {
-				continue
+				return
 			}
 			used := utf8.RuneCountInString(text)
 			remaining -= used
 			windowRemaining -= used
+			// source_id 表示窗口内的证据类型，不再冒充原始 ASR/OCR 记录 ID。
 			window.Evidence = append(window.Evidence, ragEvidence{
-				SourceType: source.SourceType, SourceID: source.SourceID,
-				StartMS: source.StartMS, EndMS: source.EndMS, Text: text,
+				SourceType: sourceType, SourceID: candidate.Segment.ID + ":" + sourceType,
+				StartMS: candidate.Segment.StartMS, EndMS: candidate.Segment.EndMS, Text: text,
 			})
 		}
+		appendEvidence("asr", candidate.Segment.Transcript)
+		appendEvidence("ocr", candidate.Segment.OCRText)
 		windows = append(windows, window)
 	}
 	return windows

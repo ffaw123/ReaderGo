@@ -12,16 +12,14 @@ const (
 	bm25B  = 0.75
 )
 
-type sourceDocument struct {
-	SourceType string `json:"source_type"`
-	SourceID   string `json:"source_id"`
-	StartMS    int64  `json:"start_ms"`
-	EndMS      int64  `json:"end_ms"`
-	Text       string `json:"text"`
+type segmentTextDocument struct {
+	SegmentID  string
+	SourceType string
+	Text       string
 }
 
-type rankedSource struct {
-	Document sourceDocument
+type rankedSegmentText struct {
+	Document segmentTextDocument
 	Score    float64
 }
 
@@ -30,7 +28,7 @@ var lexicalStopTokens = map[string]struct{}{
 	"为什么": {}, "是否": {}, "有没有": {}, "提到": {}, "一下": {}, "请问": {}, "关于": {},
 }
 
-func rankBM25(query string, documents []sourceDocument, limit int) []rankedSource {
+func rankBM25(query string, documents []segmentTextDocument, limit int) []rankedSegmentText {
 	queryTokens := lexicalTokens(query)
 	if len(queryTokens) == 0 || len(documents) == 0 {
 		return nil
@@ -60,7 +58,7 @@ func rankBM25(query string, documents []sourceDocument, limit int) []rankedSourc
 		queryFrequency[token]++
 	}
 
-	ranked := make([]rankedSource, 0, len(documents))
+	ranked := make([]rankedSegmentText, 0, len(documents))
 	for index, tokens := range documentTokens {
 		termFrequency := make(map[string]int)
 		for _, token := range tokens {
@@ -78,19 +76,19 @@ func rankBM25(query string, documents []sourceDocument, limit int) []rankedSourc
 			score += float64(queryCount) * idf * (float64(frequency) * (bm25K1 + 1)) / (float64(frequency) + bm25K1*lengthNorm)
 		}
 		if score > 0 {
-			ranked = append(ranked, rankedSource{Document: documents[index], Score: score})
+			ranked = append(ranked, rankedSegmentText{Document: documents[index], Score: score})
 		}
 	}
-	return sortRankedSources(ranked, limit)
+	return sortRankedSegmentTexts(ranked, limit)
 }
 
-func rankExact(query string, documents []sourceDocument, limit int) []rankedSource {
+func rankExact(query string, documents []segmentTextDocument, limit int) []rankedSegmentText {
 	terms := exactTerms(query)
 	if len(terms) == 0 {
 		return nil
 	}
 	normalizedQuery := strings.ToLower(strings.TrimSpace(query))
-	ranked := make([]rankedSource, 0, len(documents))
+	ranked := make([]rankedSegmentText, 0, len(documents))
 	for _, document := range documents {
 		text := strings.ToLower(document.Text)
 		var score float64
@@ -110,19 +108,19 @@ func rankExact(query string, documents []sourceDocument, limit int) []rankedSour
 			score += weight * (1 + math.Log(float64(occurrences)))
 		}
 		if score > 0 {
-			ranked = append(ranked, rankedSource{Document: document, Score: score})
+			ranked = append(ranked, rankedSegmentText{Document: document, Score: score})
 		}
 	}
-	return sortRankedSources(ranked, limit)
+	return sortRankedSegmentTexts(ranked, limit)
 }
 
-func sortRankedSources(ranked []rankedSource, limit int) []rankedSource {
+func sortRankedSegmentTexts(ranked []rankedSegmentText, limit int) []rankedSegmentText {
 	sort.SliceStable(ranked, func(i, j int) bool {
 		if ranked[i].Score == ranked[j].Score {
-			if ranked[i].Document.StartMS == ranked[j].Document.StartMS {
-				return ranked[i].Document.SourceID < ranked[j].Document.SourceID
+			if ranked[i].Document.SegmentID == ranked[j].Document.SegmentID {
+				return ranked[i].Document.SourceType < ranked[j].Document.SourceType
 			}
-			return ranked[i].Document.StartMS < ranked[j].Document.StartMS
+			return ranked[i].Document.SegmentID < ranked[j].Document.SegmentID
 		}
 		return ranked[i].Score > ranked[j].Score
 	})

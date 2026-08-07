@@ -14,17 +14,17 @@ func TestLexicalTokensPreserveIdentifiersAndSplitChinese(t *testing.T) {
 	}
 }
 
-func TestBM25AndExactRankOriginalSources(t *testing.T) {
-	documents := []sourceDocument{
-		{SourceType: "asr", SourceID: "asr-1", StartMS: 0, EndMS: 60000, Text: "这一节介绍二叉树的前序遍历，模型版本是 GPT-4.1。"},
-		{SourceType: "ocr", SourceID: "ocr-1", StartMS: 60000, EndMS: 61000, Text: "数据库连接配置与部署说明"},
+func TestBM25AndExactRankSegmentTexts(t *testing.T) {
+	documents := []segmentTextDocument{
+		{SegmentID: "segment-1", SourceType: "asr", Text: "这一节介绍二叉树的前序遍历，模型版本是 GPT-4.1。"},
+		{SegmentID: "segment-2", SourceType: "ocr", Text: "数据库连接配置与部署说明"},
 	}
 	bm25 := rankBM25("二叉树前序遍历", documents, 8)
-	if len(bm25) == 0 || bm25[0].Document.SourceID != "asr-1" {
-		t.Fatalf("BM25 top result = %#v, want asr-1", bm25)
+	if len(bm25) == 0 || bm25[0].Document.SegmentID != "segment-1" {
+		t.Fatalf("BM25 top result = %#v, want segment-1", bm25)
 	}
 	exact := rankExact("视频中的 GPT-4.1 是什么", documents, 8)
-	if len(exact) == 0 || exact[0].Document.SourceID != "asr-1" {
-		t.Fatalf("exact top result = %#v, want asr-1", exact)
+	if len(exact) == 0 || exact[0].Document.SegmentID != "segment-1" {
+		t.Fatalf("exact top result = %#v, want segment-1", exact)
 	}
 }

@@ -6,14 +6,33 @@ import (
 	"readergo/internal/model"
 )
 
+func TestBuildSegmentTextDocumentsUsesVideoSegmentCopies(t *testing.T) {
+	documents := buildSegmentTextDocuments([]model.VideoSegment{
+		{ID: "both", Transcript: " ASR 原文 ", OCRText: " OCR 原文 "},
+		{ID: "empty"},
+	})
+	if len(documents) != 2 {
+		t.Fatalf("got %d documents, want ASR and OCR documents", len(documents))
+	}
+	if documents[0].SegmentID != "both" || documents[0].SourceType != "asr" || documents[0].Text != "ASR 原文" {
+		t.Fatalf("ASR document = %#v", documents[0])
+	}
+	if documents[1].SegmentID != "both" || documents[1].SourceType != "ocr" || documents[1].Text != "OCR 原文" {
+		t.Fatalf("OCR document = %#v", documents[1])
+	}
+}
+
 func TestFuseRetrievalChannelsUsesThreeIndependentRanks(t *testing.T) {
 	segments := []model.VideoSegment{
 		{ID: "a", StartMS: 0, EndMS: 60000},
 		{ID: "b", StartMS: 60000, EndMS: 120000},
 	}
 	dense := []semanticHit{{SegmentID: "b", Similarity: .9}}
-	exact := []rankedSource{{Document: sourceDocument{SourceID: "cross", StartMS: 59000, EndMS: 61000}, Score: 5}}
-	bm25 := []rankedSource{{Document: sourceDocument{SourceID: "early", StartMS: 1000, EndMS: 2000}, Score: 3}}
+	exact := []rankedSegmentText{
+		{Document: segmentTextDocument{SegmentID: "a", SourceType: "asr"}, Score: 5},
+		{Document: segmentTextDocument{SegmentID: "b", SourceType: "ocr"}, Score: 5},
+	}
+	bm25 := []rankedSegmentText{{Document: segmentTextDocument{SegmentID: "a", SourceType: "asr"}, Score: 3}}
 
 	result := fuseRetrievalChannels(segments, dense, exact, bm25)
 	if len(result) != 2 {
@@ -27,30 +46,30 @@ func TestFuseRetrievalChannelsUsesThreeIndependentRanks(t *testing.T) {
 	}
 }
 
-func TestSourceAtBoundaryMapsOnlyToRightWindow(t *testing.T) {
+func TestSegmentTextMapsDirectlyToOwningWindow(t *testing.T) {
 	segments := []model.VideoSegment{
 		{ID: "left", StartMS: 0, EndMS: 60000},
 		{ID: "right", StartMS: 60000, EndMS: 120000},
 	}
-	exact := []rankedSource{{Document: sourceDocument{SourceID: "source", StartMS: 60000, EndMS: 61000}, Score: 1}}
+	exact := []rankedSegmentText{{Document: segmentTextDocument{SegmentID: "right", SourceType: "asr"}, Score: 1}}
 	result := fuseRetrievalChannels(segments, nil, exact, nil)
 	if len(result) != 1 || result[0].Segment.ID != "right" {
-		t.Fatalf("boundary mapping = %#v, want only right window", result)
+		t.Fatalf("segment mapping = %#v, want only right window", result)
 	}
 }
 
-func TestSourceRankingTakesTopWindowsAfterAggregation(t *testing.T) {
+func TestSegmentRankingUsesHigherASROrOCRScore(t *testing.T) {
 	segments := []model.VideoSegment{
 		{ID: "crowded", StartMS: 0, EndMS: 60000},
 		{ID: "later", StartMS: 60000, EndMS: 120000},
 	}
-	hits := make([]rankedSource, 0, 10)
-	for index := 0; index < 9; index++ {
-		hits = append(hits, rankedSource{Document: sourceDocument{SourceID: string(rune('a' + index)), StartMS: int64(index), EndMS: int64(index + 1)}, Score: float64(100 - index)})
+	hits := []rankedSegmentText{
+		{Document: segmentTextDocument{SegmentID: "crowded", SourceType: "asr"}, Score: 90},
+		{Document: segmentTextDocument{SegmentID: "crowded", SourceType: "ocr"}, Score: 100},
+		{Document: segmentTextDocument{SegmentID: "later", SourceType: "asr"}, Score: 10},
 	}
-	hits = append(hits, rankedSource{Document: sourceDocument{SourceID: "later-source", StartMS: 61000, EndMS: 62000}, Score: 10})
-	ranks := sourceWindowRanks(segments, hits, 8)
+	ranks := segmentWindowRanks(segments, hits, 8)
 	if ranks["crowded"] != 1 || ranks["later"] != 2 {
-		t.Fatalf("window ranks = %#v, want both windows after source aggregation", ranks)
+		t.Fatalf("window ranks = %#v, want the best ASR/OCR score per window", ranks)
 	}
 }

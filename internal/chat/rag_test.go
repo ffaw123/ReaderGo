@@ -1,6 +1,30 @@
 package chat
 
-import "testing"
+import (
+	"testing"
+
+	"readergo/internal/model"
+)
+
+func TestBuildRAGWindowsUsesVideoSegmentEvidence(t *testing.T) {
+	result := retrievalResult{Candidates: []segmentCandidate{{
+		Segment: model.VideoSegment{
+			ID: "segment-1", StartMS: 0, EndMS: 60000,
+			Transcript: "ASR 原文", OCRText: "OCR 原文",
+		},
+		Primary: true,
+	}}}
+	windows := buildRAGWindows(result)
+	if len(windows) != 1 || len(windows[0].Evidence) != 2 {
+		t.Fatalf("windows = %#v, want one window with ASR and OCR evidence", windows)
+	}
+	if windows[0].Evidence[0].SourceID != "segment-1:asr" || windows[0].Evidence[0].Text != "ASR 原文" {
+		t.Fatalf("ASR evidence = %#v", windows[0].Evidence[0])
+	}
+	if windows[0].Evidence[1].SourceID != "segment-1:ocr" || windows[0].Evidence[1].Text != "OCR 原文" {
+		t.Fatalf("OCR evidence = %#v", windows[0].Evidence[1])
+	}
+}
 
 func TestPartialJSONAnswerDecodesOnlyAnswerContent(t *testing.T) {
 	tests := []struct {

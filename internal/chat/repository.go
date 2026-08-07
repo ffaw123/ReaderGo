@@ -211,30 +211,26 @@ func (r *repository) LoadCapabilities(ctx context.Context, tenantID, videoID str
 		return capabilities, nil
 	}
 
-	var segmentCount, embeddingCount, sourceCount int64
+	var segmentCount, embeddingCount, evidenceSegmentCount int64
 	if err := r.db.WithContext(ctx).Model(&model.VideoSegment{}).
 		Where("tenant_id = ? AND video_id = ?", tenantID, videoID).Count(&segmentCount).Error; err != nil {
+		return capabilities, err
+	}
+	// video_segments 是在线 RAG 的自包含快照，能力门控不再依赖原始 ASR/OCR 表。
+	if err := r.db.WithContext(ctx).Model(&model.VideoSegment{}).
+		Where("tenant_id = ? AND video_id = ?", tenantID, videoID).
+		Where("(btrim(transcript) <> '' OR btrim(ocr_text) <> '')").Count(&evidenceSegmentCount).Error; err != nil {
 		return capabilities, err
 	}
 	if err := r.db.WithContext(ctx).Model(&model.SegmentEmbedding{}).
 		Where("tenant_id = ? AND video_id = ?", tenantID, videoID).Count(&embeddingCount).Error; err != nil {
 		return capabilities, err
 	}
-	var asrCount, ocrCount int64
-	if err := r.db.WithContext(ctx).Model(&model.ASRSegment{}).
-		Where("tenant_id = ? AND video_id = ?", tenantID, videoID).Count(&asrCount).Error; err != nil {
-		return capabilities, err
-	}
-	if err := r.db.WithContext(ctx).Model(&model.OCRSegment{}).
-		Where("tenant_id = ? AND video_id = ?", tenantID, videoID).Count(&ocrCount).Error; err != nil {
-		return capabilities, err
-	}
-	sourceCount = asrCount + ocrCount
-	if segmentCount > 0 && embeddingCount == segmentCount && sourceCount > 0 {
+	if segmentCount > 0 && embeddingCount == segmentCount && evidenceSegmentCount == segmentCount {
 		capabilities.RAGState = CapabilityStateReady
 	} else {
 		capabilities.RAGState = CapabilityStateFailed
-		capabilities.RAGError = "检索任务已结束，但索引或原始证据不完整"
+		capabilities.RAGError = "检索任务已结束，但索引或窗口证据不完整"
 	}
 	return capabilities, nil
 }
