@@ -58,23 +58,19 @@ ReaderGo/
 
 ```mermaid
 flowchart TD
-    U[用户选择视频] --> W[Vue 前端分片上传]
-    W --> A[Go API]
-    A --> M[MinIO 保存视频]
-    A --> D[(PostgreSQL 写入任务与 Outbox)]
-    D --> O[Outbox Dispatcher]
-    O --> Q[RabbitMQ]
-    Q --> K[Worker]
-    K --> S1[ASR 语音转写]
-    K --> S2[OCR 画面文字识别]
-    S1 --> R[RAG 内容分段]
-    S2 --> R
+    U[用户添加视频] --> T{选择来源}
+    T -->|本地文件| M[上传至 MinIO]
+    T -->|视频 URL| P[prepare 下载与校验]
+    P --> M
+    M --> Q[进入异步处理队列]
+    Q --> A[ASR 语音转写]
+    Q --> O[OCR 文字识别]
+    A --> R[RAG 内容分段]
+    O --> R
     R --> E[生成向量索引]
     R --> S[生成章节摘要]
-    E --> D
-    S --> D
-    D --> C[摘要预览与视频问答]
-    C --> W
+    E --> C[摘要预览与视频问答]
+    S --> C
 ```
 
 ## 启动
