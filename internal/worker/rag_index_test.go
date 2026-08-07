@@ -371,7 +371,7 @@ func TestRouterRegistersRAGIndexProcessor(t *testing.T) {
 	rag := &RAGIndexProcessor{}
 	embedding := &EmbeddingProcessor{}
 	summary := &SummaryProcessor{}
-	router := NewRouterProcessor(nil, nil, rag, embedding, summary)
+	router := NewRouterProcessor(nil, nil, nil, rag, embedding, summary)
 	if router.processors[model.TaskRAGIndex] != rag {
 		t.Fatal("RAG index processor was not registered")
 	}

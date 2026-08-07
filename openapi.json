@@ -101,7 +101,7 @@
         "type": "object",
         "required": ["source_url"],
         "properties": {
-          "source_url": { "type": "string", "format": "uri", "description": "视频 URL（仅支持 http/https）" },
+          "source_url": { "type": "string", "format": "uri", "maxLength": 2048, "description": "可直接下载的视频文件 URL（http/https），或 Bilibili HTTPS 单视频页面；不得包含用户名或密码，页面短链不受支持" },
           "title":      { "type": "string", "description": "视频标题（可选）" }
         }
       },
@@ -434,7 +434,7 @@
       "post": {
         "tags": ["Videos"],
         "summary": "提交视频处理任务",
-        "description": "提交一个视频 URL 进行异步处理。系统在同一事务创建视频、prepare 任务和 Outbox，再通过 RabbitMQ 分发给 Worker。",
+        "description": "提交公开视频直链或 Bilibili 单视频页面进行异步处理。系统在同一事务创建视频、prepare 任务和 Outbox，再通过 RabbitMQ 分发给 Worker。",
         "operationId": "createVideo",
         "security": [{ "BearerAuth": [] }],
         "requestBody": {

@@ -12,11 +12,11 @@ ReaderGo 是一个面向长视频内容的 AI 理解与问答系统。用户上�
 | 消息队列 | RabbitMQ、Transactional Outbox |
 | 对象存储 | MinIO（S3 兼容） |
 | AI 与媒体处理 | OpenAI 兼容接口、LLM、Embedding、FFmpeg |
-| 缓存 | Redis（已加入本地编排，业务暂未使用） |
+| 缓存 | Redis |
 
 ## 项目亮点
 
-1. **可靠的大文件上传**：视频分片并发直传 MinIO，网络异常时只需重传失败分片（暂未实现）。
+1. **可靠的大文件上传**：视频分片并发直传 MinIO，网络异常时只需重传失败分片。
 2. **异步任务流水线**：通过 Outbox、RabbitMQ 和 Worker 解耦耗时任务，支持重试、死信处理及暂停恢复。
 3. **多模态视频理解**：结合 ASR 语音转写与 OCR 画面文字识别，按时间轴自动生成分段内容和章节摘要。
 4. **智能意图识别**：自动判断用户问题类型，并选择快捷回复、通用问答或视频内容检索等合适的回答路径。
@@ -85,6 +85,7 @@ flowchart TD
 - Go 1.26 或更高版本
 - Node.js 18 或更高版本
 - FFmpeg
+- yt-dlp 2026.07.04 或更高版本
 
 ### Windows 一键启动
 
@@ -94,7 +95,7 @@ flowchart TD
 Copy-Item .env.example .env
 ```
 
-在 `.env` 中填写 ASR、OCR、RAG、Chat 和 Intent 对应的模型配置，然后双击运行 [`batch/start.bat`](batch/start.bat)，或在 PowerShell 中执行：
+在 `.env` 中填写 ASR、OCR、RAG、Chat 和 Intent 对应的模型配置；网址上传支持公开视频直链以及 Bilibili 完整单视频页面（不支持短链），文件大小、时长、清晰度、超时和重定向上限可通过 `.env.example` 中的 `PREPARE_*`、`YT_DLP_*` 配置调整。然后双击运行 [`batch/start.bat`](batch/start.bat)，或在 PowerShell 中执行：
 
 ```powershell
 .\batch\start.bat

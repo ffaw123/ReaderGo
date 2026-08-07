@@ -1032,7 +1032,7 @@ onBeforeUnmount(() => {
           <div class="upload-body">
             <label class="upload-label" :class="{ 'upload-label--muted': sourceDisabled }">
               <span><Link2 :size="15" /> 通过网址添加</span>
-              <small>支持公开可访问的 HTTP / HTTPS 视频链接</small>
+              <small>支持公开视频直链及 Bilibili 完整单视频页面，不支持短链</small>
             </label>
             <div class="url-input" :class="{ 'url-input--disabled': sourceDisabled }">
               <Link2 :size="18" />
@@ -1040,7 +1040,7 @@ onBeforeUnmount(() => {
                 v-model="uploadUrl"
                 type="url"
                 :disabled="sourceDisabled || uploadBusy"
-                placeholder="粘贴 YouTube、Bilibili 或视频文件网址"
+                placeholder="粘贴 Bilibili 或视频文件网址"
                 @focus="chooseUrl"
                 @input="uploadSource = 'url'"
               />

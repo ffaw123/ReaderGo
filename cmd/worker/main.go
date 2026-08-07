@@ -35,6 +35,19 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	prepareProcessor, err := worker.NewPrepareProcessor(database, ffmpeg, configValue.MinIOEndpoint, configValue.MinIOAccessKey, configValue.MinIOSecretKey, configValue.MinIOSecure, configValue.MinIOBucket, worker.PrepareOptions{
+		MaxFileSize:           int64(configValue.PrepareMaxFileSizeMiB) * 1024 * 1024,
+		MaxDuration:           configValue.PrepareMaxDuration,
+		ConnectTimeout:        configValue.PrepareConnectTimeout,
+		ResponseHeaderTimeout: configValue.PrepareResponseHeaderTimeout,
+		DownloadTimeout:       configValue.PrepareDownloadTimeout,
+		MaxRedirects:          configValue.PrepareMaxRedirects,
+		YTDLPPath:             configValue.YTDLPPath,
+		YTDLPMaxHeight:        configValue.YTDLPMaxHeight,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	asrProcessor, err := worker.NewASRProcessor(database, ffmpeg, configValue.MinIOEndpoint, configValue.MinIOAccessKey, configValue.MinIOSecretKey, configValue.MinIOSecure, configValue.MinIOBucket, configValue.ASRBaseURL, configValue.ASRAPIKey, configValue.ASRModel, configValue.ASRConcurrency)
 	if err != nil {
 		log.Fatal(err)
@@ -56,7 +69,7 @@ func main() {
 		log.Fatal(err)
 	}
 	writer := outbox.NewWriter(configValue.RabbitMQJobsExchange, configValue.RabbitMQDLXExchange)
-	handler := worker.New(database, worker.NewRouterProcessor(asrProcessor, ocrProcessor, ragIndexProcessor, embeddingProcessor, summaryProcessor), writer, worker.Options{
+	handler := worker.New(database, worker.NewRouterProcessor(prepareProcessor, asrProcessor, ocrProcessor, ragIndexProcessor, embeddingProcessor, summaryProcessor), writer, worker.Options{
 		WorkerID: "worker-" + uuid.NewString(), MaxAttempts: configValue.JobMaxAttempts,
 		RetryDelays: configValue.JobRetryDelays, LeaseTTL: configValue.JobLeaseTTL,
 		HeartbeatInterval: configValue.JobHeartbeatInterval,

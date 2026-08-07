@@ -55,6 +55,15 @@ type Config struct {
 	ChatMaxInputRunes, ChatHistoryTurns      int
 	// UploadPartSizeMiB 限制为 16-64 MiB，以平衡重试成本和请求数量。
 	UploadPartSizeMiB, UploadURLTTLMinutes int
+	// Prepare 下载限制由 Worker 强制执行，避免外部地址长期占用连接、内存或磁盘。
+	PrepareMaxFileSizeMiB                               int
+	PrepareConnectTimeout, PrepareResponseHeaderTimeout time.Duration
+	PrepareDownloadTimeout                              time.Duration
+	PrepareMaxRedirects                                 int
+	// yt-dlp 只处理经过白名单识别的 Bilibili 页面，格式与时长限制继续由 prepare 统一控制。
+	YTDLPPath          string
+	YTDLPMaxHeight     int
+	PrepareMaxDuration time.Duration
 }
 
 // Load 优先加载本地 .env，再校验生产环境必填配置。
@@ -89,6 +98,18 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	chatHistoryTurns, err := strictIntValue("CHAT_HISTORY_TURNS", 3)
+	if err != nil {
+		return Config{}, err
+	}
+	prepareMaxFileSizeMiB, err := strictIntValue("PREPARE_MAX_FILE_SIZE_MIB", 2048)
+	if err != nil {
+		return Config{}, err
+	}
+	prepareMaxRedirects, err := strictIntValue("PREPARE_MAX_REDIRECTS", 5)
+	if err != nil {
+		return Config{}, err
+	}
+	ytdlpMaxHeight, err := strictIntValue("YT_DLP_MAX_HEIGHT", 1080)
 	if err != nil {
 		return Config{}, err
 	}
@@ -153,6 +174,15 @@ func Load() (Config, error) {
 
 		UploadPartSizeMiB:   intValue("UPLOAD_PART_SIZE_MIB", 32),
 		UploadURLTTLMinutes: intValue("UPLOAD_URL_TTL_MINUTES", 15),
+
+		PrepareMaxFileSizeMiB:        prepareMaxFileSizeMiB,
+		PrepareConnectTimeout:        durationValue("PREPARE_CONNECT_TIMEOUT", 10*time.Second),
+		PrepareResponseHeaderTimeout: durationValue("PREPARE_RESPONSE_HEADER_TIMEOUT", 30*time.Second),
+		PrepareDownloadTimeout:       durationValue("PREPARE_DOWNLOAD_TIMEOUT", 2*time.Hour),
+		PrepareMaxRedirects:          prepareMaxRedirects,
+		PrepareMaxDuration:           durationValue("PREPARE_MAX_DURATION", 6*time.Hour),
+		YTDLPPath:                    value("YT_DLP_PATH", "yt-dlp"),
+		YTDLPMaxHeight:               ytdlpMaxHeight,
 	}
 	if c.DatabaseURL == "" || len(c.JWTSecret) < 32 || c.MinIOEndpoint == "" || c.MinIOAccessKey == "" || c.MinIOSecretKey == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL, MinIO credentials, and a JWT_SECRET of at least 32 characters are required")
@@ -216,6 +246,24 @@ func Load() (Config, error) {
 	// 预签名 URL 的过期时间远短于上传会话，客户端可在失效后重新申请同一分片的 URL。
 	if c.UploadURLTTLMinutes < 1 || c.UploadURLTTLMinutes > 60 {
 		return Config{}, fmt.Errorf("UPLOAD_URL_TTL_MINUTES must be between 1 and 60")
+	}
+	if c.PrepareMaxFileSizeMiB < 1 || c.PrepareMaxFileSizeMiB > 10240 {
+		return Config{}, fmt.Errorf("PREPARE_MAX_FILE_SIZE_MIB must be between 1 and 10240")
+	}
+	if c.PrepareConnectTimeout <= 0 || c.PrepareResponseHeaderTimeout <= 0 || c.PrepareDownloadTimeout <= 0 {
+		return Config{}, fmt.Errorf("prepare download timeouts must be positive")
+	}
+	if c.PrepareMaxRedirects < 0 || c.PrepareMaxRedirects > 10 {
+		return Config{}, fmt.Errorf("PREPARE_MAX_REDIRECTS must be between 0 and 10")
+	}
+	if c.PrepareMaxDuration <= 0 || c.PrepareMaxDuration > 24*time.Hour {
+		return Config{}, fmt.Errorf("PREPARE_MAX_DURATION must be positive and at most 24h")
+	}
+	if strings.TrimSpace(c.YTDLPPath) == "" {
+		return Config{}, fmt.Errorf("YT_DLP_PATH must not be empty")
+	}
+	if c.YTDLPMaxHeight < 144 || c.YTDLPMaxHeight > 4320 {
+		return Config{}, fmt.Errorf("YT_DLP_MAX_HEIGHT must be between 144 and 4320")
 	}
 	return c, nil
 }

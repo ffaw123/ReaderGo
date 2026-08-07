@@ -14,9 +14,12 @@ type RouterProcessor struct {
 
 // NewRouterProcessor 创建路由器，参数按需传入已初始化的 Processor。
 // OCRProcessor 沿用现有 TaskVision 路由键，保持 RabbitMQ routing key、数据库任务类型和协调逻辑兼容。
-func NewRouterProcessor(asr *ASRProcessor, ocr *OCRProcessor, ragIndex *RAGIndexProcessor, embedding *EmbeddingProcessor, summary *SummaryProcessor) *RouterProcessor {
+func NewRouterProcessor(prepare *PrepareProcessor, asr *ASRProcessor, ocr *OCRProcessor, ragIndex *RAGIndexProcessor, embedding *EmbeddingProcessor, summary *SummaryProcessor) *RouterProcessor {
 	r := &RouterProcessor{
 		processors: make(map[string]Processor),
+	}
+	if prepare != nil {
+		r.processors[model.TaskPrepare] = prepare
 	}
 	if asr != nil {
 		r.processors[model.TaskASR] = asr

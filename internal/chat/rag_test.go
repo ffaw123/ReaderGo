@@ -1,6 +1,8 @@
 package chat
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"readergo/internal/model"
@@ -23,6 +25,28 @@ func TestBuildRAGWindowsUsesVideoSegmentEvidence(t *testing.T) {
 	}
 	if windows[0].Evidence[1].SourceID != "segment-1:ocr" || windows[0].Evidence[1].Text != "OCR 原文" {
 		t.Fatalf("OCR evidence = %#v", windows[0].Evidence[1])
+	}
+}
+
+func TestBuildRAGWindowsOmitsWindowsAfterEvidenceBudgetIsExhausted(t *testing.T) {
+	candidateCount := ragMaxEvidenceRunes/ragMaxWindowEvidence + 1
+	result := retrievalResult{Candidates: make([]segmentCandidate, 0, candidateCount)}
+	for index := 0; index < candidateCount; index++ {
+		result.Candidates = append(result.Candidates, segmentCandidate{Segment: model.VideoSegment{
+			ID:         fmt.Sprintf("segment-%d", index),
+			Transcript: strings.Repeat("证", ragMaxWindowEvidence),
+		}})
+	}
+
+	windows := buildRAGWindows(result)
+	want := ragMaxEvidenceRunes / ragMaxWindowEvidence
+	if len(windows) != want {
+		t.Fatalf("window count = %d, want %d evidence-bearing windows", len(windows), want)
+	}
+	for _, window := range windows {
+		if len(window.Evidence) == 0 {
+			t.Fatalf("empty-evidence window was retained: %#v", window)
+		}
 	}
 }
 

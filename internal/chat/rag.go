@@ -60,7 +60,8 @@ func (s *Service) answerRAG(ctx context.Context, tenantID, videoID string, histo
 		return generatedReply{}, fmt.Errorf("retrieve video evidence: %w", err)
 	}
 	retrievalLatency := time.Since(retrievalStarted)
-	if len(retrieved.Candidates) == 0 {
+	windows := buildRAGWindows(retrieved)
+	if len(windows) == 0 {
 		reply := generatedReply{
 			Content:  "当前视频内容中未找到足够依据。",
 			Route:    RouteInfo{Mode: ModeRAG, Intent: decision.Intent, Notice: "此回答基于视频片段检索结果。"},
@@ -70,7 +71,6 @@ func (s *Service) answerRAG(ctx context.Context, tenantID, videoID string, histo
 		return reply, emitReplyContent(reply, onDelta)
 	}
 
-	windows := buildRAGWindows(retrieved)
 	payload, err := json.Marshal(map[string]any{
 		"history": history, "current_input": currentInput, "rewritten_query": decision.RewrittenQuery,
 		"candidate_windows": windows,
@@ -121,6 +121,10 @@ func buildRAGWindows(result retrievalResult) []ragWindow {
 		}
 		appendEvidence("asr", candidate.Segment.Transcript)
 		appendEvidence("ocr", candidate.Segment.OCRText)
+		if len(window.Evidence) == 0 {
+			// 没有原始 ASR/OCR 证据的窗口不能发给模型，确保候选集合与服务端可引用集合完全一致。
+			continue
+		}
 		windows = append(windows, window)
 	}
 	return windows

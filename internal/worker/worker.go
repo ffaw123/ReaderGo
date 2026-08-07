@@ -74,7 +74,14 @@ func (x *Consumer) Handle(ctx context.Context, message queue.VideoJobMessage) er
 		log.Printf("job %s attempt %d failed and was persisted according to its failure policy: %v", job.ID, job.Attempt, processErr)
 		return nil
 	}
-	return x.completeJob(ctx, job, message.UploadMethod)
+	if err := x.completeJob(ctx, job, message.UploadMethod); err != nil {
+		return err
+	}
+	if job.TaskType == model.TaskPrepare {
+		// 事务成功提交后再记录完成日志，避免日志与任务终态、下游 Outbox 状态不一致。
+		log.Printf("Prepare completed for video %s", job.VideoID)
+	}
+	return nil
 }
 
 // claimJob 用视频行锁和条件更新完成原子抢占，重复消息最多只有一个进入 Processor。

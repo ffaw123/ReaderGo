@@ -430,9 +430,9 @@ func (s *Server) createVideo(c *gin.Context) {
 		bad(c, "source_url must be a valid URL")
 		return
 	}
-	// 仅接收 HTTP(S) URL，后续下载器也应防范内网地址（SSRF）。
+	// API 先拒绝明显非法的协议和凭据；Worker 下载前及每次重定向仍会完整执行 SSRF 校验。
 	u, e := url.Parse(in.SourceURL)
-	if e != nil || (u.Scheme != "http" && u.Scheme != "https") {
+	if e != nil || len(in.SourceURL) > 2048 || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil {
 		bad(c, "only http(s) video URLs are allowed")
 		return
 	}
