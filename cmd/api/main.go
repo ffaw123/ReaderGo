@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
 	"readergo/internal/api"
 	"readergo/internal/auth"
 	"readergo/internal/chat"
@@ -10,6 +12,7 @@ import (
 	"readergo/internal/db"
 	"readergo/internal/outbox"
 	"readergo/internal/storage"
+	"syscall"
 	"time"
 )
 
@@ -44,5 +47,10 @@ func main() {
 	}
 	// 视频任务仍只写入 Outbox；同步对话则由 chatService 在当前请求中完成。
 	writer := outbox.NewWriter(c.RabbitMQJobsExchange, c.RabbitMQDLXExchange)
-	log.Fatal(api.New(d, auth.New(c.JWTSecret, c.JWTTTLHours), chatService, writer, uploads, int64(c.UploadPartSizeMiB)*1024*1024).Router().Run(c.HTTPAddr))
+	server := api.New(d, auth.New(c.JWTSecret, c.JWTTTLHours), chatService, writer, uploads, int64(c.UploadPartSizeMiB)*1024*1024)
+	cleanupCtx, stopCleanup := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopCleanup()
+	// 过期会话会同时清理 MinIO 临时分片并保留数据库审计终态。
+	go server.RunUploadCleanup(cleanupCtx, 15*time.Minute)
+	log.Fatal(server.Router().Run(c.HTTPAddr))
 }

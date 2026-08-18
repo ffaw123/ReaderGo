@@ -54,6 +54,7 @@ func (x *Consumer) Handle(ctx context.Context, message queue.VideoJobMessage) er
 	}
 
 	processorCtx, stopMonitor, pauseRequested, leaseLost := x.withLifecycleMonitor(ctx, job)
+	// 调用 router Process，进行消费路由
 	processErr := x.processor.Process(processorCtx, message)
 	stopMonitor()
 	if leaseLost.Load() {

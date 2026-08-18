@@ -33,7 +33,7 @@ import {
   X,
   Zap,
 } from 'lucide-vue-next'
-import { api, uploadFileParts } from '../services/api'
+import { api, createFileIdentity, sameFileIdentity, uploadFileParts } from '../services/api'
 import { demoMessages, demoVideos } from '../lib/demo'
 
 const router = useRouter()
@@ -64,10 +64,14 @@ const dragActive = ref(false)
 const uploadBusy = ref(false)
 const uploadProgress = ref(0)
 const uploadError = ref('')
+const pendingUpload = ref(null)
+const uploadCanPause = ref(false)
+const uploadCancelBusy = ref(false)
 const pauseSettled = ref(true)
 const statusActionBusy = ref(false)
 let statusTimer
 let toastTimer
+let uploadAbortController
 
 const selectedVideo = computed(() => videos.value.find((video) => video.id === selectedId.value) || null)
 const hasStreamingAssistant = computed(() => messages.value.some((message) => message.streaming))
@@ -149,7 +153,7 @@ const statusMeta = computed(() => {
   }
   return statuses[selectedVideo.value?.status] || statuses.uploading
 })
-const sourceDisabled = computed(() => uploadSource.value === 'file' && selectedFile.value)
+const sourceDisabled = computed(() => pendingUpload.value || (uploadSource.value === 'file' && selectedFile.value))
 const fileDisabled = computed(() => uploadSource.value === 'url' && uploadUrl.value.trim())
 const summaryExcerpt = computed(() =>
   summary.value
@@ -176,6 +180,49 @@ function parseSession() {
 
 function cacheKey() {
   return `readergo_videos_${session.value?.user?.id || 'anonymous'}`
+}
+
+function pendingUploadKey() {
+  return `readergo_pending_upload_${session.value?.user?.id || 'anonymous'}`
+}
+
+function loadPendingUpload() {
+  try {
+    pendingUpload.value = JSON.parse(localStorage.getItem(pendingUploadKey()) || 'null')
+  } catch {
+    pendingUpload.value = null
+  }
+  if (pendingUpload.value) {
+    uploadSource.value = 'file'
+    uploadProgress.value = pendingUpload.value.progress || 0
+  }
+}
+
+function savePendingUpload(uploadSession, identity, title) {
+  pendingUpload.value = {
+    upload_id: uploadSession.upload_id,
+    video_id: uploadSession.video_id,
+    filename: identity.filename,
+    file_size: identity.file_size,
+    file_last_modified_ms: identity.file_last_modified_ms,
+    file_fingerprint: identity.file_fingerprint,
+    expires_at: uploadSession.expires_at,
+    progress: uploadSession.progress || 0,
+    title,
+  }
+  localStorage.setItem(pendingUploadKey(), JSON.stringify(pendingUpload.value))
+}
+
+function updatePendingProgress(progress) {
+  uploadProgress.value = progress
+  if (!pendingUpload.value) return
+  pendingUpload.value.progress = progress
+  localStorage.setItem(pendingUploadKey(), JSON.stringify(pendingUpload.value))
+}
+
+function clearPendingUpload() {
+  localStorage.removeItem(pendingUploadKey())
+  pendingUpload.value = null
 }
 
 function getCachedEntries() {
@@ -513,10 +560,25 @@ function downloadSummary() {
   notify('Markdown 摘要已开始下载')
 }
 
-function openUpload() {
+async function openUpload() {
   uploadOpen.value = true
   sidebarOpen.value = false
   uploadError.value = ''
+  if (!pendingUpload.value || previewMode.value) return
+  uploadSource.value = 'file'
+  try {
+    const status = await api.getUploadStatus(pendingUpload.value.upload_id)
+    pendingUpload.value.progress = status.progress
+    uploadProgress.value = status.progress
+    localStorage.setItem(pendingUploadKey(), JSON.stringify(pendingUpload.value))
+  } catch (error) {
+    if (error.status === 404 || error.status === 409) {
+      clearPendingUpload()
+      uploadError.value = '之前的上传会话已结束，请重新选择文件上传'
+    } else {
+      uploadError.value = '暂时无法读取断点，请稍后重试'
+    }
+  }
 }
 
 function closeUpload() {
@@ -524,13 +586,13 @@ function closeUpload() {
   uploadOpen.value = false
   uploadUrl.value = ''
   selectedFile.value = null
-  uploadProgress.value = 0
+  uploadProgress.value = pendingUpload.value?.progress || 0
   uploadError.value = ''
-  uploadSource.value = 'url'
+  uploadSource.value = pendingUpload.value ? 'file' : 'url'
 }
 
 function chooseUrl() {
-  if (selectedFile.value) return
+  if (selectedFile.value || pendingUpload.value) return
   uploadSource.value = 'url'
 }
 
@@ -564,7 +626,38 @@ function onFileChange(event) {
 function removeFile() {
   if (uploadBusy.value) return
   selectedFile.value = null
+  uploadSource.value = pendingUpload.value ? 'file' : 'url'
+}
+
+function pauseLocalUpload() {
+  if (!uploadAbortController) return
+  // 只停止当前 PUT 和后续调度，不调用服务端取消接口，MinIO 已有分片继续保留。
+  uploadAbortController.abort()
+}
+
+async function cancelPendingUpload() {
+  if (!pendingUpload.value || uploadCancelBusy.value) {
+    closeUpload()
+    return
+  }
+  uploadCancelBusy.value = true
+  uploadAbortController?.abort()
+  try {
+    await api.cancelUpload(pendingUpload.value.upload_id)
+  } catch (error) {
+    if (error.status !== 404 && error.status !== 409) {
+      uploadError.value = error.message
+      return
+    }
+  } finally {
+    uploadCancelBusy.value = false
+  }
+  clearPendingUpload()
+  selectedFile.value = null
+  uploadProgress.value = 0
+  uploadError.value = ''
   uploadSource.value = 'url'
+  notify('未完成的上传已取消')
 }
 
 async function submitUpload() {
@@ -626,9 +719,33 @@ async function submitUpload() {
     } else {
       const file = selectedFile.value
       const title = file.name.replace(/\.[^.]+$/, '')
-      const uploadSession = await api.createUpload(file, title)
-      const parts = await uploadFileParts(file, uploadSession, (progress) => (uploadProgress.value = progress))
-      const completed = await api.completeUpload(uploadSession.upload_id, parts)
+      const identity = await createFileIdentity(file)
+      let uploadSession
+      if (pendingUpload.value) {
+        if (!sameFileIdentity(identity, pendingUpload.value)) {
+          throw new Error('所选文件与未完成上传不一致，请重新选择原文件或先取消旧上传')
+        }
+        try {
+          uploadSession = await api.getUploadStatus(pendingUpload.value.upload_id)
+        } catch (error) {
+          if (error.status !== 404 && error.status !== 409) throw error
+          clearPendingUpload()
+        }
+      }
+      if (!uploadSession) {
+        uploadSession = await api.createUpload(file, title, identity)
+        savePendingUpload(uploadSession, identity, title)
+      } else if (!sameFileIdentity(identity, uploadSession)) {
+        throw new Error('服务端上传会话与所选文件不一致，已拒绝恢复')
+      }
+
+      uploadAbortController = new AbortController()
+      uploadCanPause.value = true
+      await uploadFileParts(file, uploadSession, updatePendingProgress, uploadAbortController.signal)
+      // 所有分片已到达 MinIO 后进入不可中断的幂等完成阶段，避免把“暂停”误解为取消合并。
+      uploadCanPause.value = false
+      const completed = await api.completeUpload(uploadSession.upload_id)
+      clearPendingUpload()
       const video = completed.video
       const conversation = await api.createConversation(video.id, video.title || title)
       video.conversationId = conversation.id
@@ -640,8 +757,16 @@ async function submitUpload() {
       notify('文件已上传完成，ReaderGo 正在后台处理')
     }
   } catch (error) {
-    uploadError.value = error.message
+    // 任一分片耗尽重试时立即终止同批并发 PUT，避免界面进入恢复态后后台仍继续传输。
+    uploadAbortController?.abort()
+    if (error.name === 'AbortError') {
+      uploadError.value = '上传已暂停，继续时会从 MinIO 中缺失的分片恢复'
+    } else {
+      uploadError.value = pendingUpload.value ? `${error.message}；可稍后继续上传` : error.message
+    }
   } finally {
+    uploadAbortController = null
+    uploadCanPause.value = false
     uploadBusy.value = false
   }
 }
@@ -695,10 +820,12 @@ watch(
 
 onMounted(async () => {
   parseSession()
+  loadPendingUpload()
   await loadVideos()
 })
 
 onBeforeUnmount(() => {
+  uploadAbortController?.abort()
   clearInterval(statusTimer)
   clearTimeout(toastTimer)
 })
@@ -1049,6 +1176,14 @@ onBeforeUnmount(() => {
 
             <div class="source-divider"><span>或者，从本地上传</span></div>
 
+            <div v-if="pendingUpload" class="resume-notice">
+              <RotateCcw :size="17" />
+              <span>
+                <strong>存在未完成上传：{{ pendingUpload.filename }}</strong>
+                <small>请重新选择同一文件，ReaderGo 将校验文件并只上传 MinIO 中缺失的分片。</small>
+              </span>
+            </div>
+
             <input ref="fileInput" class="visually-hidden" type="file" accept="video/*" @change="onFileChange" />
             <button
               type="button"
@@ -1076,21 +1211,39 @@ onBeforeUnmount(() => {
               </template>
             </button>
 
-            <div v-if="uploadBusy" class="upload-progress">
-              <div><span>{{ selectedFile ? '正在上传视频分片' : '正在创建处理任务' }}</span><strong>{{ uploadProgress }}%</strong></div>
+            <div v-if="uploadBusy || pendingUpload" class="upload-progress">
+              <div>
+                <span>{{ uploadCanPause ? '正在上传视频分片' : pendingUpload ? '上传已暂停，可继续恢复' : '正在创建处理任务' }}</span>
+                <strong>{{ uploadProgress }}%</strong>
+              </div>
               <div class="progress-track"><span :style="{ width: `${Math.max(uploadProgress, 8)}%` }"></span></div>
             </div>
             <p v-if="uploadError" class="form-error upload-error">{{ uploadError }}</p>
           </div>
 
           <footer class="modal-footer">
-            <span><Zap :size="14" /> 提交后可以关闭页面，处理会继续进行</span>
+            <span>
+              <Zap :size="14" />
+              {{ pendingUpload ? '关闭或刷新后，重新选择同一文件即可继续' : '提交后可以关闭页面，处理会继续进行' }}
+            </span>
             <div>
-              <button class="secondary-button" :disabled="uploadBusy" @click="closeUpload">取消</button>
-              <button class="primary-button" :disabled="uploadBusy || (!uploadUrl.trim() && !selectedFile)" @click="submitUpload">
+              <button class="secondary-button" :disabled="uploadCancelBusy" @click="pendingUpload ? cancelPendingUpload() : closeUpload()">
+                {{ uploadCancelBusy ? '正在取消' : pendingUpload ? '取消上传' : '取消' }}
+              </button>
+              <button v-if="uploadCanPause" class="primary-button" @click="pauseLocalUpload">
+                <Pause :size="17" />
+                暂停上传
+              </button>
+              <button
+                v-else
+                class="primary-button"
+                :disabled="uploadBusy || uploadCancelBusy || (!uploadUrl.trim() && !selectedFile)"
+                @click="submitUpload"
+              >
                 <LoaderCircle v-if="uploadBusy" :size="17" class="spin" />
+                <RotateCcw v-else-if="pendingUpload" :size="17" />
                 <UploadCloud v-else :size="17" />
-                {{ uploadBusy ? '正在提交' : '提交视频' }}
+                {{ uploadBusy ? '正在提交' : pendingUpload ? '继续上传' : '提交视频' }}
               </button>
             </div>
           </footer>

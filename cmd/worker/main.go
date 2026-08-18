@@ -69,6 +69,7 @@ func main() {
 		log.Fatal(err)
 	}
 	writer := outbox.NewWriter(configValue.RabbitMQJobsExchange, configValue.RabbitMQDLXExchange)
+	// 创建一个worker实例
 	handler := worker.New(database, worker.NewRouterProcessor(prepareProcessor, asrProcessor, ocrProcessor, ragIndexProcessor, embeddingProcessor, summaryProcessor), writer, worker.Options{
 		WorkerID: "worker-" + uuid.NewString(), MaxAttempts: configValue.JobMaxAttempts,
 		RetryDelays: configValue.JobRetryDelays, LeaseTTL: configValue.JobLeaseTTL,

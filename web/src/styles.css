@@ -326,6 +326,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .url-input button:hover { background: #f0f0eb; }
 .source-divider { display: flex; margin: 19px 0; align-items: center; gap: 12px; color: #9ba19e; font-size: 9px; }
 .source-divider::before, .source-divider::after { height: 1px; flex: 1; content: ''; background: #e2e2dc; }
+.resume-notice { display: flex; margin: -4px 0 14px; padding: 11px 13px; align-items: flex-start; gap: 9px; border: 1px solid #d4d6ef; border-radius: 10px; color: var(--accent-strong); background: #f3f4ff; }
+.resume-notice > svg { margin-top: 1px; flex: 0 0 auto; }
+.resume-notice > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.resume-notice strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.resume-notice small { color: #6f7488; font-size: 8px; line-height: 1.5; }
 .dropzone { display: flex; width: 100%; min-height: 146px; padding: 24px; align-items: center; justify-content: center; flex-direction: column; border: 1px dashed #c3c8d8; border-radius: 14px; color: #4f5468; background: #f8f9fc; cursor: pointer; transition: 150ms ease; }
 .dropzone:hover:not(:disabled), .dropzone--active { border-color: var(--accent); background: var(--accent-soft); }
 .dropzone--disabled { opacity: .44; cursor: not-allowed; }

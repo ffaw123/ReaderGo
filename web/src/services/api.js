@@ -1,6 +1,7 @@
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const maxPartUploadRetries = 3
 const initialPartRetryDelayMs = 400
+const fingerprintSampleSize = 64 * 1024
 
 function getSession() {
   try {
@@ -26,7 +27,9 @@ async function request(path, options = {}) {
       localStorage.removeItem('readergo_session')
       window.location.assign('/login')
     }
-    throw new Error(payload?.error || `请求失败（${response.status}）`)
+    const error = new Error(payload?.error || `请求失败（${response.status}）`)
+    error.status = response.status
+    throw error
   }
   return payload
 }
@@ -98,7 +101,7 @@ async function streamRequest(path, options, onDelta) {
     consumeBuffer(true)
     finished = true
   } finally {
-    if (!finished) await reader.cancel().catch(() => {})
+    if (!finished) await reader.cancel().catch(() => { })
     reader.releaseLock()
   }
   if (!result) throw new Error('回答流意外中断，请重试')
@@ -129,43 +132,64 @@ export const api = {
       },
       onDelta,
     ),
-  createUpload: (file, title) =>
+  createUpload: (file, title, identity) =>
     request('/api/uploads', {
       method: 'POST',
       body: JSON.stringify({
         filename: file.name,
         content_type: file.type || 'application/octet-stream',
         file_size: file.size,
+        file_last_modified_ms: identity.file_last_modified_ms,
+        file_fingerprint: identity.file_fingerprint,
         title,
       }),
     }),
-  getUploadParts: (uploadId, partNumbers) =>
+  getUploadStatus: (uploadId, signal) => request(`/api/uploads/${uploadId}`, { signal }),
+  getUploadParts: (uploadId, partNumbers, signal) =>
     request(`/api/uploads/${uploadId}/parts`, {
       method: 'POST',
       body: JSON.stringify({ part_numbers: partNumbers }),
+      signal,
     }),
-  completeUpload: (uploadId, parts) =>
-    request(`/api/uploads/${uploadId}/complete`, {
-      method: 'POST',
-      body: JSON.stringify({ parts }),
-    }),
+  completeUpload: (uploadId) => request(`/api/uploads/${uploadId}/complete`, { method: 'POST' }),
+  cancelUpload: (uploadId) => request(`/api/uploads/${uploadId}`, { method: 'DELETE' }),
 }
 
-function waitForRetry(delayMs) {
-  return new Promise((resolve) => window.setTimeout(resolve, delayMs))
+function abortError() {
+  return new DOMException('上传已暂停', 'AbortError')
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError()
+}
+
+function waitForRetry(delayMs, signal) {
+  return new Promise((resolve, reject) => {
+    throwIfAborted(signal)
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, delayMs)
+    const onAbort = () => {
+      window.clearTimeout(timer)
+      reject(abortError())
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function isRetryablePartUploadStatus(status) {
   return status === 408 || status === 429 || status >= 500
 }
 
-async function uploadPartWithRetry(url, part, partNumber) {
+async function uploadPartWithRetry(url, part, partNumber, signal) {
   let lastError
 
   // 首次请求之外，最多额外重试 3 次；每次等待时间按指数增长。
   for (let retry = 0; retry <= maxPartUploadRetries; retry += 1) {
+    throwIfAborted(signal)
     try {
-      const response = await fetch(url, { method: 'PUT', body: part })
+      const response = await fetch(url, { method: 'PUT', body: part, signal })
       if (!response.ok) {
         const error = new Error(`第 ${partNumber} 个分片上传失败（HTTP ${response.status}）`)
         error.retryable = isRetryablePartUploadStatus(response.status)
@@ -180,43 +204,100 @@ async function uploadPartWithRetry(url, part, partNumber) {
       }
       return etag
     } catch (error) {
+      if (signal?.aborted || error.name === 'AbortError') throw abortError()
       lastError = error
       if (retry === maxPartUploadRetries || error.retryable === false) break
-      await waitForRetry(initialPartRetryDelayMs * 2 ** retry)
+      await waitForRetry(initialPartRetryDelayMs * 2 ** retry, signal)
     }
   }
 
   throw new Error(`第 ${partNumber} 个分片上传失败，已重试 ${maxPartUploadRetries} 次：${lastError.message}`)
 }
 
-export async function uploadFileParts(file, session, onProgress) {
-  const knownParts = new Map(session.parts.map((part) => [part.part_number, part.url]))
+export async function createFileIdentity(file) {
+  if (!globalThis.crypto?.subtle) throw new Error('当前浏览器环境不支持文件指纹校验')
+  const first = new Uint8Array(await file.slice(0, fingerprintSampleSize).arrayBuffer())
+  const lastStart = Math.max(first.length, file.size - fingerprintSampleSize)
+  const last = new Uint8Array(await file.slice(lastStart).arrayBuffer())
+  const sizeBytes = new TextEncoder().encode(`readergo-v1:${file.size}:`)
+  const sample = new Uint8Array(sizeBytes.length + first.length + last.length)
+  sample.set(sizeBytes)
+  sample.set(first, sizeBytes.length)
+  sample.set(last, sizeBytes.length + first.length)
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', sample))
+  return {
+    filename: file.name,
+    file_size: file.size,
+    file_last_modified_ms: file.lastModified,
+    file_fingerprint: Array.from(digest, (value) => value.toString(16).padStart(2, '0')).join(''),
+  }
+}
+
+export function sameFileIdentity(left, right) {
+  return Boolean(
+    left &&
+    right &&
+    left.filename === right.filename &&
+    left.file_size === right.file_size &&
+    left.file_last_modified_ms === right.file_last_modified_ms &&
+    left.file_fingerprint === right.file_fingerprint,
+  )
+}
+
+export async function uploadFileParts(file, session, onProgress, signal) {
+  throwIfAborted(signal)
+  if (session.object_completed) {
+    onProgress(100)
+    return
+  }
+
+  const completed = new Map((session.completed_parts || []).map((part) => [part.part_number, part]))
+  let uploadedBytes = Array.from(completed.values()).reduce((total, part) => total + part.size, 0)
+  onProgress(Math.round((uploadedBytes / file.size) * 100))
+
+  // 恢复时只申请缺失分片的新 URL，并重新上传缺失部分
   const missingNumbers = []
   for (let number = 1; number <= session.part_count; number += 1) {
-    if (!knownParts.has(number)) missingNumbers.push(number)
+    if (!completed.has(number)) missingNumbers.push(number)
   }
 
+  const initialURLs = new Map(
+    (session.parts || [])
+      .filter((part) => new Date(part.expires_at).getTime() > Date.now() + 30_000)
+      .map((part) => [part.part_number, part.url]),
+  )
+
+  // 按16个一批获取预签名url，一批的内部4个分片并发上传到MinIO，上传4次。
+  // 完成后再获取下一批url
   for (let index = 0; index < missingNumbers.length; index += 16) {
+    throwIfAborted(signal)
     const batch = missingNumbers.slice(index, index + 16)
-    const result = await api.getUploadParts(session.upload_id, batch)
-    result.parts.forEach((part) => knownParts.set(part.part_number, part.url))
-  }
-
-  let uploadedBytes = 0
-  const completedParts = new Array(session.part_count)
-  const queue = Array.from({ length: session.part_count }, (_, index) => index + 1)
-  const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
-    while (queue.length) {
-      const partNumber = queue.shift()
-      const start = (partNumber - 1) * session.part_size
-      const end = Math.min(start + session.part_size, file.size)
-      const part = file.slice(start, end)
-      const etag = await uploadPartWithRetry(knownParts.get(partNumber), part, partNumber)
-      completedParts[partNumber - 1] = { part_number: partNumber, etag }
-      uploadedBytes += part.size
-      onProgress(Math.round((uploadedBytes / file.size) * 100))
+    const urls = new Map()
+    const needURLs = []
+    batch.forEach((partNumber) => {
+      if (initialURLs.has(partNumber)) urls.set(partNumber, initialURLs.get(partNumber))
+      else needURLs.push(partNumber)
+    })
+    if (needURLs.length) {
+      const result = await api.getUploadParts(session.upload_id, needURLs, signal)
+      result.parts.forEach((part) => urls.set(part.part_number, part.url))
     }
-  })
-  await Promise.all(workers)
-  return completedParts
+
+    const queue = [...batch]
+    const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+      while (queue.length) {
+        throwIfAborted(signal)
+        const partNumber = queue.shift()
+        const start = (partNumber - 1) * session.part_size
+        const end = Math.min(start + session.part_size, file.size)
+        const part = file.slice(start, end)
+        const etag = await uploadPartWithRetry(urls.get(partNumber), part, partNumber, signal)
+        // 当前页面内仅保存进度提示；恢复和最终完成仍会重新查询 MinIO。
+        completed.set(partNumber, { part_number: partNumber, etag, size: part.size })
+        uploadedBytes += part.size
+        onProgress(Math.round((uploadedBytes / file.size) * 100))
+      }
+    })
+    await Promise.all(workers)
+  }
 }

@@ -2,9 +2,11 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -26,11 +28,21 @@ const (
 	retryDelay = 100 * time.Millisecond
 )
 
+var ErrMultipartUploadNotFound = errors.New("multipart upload not found")
+
 // CompletedPart 是浏览器直传成功后返回的不可伪造分片 ETag。
 // 只有服务端使用保存的 upload ID 调用 Complete，浏览器无法自行拼接对象。
 type CompletedPart struct {
 	PartNumber int
 	ETag       string
+}
+
+// UploadedPart 是 MinIO 返回的实际分片，恢复与完成流程只能以此为准。
+type UploadedPart struct {
+	PartNumber   int       `json:"part_number"`
+	ETag         string    `json:"etag"`
+	Size         int64     `json:"size"`
+	LastModified time.Time `json:"last_modified"`
 }
 
 // NewMultipartStore 只创建客户端；EnsureBucket 在启动阶段执行存储桶可用性检查。
@@ -85,6 +97,10 @@ func (s *MultipartStore) Abort(ctx context.Context, objectKey, uploadID string) 
 		if err == nil {
 			return nil
 		}
+		if isNoSuchUpload(err) {
+			// 重复取消或对象存储已清理会话时视为成功，数据库仍可收敛到终态。
+			return nil
+		}
 		lastErr = err
 		if attempt == maxRetries {
 			break
@@ -100,6 +116,57 @@ func (s *MultipartStore) Abort(ctx context.Context, objectKey, uploadID string) 
 		}
 	}
 	return lastErr
+}
+
+// ListParts 处理 S3 分页并返回当前 multipart upload 的全部实际分片。
+func (s *MultipartStore) ListParts(ctx context.Context, objectKey, uploadID string) ([]UploadedPart, error) {
+	const pageSize = 1000
+	marker := 0
+	parts := make([]UploadedPart, 0)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result, err := s.client.ListObjectParts(ctx, s.bucket, objectKey, uploadID, marker, pageSize)
+		if err != nil {
+			if isNoSuchUpload(err) {
+				return nil, ErrMultipartUploadNotFound
+			}
+			return nil, err
+		}
+		for _, part := range result.ObjectParts {
+			parts = append(parts, UploadedPart{
+				PartNumber:   part.PartNumber,
+				ETag:         strings.Trim(strings.TrimSpace(part.ETag), "\""),
+				Size:         part.Size,
+				LastModified: part.LastModified,
+			})
+		}
+		if !result.IsTruncated {
+			return parts, nil
+		}
+		if result.NextPartNumberMarker <= marker {
+			return nil, fmt.Errorf("MinIO returned invalid next part marker %d", result.NextPartNumberMarker)
+		}
+		marker = result.NextPartNumberMarker
+	}
+}
+
+// ObjectSize 用于处理“MinIO 已完成但数据库事务尚未提交”的幂等恢复窗口。
+func (s *MultipartStore) ObjectSize(ctx context.Context, objectKey string) (int64, bool, error) {
+	info, err := s.client.StatObject(ctx, s.bucket, objectKey, minio.StatObjectOptions{})
+	if err == nil {
+		return info.Size, true, nil
+	}
+	response := minio.ToErrorResponse(err)
+	if response.Code == "NoSuchKey" || response.Code == "NoSuchObject" || response.Code == "NotFound" {
+		return 0, false, nil
+	}
+	return 0, false, err
+}
+
+func isNoSuchUpload(err error) bool {
+	return minio.ToErrorResponse(err).Code == "NoSuchUpload"
 }
 
 // Complete 校验通过后的全部分片写入一个最终对象，并关闭 multipart upload。

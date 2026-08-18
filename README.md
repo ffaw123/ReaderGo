@@ -16,7 +16,7 @@ ReaderGo 是一个面向长视频内容的 AI 理解与问答系统。用户上�
 
 ## 项目亮点
 
-1. **可靠的大文件上传**：视频分片并发直传 MinIO，网络异常时只需重传失败分片。
+1. **可靠的大文件上传**：视频分片并发直传 MinIO，支持主动暂停、弱网恢复和页面刷新后续传，只重新上传 MinIO 中缺失的分片。
 2. **异步任务流水线**：通过 Outbox、RabbitMQ 和 Worker 解耦耗时任务，支持重试、死信处理及暂停恢复。
 3. **多模态视频理解**：结合 ASR 语音转写与 OCR 画面文字识别，按时间轴自动生成分段内容和章节摘要。
 4. **智能意图识别**：自动判断用户问题类型，并选择快捷回复、通用问答或视频内容检索等合适的回答路径。
@@ -50,7 +50,7 @@ ReaderGo/
     │   └── writer.go           ← 在业务事务中写入任务和死信消息
     ├── queue/                   ← RabbitMQ 消息契约、队列拓扑、发布与消费
     ├── storage/                 ← 对象存储访问封装
-    │   └── multipart.go        ← 管理 MinIO 分片上传、签名地址和分片合并
+    │   └── multipart.go        ← 管理 MinIO 分片查询、签名地址、恢复和分片合并
     └── worker/                  ← ASR、OCR、RAG、Embedding、摘要及任务编排
 ```
 
@@ -58,23 +58,19 @@ ReaderGo/
 
 ```mermaid
 flowchart TD
-    U[用户选择视频] --> W[Vue 前端分片上传]
-    W --> A[Go API]
-    A --> M[MinIO 保存视频]
-    A --> D[(PostgreSQL 写入任务与 Outbox)]
-    D --> O[Outbox Dispatcher]
-    O --> Q[RabbitMQ]
-    Q --> K[Worker]
-    K --> S1[ASR 语音转写]
-    K --> S2[OCR 画面文字识别]
-    S1 --> R[RAG 内容分段]
-    S2 --> R
+    U[用户添加视频] --> T{选择来源}
+    T -->|本地文件| M[上传至 MinIO]
+    T -->|视频 URL| P[prepare 下载与校验]
+    P --> M
+    M --> Q[进入异步处理队列]
+    Q --> A[ASR 语音转写]
+    Q --> O[OCR 文字识别]
+    A --> R[RAG 内容分段]
+    O --> R
     R --> E[生成向量索引]
     R --> S[生成章节摘要]
-    E --> D
-    S --> D
-    D --> C[摘要预览与视频问答]
-    C --> W
+    E --> C[摘要预览与视频问答]
+    S --> C
 ```
 
 ## 启动

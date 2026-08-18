@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,8 @@ var (
 	errPauseStillSettling     = errors.New("running jobs have not stopped yet")
 	errPausedVideoHasFailures = errors.New("paused video contains failed jobs")
 	errNoPendingJobs          = errors.New("paused video has no pending jobs")
+	errUploadSessionNotActive = errors.New("upload session is not active")
+	errUploadPartsIncomplete  = errors.New("upload parts are incomplete")
 )
 
 const (
@@ -54,26 +57,17 @@ const (
 
 // createUploadRequest 仅接收客户端元数据，文件二进制不会经过 Gin 服务。
 type createUploadRequest struct {
-	Filename    string `json:"filename" binding:"required,max=512"`
-	ContentType string `json:"content_type"`
-	FileSize    int64  `json:"file_size" binding:"required,gt=0"`
-	Title       string `json:"title"`
+	Filename           string `json:"filename" binding:"required,max=512"`
+	ContentType        string `json:"content_type" binding:"max=255"`
+	FileSize           int64  `json:"file_size" binding:"required,gt=0"`
+	FileLastModifiedMS int64  `json:"file_last_modified_ms" binding:"required,gt=0"`
+	FileFingerprint    string `json:"file_fingerprint" binding:"required,len=64"`
+	Title              string `json:"title" binding:"max=512"`
 }
 
 // uploadPartsRequest 让客户端在上传队列需要新槽位时批量申请 URL。
 type uploadPartsRequest struct {
 	PartNumbers []int `json:"part_numbers" binding:"required,min=1,max=16"`
-}
-
-// completedUploadPart 是浏览器上传成功后从对象存储响应头读取的 ETag。
-type completedUploadPart struct {
-	PartNumber int    `json:"part_number" binding:"required"`
-	ETag       string `json:"etag" binding:"required,max=256"`
-}
-
-// completeUploadRequest 必须包含全部且仅包含该会话的分片。
-type completeUploadRequest struct {
-	Parts []completedUploadPart `json:"parts" binding:"required,min=1,max=10000"`
 }
 
 // uploadPartURL 描述一个仅可上传指定分片、且有短期有效期的直传地址。
@@ -87,7 +81,11 @@ type uploadPartURL struct {
 func (s *Server) createUpload(c *gin.Context) {
 	var in createUploadRequest
 	if c.ShouldBindJSON(&in) != nil {
-		bad(c, "filename and a positive file_size are required")
+		bad(c, "valid filename, file metadata and fingerprint are required")
+		return
+	}
+	if _, err := hex.DecodeString(in.FileFingerprint); err != nil || in.FileFingerprint != strings.ToLower(in.FileFingerprint) {
+		bad(c, "file_fingerprint must be a lowercase SHA-256 hex string")
 		return
 	}
 	// 文件大小和固定分片大小决定总数；最后一个分片可小于 partSize。
@@ -118,7 +116,12 @@ func (s *Server) createUpload(c *gin.Context) {
 		return
 	}
 	// 上传会话独立保存分片布局、MinIO uploadID 和过期时间，不能只依赖 videos.status。
-	session := model.UploadSession{TenantID: tenantID, VideoID: videoID, UploadID: uploadID, ObjectKey: objectKey, PartSize: s.partSize, FileSize: in.FileSize, PartCount: partCount, Status: "uploading", ExpiresAt: time.Now().Add(24 * time.Hour)}
+	session := model.UploadSession{
+		TenantID: tenantID, VideoID: videoID, UploadID: uploadID, ObjectKey: objectKey,
+		Filename: in.Filename, FileLastModifiedMS: in.FileLastModifiedMS, FileFingerprint: in.FileFingerprint,
+		PartSize: s.partSize, FileSize: in.FileSize, PartCount: partCount,
+		Status: "uploading", ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
 	if e = s.db.Create(&session).Error; e != nil {
 		// 数据库持久化失败后必须中止 MinIO multipart upload，避免产生孤儿临时分片。
 		_ = s.uploads.Abort(c.Request.Context(), objectKey, uploadID)
@@ -129,14 +132,14 @@ func (s *Server) createUpload(c *gin.Context) {
 	// 仅返回首批 URL，客户端用 /parts 接口按需续取其余 URL。
 	parts, e := s.presignParts(c.Request.Context(), session, firstPartNumbers(partCount))
 	if e != nil {
-		if cancelErr := s.cancelUpload(c.Request.Context(), session, "could not issue upload URLs"); cancelErr != nil {
+		if cancelErr := s.terminateUpload(c.Request.Context(), session.ID, session.TenantID, "cancelled", "could not issue initial upload URLs"); cancelErr != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not cancel object upload"})
 			return
 		}
 		fail(c, e)
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"upload_id": session.ID, "video_id": videoID, "part_size": s.partSize, "part_count": partCount, "expires_at": session.ExpiresAt, "parts": parts})
+	c.JSON(http.StatusCreated, uploadSessionResponse(session, nil, parts))
 }
 
 // uploadPartURLs 按需批量签发 URL；客户端以 4 到 8 路并行 PUT 这些 URL 即可。
@@ -153,8 +156,13 @@ func (s *Server) uploadPartURLs(c *gin.Context) {
 		return
 	}
 	// 已完成、取消或过期的会话都不应再获得新的上传授权。
-	if session.Status != "uploading" || time.Now().After(session.ExpiresAt) {
+	if session.Status != "uploading" {
 		c.JSON(http.StatusConflict, gin.H{"error": "upload session is not active"})
+		return
+	}
+	if time.Now().After(session.ExpiresAt) {
+		_ = s.terminateUpload(c.Request.Context(), session.ID, session.TenantID, "expired", "upload session expired")
+		c.JSON(http.StatusConflict, gin.H{"error": "upload session has expired"})
 		return
 	}
 	// 分片必须位于会话范围内且不重复，避免无效签名或重复授权。
@@ -172,133 +180,284 @@ func (s *Server) uploadPartURLs(c *gin.Context) {
 	}
 	parts, e := s.presignParts(c.Request.Context(), session, in.PartNumbers)
 	if e != nil {
-		if cancelErr := s.cancelUpload(c.Request.Context(), session, "could not issue upload URLs"); cancelErr != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not cancel object upload"})
-			return
-		}
-		fail(c, e)
+		// 签名服务的瞬时错误不能销毁已有分片；客户端稍后可重新申请 URL。
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not issue upload URLs"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"upload_id": session.ID, "parts": parts})
 }
 
-// 这个函数会将前面上传的分片也直接清除，不能用于视频处理暂停。
-// cancelUpload 中止对象存储 multipart upload，并保留数据库记录供审计与清理。
-// 只允许将仍在上传的会话转换为 cancelled，避免覆盖已完成或其他终态。
-func (s *Server) cancelUpload(ctx context.Context, session model.UploadSession, reason string) error {
-	abortErr := s.uploads.Abort(ctx, session.ObjectKey, session.UploadID)
-	stateErr := s.db.Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&model.UploadSession{}).
-			Where("id = ? AND tenant_id = ? AND status = ?", session.ID, session.TenantID, "uploading").
-			Update("status", "cancelled")
-		if result.Error != nil {
-			return result.Error
+// getUploadStatus 每次直接查询 MinIO，客户端内存不参与恢复正确性。
+func (s *Server) getUploadStatus(c *gin.Context) {
+	var session model.UploadSession
+	if err := s.db.Where("id = ? AND tenant_id = ?", c.Param("id"), auth.UserID(c)).First(&session).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "upload session not found"})
+		return
+	}
+	if session.Status != "uploading" {
+		c.JSON(http.StatusConflict, gin.H{"error": "upload session is not active"})
+		return
+	}
+	if time.Now().After(session.ExpiresAt) {
+		_ = s.terminateUpload(c.Request.Context(), session.ID, session.TenantID, "expired", "upload session expired")
+		c.JSON(http.StatusConflict, gin.H{"error": "upload session has expired"})
+		return
+	}
+	parts, err := s.uploads.ListParts(c.Request.Context(), session.ObjectKey, session.UploadID)
+	if err != nil {
+		if errors.Is(err, storage.ErrMultipartUploadNotFound) {
+			size, exists, statErr := s.uploads.ObjectSize(c.Request.Context(), session.ObjectKey)
+			if statErr == nil && exists && size == session.FileSize {
+				// 对象已完成但数据库尚未收敛时，客户端只需重试完成接口，不能重新上传分片。
+				response := uploadSessionResponse(session, nil, nil)
+				response["object_completed"] = true
+				response["uploaded_bytes"] = session.FileSize
+				response["progress"] = 100
+				c.JSON(http.StatusOK, response)
+				return
+			}
 		}
-		if result.RowsAffected != 1 {
-			return fmt.Errorf("upload session is not active")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "could not query uploaded parts"})
+		return
+	}
+	validParts, _ := validUploadedParts(session, parts)
+	c.JSON(http.StatusOK, uploadSessionResponse(session, validParts, nil))
+}
+
+// cancelUploadSession 只用于用户明确取消；暂停仅中止浏览器 PUT，不能调用此接口。
+func (s *Server) cancelUploadSession(c *gin.Context) {
+	err := s.terminateUpload(c.Request.Context(), c.Param("id"), auth.UserID(c), "cancelled", "upload cancelled by user")
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "upload session not found"})
+		case errors.Is(err, errUploadSessionNotActive):
+			c.JSON(http.StatusConflict, gin.H{"error": "upload session is not active"})
+		default:
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not cancel object upload"})
+		}
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// terminateUpload 在数据库行锁内中止 MinIO 会话，保证取消不会与完成操作并发穿透。
+func (s *Server) terminateUpload(ctx context.Context, sessionID, tenantID, terminalStatus, reason string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var session model.UploadSession
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", sessionID, tenantID).First(&session).Error; err != nil {
+			return err
+		}
+		if session.Status == terminalStatus {
+			return nil
+		}
+		if session.Status != "uploading" {
+			return errUploadSessionNotActive
+		}
+		if err := s.uploads.Abort(ctx, session.ObjectKey, session.UploadID); err != nil {
+			return err
+		}
+		if err := tx.Model(&session).Update("status", terminalStatus).Error; err != nil {
+			return err
 		}
 		return tx.Model(&model.Video{}).
 			Where("id = ? AND tenant_id = ?", session.VideoID, session.TenantID).
-			Updates(map[string]any{
-				"status":        "failed",
-				"error_message": reason,
-			}).Error
+			Updates(map[string]any{"status": model.VideoStatusFailed, "error_message": reason}).Error
 	})
-	if stateErr != nil {
-		return stateErr
+}
+
+// RunUploadCleanup 定期中止过期会话；失败会保留 uploading 状态，下一轮继续重试清理。
+func (s *Server) RunUploadCleanup(ctx context.Context, interval time.Duration) {
+	cleanup := func() {
+		if count, err := s.cleanupExpiredUploads(ctx, 100); err != nil {
+			log.Printf("cleanup expired uploads: %v", err)
+		} else if count > 0 {
+			log.Printf("cleaned up %d expired uploads", count)
+		}
 	}
-	return abortErr
+	cleanup()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanup()
+		}
+	}
+}
+
+func (s *Server) cleanupExpiredUploads(ctx context.Context, limit int) (int, error) {
+	var sessions []model.UploadSession
+	if err := s.db.WithContext(ctx).
+		Where("status = ? AND expires_at <= ?", "uploading", time.Now()).
+		Order("expires_at").Limit(limit).Find(&sessions).Error; err != nil {
+		return 0, err
+	}
+	cleaned := 0
+	for _, session := range sessions {
+		if err := s.terminateUpload(ctx, session.ID, session.TenantID, "expired", "upload session expired"); err != nil {
+			if ctx.Err() != nil {
+				return cleaned, ctx.Err()
+			}
+			log.Printf("cleanup expired upload %s: %v", session.ID, err)
+			continue
+		}
+		cleaned++
+	}
+	return cleaned, nil
 }
 
 // completeUpload 将 MinIO 中的全部已上传分片提交为最终对象，并创建视频处理任务。
 func (s *Server) completeUpload(c *gin.Context) {
-	var in completeUploadRequest
-	if c.ShouldBindJSON(&in) != nil {
-		bad(c, "parts with part_number and etag are required")
-		return
-	}
-
-	var session model.UploadSession
-	if e := s.db.Where("id = ? AND tenant_id = ?", c.Param("id"), auth.UserID(c)).First(&session).Error; e != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "upload session not found"})
-		return
-	}
-	if session.Status != "uploading" || time.Now().After(session.ExpiresAt) {
-		c.JSON(http.StatusConflict, gin.H{"error": "upload session is not active"})
-		return
-	}
-	if len(in.Parts) != session.PartCount {
-		bad(c, "all upload parts must be completed exactly once")
-		return
-	}
-
-	// S3 CompleteMultipartUpload 要求分片按编号有序，并且不允许缺片或重复。
-	parts := make([]storage.CompletedPart, session.PartCount)
-	seen := make(map[int]struct{}, session.PartCount)
-	for _, part := range in.Parts {
-		if part.PartNumber < 1 || part.PartNumber > session.PartCount {
-			bad(c, "part number is outside the upload range")
-			return
-		}
-		if _, duplicate := seen[part.PartNumber]; duplicate {
-			bad(c, "parts must not contain duplicates")
-			return
-		}
-		etag := strings.Trim(strings.TrimSpace(part.ETag), "\"")
-		if etag == "" {
-			bad(c, "part etag must not be empty")
-			return
-		}
-		seen[part.PartNumber] = struct{}{}
-		parts[part.PartNumber-1] = storage.CompletedPart{PartNumber: part.PartNumber, ETag: etag}
-	}
-
-	if e := s.uploads.Complete(c.Request.Context(), session.ObjectKey, session.UploadID, parts); e != nil {
-		_ = s.cancelUpload(c.Request.Context(), session, "could not complete object upload")
-		c.JSON(http.StatusBadGateway, gin.H{"error": "could not complete object upload"})
-		return
-	}
-
-	// 直传对象已完成，Worker 可直接读取完整视频，因此从 ASR 与 Vision 两个阶段并行开始。
+	tenantID := auth.UserID(c)
+	alreadyCompleted := false
 	var video model.Video
-	jobs := []model.ProcessingJob{
-		{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: model.TaskASR, Status: model.JobStatusPending, Attempt: 1},
-		{TenantID: auth.UserID(c), VideoID: session.VideoID, TaskType: model.TaskVision, Status: model.JobStatusPending, Attempt: 1},
-	}
-	if e := s.db.Transaction(func(tx *gorm.DB) error {
-		if e := tx.Where("id = ? AND tenant_id = ?", session.ID, auth.UserID(c)).First(&session).Error; e != nil {
-			return e
+	var firstJob model.ProcessingJob
+	err := s.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		var session model.UploadSession
+		// 行锁覆盖查询分片、完成对象和写入任务，重复完成请求只能串行收敛一次。
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", c.Param("id"), tenantID).First(&session).Error; err != nil {
+			return err
 		}
-		if session.Status != "uploading" {
-			return fmt.Errorf("upload session is not active")
+		if session.Status == "completed" {
+			alreadyCompleted = true
+			if err := tx.Where("id = ? AND tenant_id = ?", session.VideoID, tenantID).First(&video).Error; err != nil {
+				return err
+			}
+			return tx.Where("video_id = ? AND task_type = ?", session.VideoID, model.TaskASR).First(&firstJob).Error
 		}
-		if e := tx.Where("id = ? AND tenant_id = ?", session.VideoID, auth.UserID(c)).First(&video).Error; e != nil {
-			return e
+		if session.Status != "uploading" || time.Now().After(session.ExpiresAt) {
+			return errUploadSessionNotActive
 		}
-		if e := tx.Model(&session).Update("status", "completed").Error; e != nil {
-			return e
+
+		uploaded, err := s.uploads.ListParts(c.Request.Context(), session.ObjectKey, session.UploadID)
+		if err != nil {
+			if !errors.Is(err, storage.ErrMultipartUploadNotFound) {
+				return fmt.Errorf("list uploaded parts: %w", err)
+			}
+			// MinIO 完成成功但数据库事务回滚时 upload ID 已消失；完整最终对象可安全重放数据库提交。
+			size, exists, statErr := s.uploads.ObjectSize(c.Request.Context(), session.ObjectKey)
+			if statErr != nil {
+				return fmt.Errorf("stat completed upload object: %w", statErr)
+			}
+			if !exists || size != session.FileSize {
+				return fmt.Errorf("multipart upload disappeared before completion")
+			}
+		} else {
+			parts, _ := validUploadedParts(session, uploaded)
+			if len(parts) != session.PartCount {
+				return errUploadPartsIncomplete
+			}
+			completed := make([]storage.CompletedPart, len(parts))
+			for i, part := range parts {
+				completed[i] = storage.CompletedPart{PartNumber: part.PartNumber, ETag: part.ETag}
+			}
+			if err := s.uploads.Complete(c.Request.Context(), session.ObjectKey, session.UploadID, completed); err != nil {
+				return fmt.Errorf("complete object upload: %w", err)
+			}
 		}
-		if e := tx.Model(&video).Updates(map[string]any{"status": model.VideoStatusProcessing, "error_message": ""}).Error; e != nil {
-			return e
+
+		if err := tx.Where("id = ? AND tenant_id = ?", session.VideoID, tenantID).First(&video).Error; err != nil {
+			return err
 		}
-		if e := tx.Create(&jobs).Error; e != nil {
-			return e
+		if err := tx.Model(&session).Update("status", "completed").Error; err != nil {
+			return err
 		}
+		if err := tx.Model(&video).Updates(map[string]any{"status": model.VideoStatusProcessing, "error_message": ""}).Error; err != nil {
+			return err
+		}
+		jobs := []model.ProcessingJob{
+			{TenantID: tenantID, VideoID: session.VideoID, TaskType: model.TaskASR, Status: model.JobStatusPending, Attempt: 1},
+			{TenantID: tenantID, VideoID: session.VideoID, TaskType: model.TaskVision, Status: model.JobStatusPending, Attempt: 1},
+		}
+		if err := tx.Create(&jobs).Error; err != nil {
+			return err
+		}
+		firstJob = jobs[0]
 		// 两个任务及其通知在同一事务提交，RabbitMQ 暂时不可用也不会造成漏派发。
 		for _, job := range jobs {
-			if e := s.outbox.EnqueueJob(tx, job, queue.UploadMethodLocalDirect, time.Now().UTC()); e != nil {
-				return e
+			if err := s.outbox.EnqueueJob(tx, job, queue.UploadMethodLocalDirect, time.Now().UTC()); err != nil {
+				return err
 			}
 		}
 		return nil
-	}); e != nil {
-		fail(c, e)
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "upload session not found"})
+		case errors.Is(err, errUploadSessionNotActive):
+			c.JSON(http.StatusConflict, gin.H{"error": "upload session is not active"})
+		case errors.Is(err, errUploadPartsIncomplete):
+			c.JSON(http.StatusConflict, gin.H{"error": "not all upload parts are present in object storage"})
+		default:
+			c.JSON(http.StatusBadGateway, gin.H{"error": "could not complete object upload"})
+		}
 		return
 	}
 
 	video.Status = model.VideoStatusProcessing
 	video.ErrorMessage = ""
-	c.JSON(http.StatusCreated, gin.H{"video": video, "job_id": jobs[0].ID})
+	status := http.StatusCreated
+	if alreadyCompleted {
+		status = http.StatusOK
+	}
+	c.JSON(status, gin.H{"video": video, "job_id": firstJob.ID})
+}
+
+func validUploadedParts(session model.UploadSession, uploaded []storage.UploadedPart) ([]storage.UploadedPart, int64) {
+	byNumber := make([]*storage.UploadedPart, session.PartCount)
+	for i := range uploaded {
+		part := uploaded[i]
+		if part.PartNumber < 1 || part.PartNumber > session.PartCount || part.ETag == "" {
+			continue
+		}
+		expectedSize := session.PartSize
+		if part.PartNumber == session.PartCount {
+			expectedSize = session.FileSize - int64(session.PartCount-1)*session.PartSize
+		}
+		if part.Size != expectedSize || byNumber[part.PartNumber-1] != nil {
+			continue
+		}
+		partCopy := part
+		byNumber[part.PartNumber-1] = &partCopy
+	}
+	parts := make([]storage.UploadedPart, 0, len(uploaded))
+	var uploadedBytes int64
+	for _, part := range byNumber {
+		if part == nil {
+			continue
+		}
+		parts = append(parts, *part)
+		uploadedBytes += part.Size
+	}
+	return parts, uploadedBytes
+}
+
+func uploadSessionResponse(session model.UploadSession, completed []storage.UploadedPart, signed []uploadPartURL) gin.H {
+	var uploadedBytes int64
+	for _, part := range completed {
+		uploadedBytes += part.Size
+	}
+	progress := 0
+	if session.FileSize > 0 {
+		progress = int(math.Round(float64(uploadedBytes) / float64(session.FileSize) * 100))
+	}
+	response := gin.H{
+		"upload_id": session.ID, "video_id": session.VideoID, "status": session.Status,
+		"filename": session.Filename, "file_size": session.FileSize,
+		"file_last_modified_ms": session.FileLastModifiedMS, "file_fingerprint": session.FileFingerprint,
+		"part_size": session.PartSize, "part_count": session.PartCount, "expires_at": session.ExpiresAt,
+		"completed_parts": completed, "uploaded_bytes": uploadedBytes, "progress": progress,
+	}
+	if signed != nil {
+		response["parts"] = signed
+	}
+	return response
 }
 
 func (s *Server) presignParts(ctx context.Context, session model.UploadSession, numbers []int) ([]uploadPartURL, error) {
@@ -342,8 +501,10 @@ func (s *Server) Router() *gin.Engine {
 	p.Use(s.auth.Middleware())
 	p.POST("/videos", s.createVideo)
 	p.POST("/uploads", s.createUpload)
+	p.GET("/uploads/:id", s.getUploadStatus)
 	p.POST("/uploads/:id/parts", s.uploadPartURLs)
 	p.POST("/uploads/:id/complete", s.completeUpload)
+	p.DELETE("/uploads/:id", s.cancelUploadSession)
 	p.GET("/videos/:id", s.getVideo) // 这里的id是指视频id
 	p.GET("/videos/:id/status", s.videoStatus)
 	p.POST("/videos/:id/pause", s.pauseVideo)

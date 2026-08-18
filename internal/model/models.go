@@ -155,18 +155,21 @@ type SegmentEmbedding struct {
 }
 
 type UploadSession struct {
-	ID        string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	TenantID  string    `gorm:"type:uuid;not null;index" json:"-"`
-	VideoID   string    `gorm:"type:uuid;not null;index" json:"video_id"`
-	UploadID  string    `gorm:"not null" json:"-"`
-	ObjectKey string    `gorm:"not null" json:"object_key"`
-	PartSize  int64     `gorm:"not null" json:"part_size"`
-	FileSize  int64     `gorm:"not null" json:"file_size"`
-	PartCount int       `gorm:"not null" json:"part_count"`
-	Status    string    `gorm:"not null" json:"status"`
-	ExpiresAt time.Time `gorm:"not null" json:"expires_at"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID                 string    `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID           string    `gorm:"type:uuid;not null;index" json:"-"`
+	VideoID            string    `gorm:"type:uuid;not null;index" json:"video_id"`
+	UploadID           string    `gorm:"not null" json:"-"`
+	ObjectKey          string    `gorm:"not null" json:"-"`
+	Filename           string    `gorm:"not null" json:"filename"`
+	FileLastModifiedMS int64     `gorm:"not null" json:"file_last_modified_ms"`
+	FileFingerprint    string    `gorm:"not null" json:"file_fingerprint"`
+	PartSize           int64     `gorm:"not null" json:"part_size"`
+	FileSize           int64     `gorm:"not null" json:"file_size"`
+	PartCount          int       `gorm:"not null" json:"part_count"`
+	Status             string    `gorm:"not null" json:"status"`
+	ExpiresAt          time.Time `gorm:"not null" json:"expires_at"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // VideoSummary 保存一个视频唯一的最终 LLM 摘要。

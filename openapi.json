@@ -112,22 +112,55 @@
           "job_id": { "type": "string", "format": "uuid", "description": "后台处理任务 ID，可用于追踪进度" }
         }
       },
-      "CompletedUploadPart": {
+      "CreateUploadRequest": {
         "type": "object",
-        "required": ["part_number", "etag"],
+        "required": ["filename", "file_size", "file_last_modified_ms", "file_fingerprint"],
         "properties": {
-          "part_number": { "type": "integer", "minimum": 1 },
-          "etag": { "type": "string", "description": "对象存储 PUT 响应头返回的 ETag" }
+          "filename": { "type": "string", "maxLength": 512 },
+          "content_type": { "type": "string", "maxLength": 255 },
+          "file_size": { "type": "integer", "format": "int64", "minimum": 1 },
+          "file_last_modified_ms": { "type": "integer", "format": "int64", "minimum": 1 },
+          "file_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "文件首尾采样内容的 SHA-256 指纹" },
+          "title": { "type": "string", "maxLength": 512 }
         }
       },
-      "CompleteUploadRequest": {
+      "UploadedPart": {
         "type": "object",
-        "required": ["parts"],
         "properties": {
+          "part_number": { "type": "integer", "minimum": 1 },
+          "etag": { "type": "string", "description": "MinIO 返回的权威 ETag" },
+          "size": { "type": "integer", "format": "int64" },
+          "last_modified": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UploadSessionResponse": {
+        "type": "object",
+        "properties": {
+          "upload_id": { "type": "string", "format": "uuid" },
+          "video_id": { "type": "string", "format": "uuid" },
+          "status": { "type": "string", "enum": ["uploading"] },
+          "filename": { "type": "string" },
+          "file_size": { "type": "integer", "format": "int64" },
+          "file_last_modified_ms": { "type": "integer", "format": "int64" },
+          "file_fingerprint": { "type": "string" },
+          "part_size": { "type": "integer", "format": "int64" },
+          "part_count": { "type": "integer" },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "completed_parts": { "type": "array", "items": { "$ref": "#/components/schemas/UploadedPart" } },
+          "uploaded_bytes": { "type": "integer", "format": "int64" },
+          "progress": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "object_completed": { "type": "boolean", "description": "最终对象已存在但数据库完成事务仍需重试" },
           "parts": {
             "type": "array",
-            "description": "必须包含全部且不重复的分片。",
-            "items": { "$ref": "#/components/schemas/CompletedUploadPart" }
+            "description": "创建会话时返回的首批预签名分片 URL。",
+            "items": {
+              "type": "object",
+              "properties": {
+                "part_number": { "type": "integer" },
+                "url": { "type": "string", "format": "uri" },
+                "expires_at": { "type": "string", "format": "date-time" }
+              }
+            }
           }
         }
       },
@@ -374,11 +407,85 @@
         }
       }
     },
+    "/api/uploads": {
+      "post": {
+        "tags": ["Videos"],
+        "summary": "创建本地文件分片上传会话",
+        "description": "保存文件身份和分片布局，创建 MinIO Multipart Upload，并返回首批预签名 URL。",
+        "operationId": "createUpload",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateUploadRequest" } } }
+        },
+        "responses": {
+          "201": { "description": "上传会话已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionResponse" } } } },
+          "400": { "description": "文件元数据或指纹无效", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "503": { "description": "对象存储暂不可用", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/uploads/{id}": {
+      "get": {
+        "tags": ["Videos"],
+        "summary": "查询可恢复上传状态",
+        "description": "校验租户上传会话后直接调用 MinIO ListObjectParts，返回实际已上传分片和进度。",
+        "operationId": "getUploadStatus",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "上传状态", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UploadSessionResponse" } } } },
+          "404": { "description": "上传会话不存在或不属于当前用户", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "409": { "description": "上传会话已完成、取消或过期", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "无法查询 MinIO 分片", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "delete": {
+        "tags": ["Videos"],
+        "summary": "取消本地分片上传",
+        "description": "仅用于用户明确取消；中止 MinIO Multipart Upload 并保留数据库终态。暂停上传不得调用。",
+        "operationId": "cancelUpload",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "204": { "description": "上传已取消" },
+          "404": { "description": "上传会话不存在或不属于当前用户", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "409": { "description": "上传会话已经进入其他终态", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/uploads/{id}/parts": {
+      "post": {
+        "tags": ["Videos"],
+        "summary": "按需签发分片上传 URL",
+        "operationId": "getUploadPartURLs",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["part_numbers"],
+                "properties": { "part_numbers": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "integer", "minimum": 1 } } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "预签名 URL 已签发" },
+          "400": { "description": "分片编号无效", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "上传会话不存在或不属于当前用户", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "409": { "description": "上传会话不可恢复", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/uploads/{id}/complete": {
       "post": {
         "tags": ["Videos"],
         "summary": "完成本地分片上传并创建处理任务",
-        "description": "客户端上传全部分片后，提交每个分片的 ETag。服务端完成 MinIO Multipart Upload，并在同一事务创建处理任务和 RabbitMQ Outbox 通知。",
+        "description": "服务端重新调用 MinIO ListObjectParts，校验分片编号、大小和权威 ETag 后完成 Multipart Upload，并在数据库事务中创建处理任务和 RabbitMQ Outbox 通知。客户端不提交 ETag。",
         "operationId": "completeUpload",
         "security": [{ "BearerAuth": [] }],
         "parameters": [
@@ -390,14 +497,6 @@
             "schema": { "type": "string", "format": "uuid" }
           }
         ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/CompleteUploadRequest" }
-            }
-          }
-        },
         "responses": {
           "201": {
             "description": "对象上传已完成，处理任务已入队",
@@ -407,24 +506,16 @@
               }
             }
           },
-          "400": {
-            "description": "分片数量、编号或 ETag 无效",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
-          },
           "404": {
             "description": "上传会话不存在或不属于当前用户",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "409": {
-            "description": "上传会话已完成、取消或过期",
+            "description": "分片尚未完整、上传会话已取消或过期",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "502": {
             "description": "对象存储无法完成 multipart upload",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
-          },
-          "503": {
-            "description": "对象已完成但处理任务暂未成功入队",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
         }
