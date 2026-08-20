@@ -2,7 +2,12 @@
 .env
 
 # ── 文档（不纳入版本控制）──
-docs/
+docs/*
+!docs/evaldata/
+!docs/evaldata/**
+
+# 本地视频文件，不纳入版本控制
+/videos/
 
 # ── Go ──
 *.exe
