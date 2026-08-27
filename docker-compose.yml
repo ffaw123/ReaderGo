@@ -25,7 +25,7 @@ services:
     # 空匿名卷启动时由 PostgreSQL 官方入口自动恢复冻结 SQL；停止时可只删除评测临时数据。
     volumes:
       - /var/lib/postgresql/data
-      - ./docs/evaldata/evaluation_database.sql:/docker-entrypoint-initdb.d/001_evaluation_database.sql:ro
+      - ${RETRIEVAL_EVAL_SQL_FILE:-./docs/evaldata/retrieval_tuning_database.sql}:/docker-entrypoint-initdb.d/001_retrieval_database.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U readergo -d readergo_eval"]
       interval: 5s

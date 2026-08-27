@@ -5,9 +5,13 @@ chcp 65001 >nul
 pushd "%~dp0.."
 set "READERGO_EVAL_PROJECT_ROOT=%CD%"
 set "READERGO_EVAL_ENV_FILE=%CD%\.env"
-set "READERGO_EVAL_SQL_FILE=%CD%\docs\evaldata\evaluation_database.sql"
+set "READERGO_EVAL_SQL_FILE=%CD%\docs\evaldata\retrieval_tuning_database.sql"
 set "READERGO_EVAL_RUNTIME_DIR=%TEMP%\ReaderGo"
 set "READERGO_EVAL_PID_FILE=%TEMP%\ReaderGo\eval.pid"
+rem 显式固定调参配套文件，避免根目录 .env 被正式评测配置覆盖。
+set "RETRIEVAL_EVAL_SQL_FILE=./docs/evaldata/retrieval_tuning_database.sql"
+set "RETRIEVAL_EVAL_DATASET=docs/evaldata/retrieval_tuning_questions.jsonl"
+set "RETRIEVAL_EVAL_DATABASE_SNAPSHOT=docs/evaldata/retrieval_tuning_database.sql"
 
 if not exist "%READERGO_EVAL_ENV_FILE%" (
   echo 未找到项目根目录下的 .env 文件。
@@ -21,12 +25,18 @@ if not exist "%READERGO_EVAL_SQL_FILE%" (
   exit /b 1
 )
 
+if not exist "%READERGO_EVAL_PROJECT_ROOT%\docs\evaldata\retrieval_tuning_questions.jsonl" (
+  echo 未找到调参问题集。
+  popd
+  exit /b 1
+)
+
 if not exist "%READERGO_EVAL_RUNTIME_DIR%" mkdir "%READERGO_EVAL_RUNTIME_DIR%"
 
 if exist "%READERGO_EVAL_PID_FILE%" (
   set "EVAL_PID="
   set /p "EVAL_PID="<"%READERGO_EVAL_PID_FILE%"
-  powershell.exe -NoProfile -Command "$p = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $env:EVAL_PID) -ErrorAction SilentlyContinue; if ($null -ne $p -and $p.Name -ieq 'go.exe' -and $p.CommandLine -match 'TestRetrievalOfflineEval') { exit 0 }; exit 1"
+  powershell.exe -NoProfile -Command "$p = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $env:EVAL_PID) -ErrorAction SilentlyContinue; if ($null -ne $p -and $p.Name -ieq 'go.exe' -and $p.CommandLine -match 'TestRetrieval(?:OfflineEval|BM25SourceEval)') { exit 0 }; exit 1"
   if not errorlevel 1 (
     echo 检测到测评任务已在运行，PID=%EVAL_PID%。
     popd
@@ -51,7 +61,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo 正在启动离线评测 PostgreSQL，并自动导入 evaluation_database.sql...
+echo 正在启动离线调参 PostgreSQL，并自动导入 retrieval_tuning_database.sql...
 docker compose --profile eval up -d --wait postgres-eval
 if errorlevel 1 (
   echo 离线测评专用 PostgreSQL 启动失败。

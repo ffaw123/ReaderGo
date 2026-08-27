@@ -37,14 +37,15 @@ const (
 	retrievalEvalRunEnv      = "RUN_RETRIEVAL_EVAL"
 	retrievalEvalDatabaseEnv = "RETRIEVAL_EVAL_DATABASE_URL"
 	retrievalEvalDatasetEnv  = "RETRIEVAL_EVAL_DATASET"
+	retrievalEvalSnapshotEnv = "RETRIEVAL_EVAL_DATABASE_SNAPSHOT"
 	retrievalEvalResultsEnv  = "RETRIEVAL_EVAL_RESULTS"
 
 	// 这些常量是业务检索参数的评测快照。测试代码不引用业务常量，便于独立做消融实验。
 	evalEmbeddingDimensions = 1024
 	evalChannelTopK         = 8
 	evalFinalTopK           = 5
-	evalRRFConstant         = 10.0
-	evalResultSchemaVersion = "retrieval-eval-run-v2"
+	evalFusionRRFConstant   = 10.0
+	evalResultSchemaVersion = "retrieval-eval-run-v4"
 )
 
 var evalLexicalStopTokens = map[string]struct{}{
@@ -76,14 +77,16 @@ type evalAggregate struct {
 
 type evalRRFWeights struct {
 	Dense float64 `json:"dense"`
-	Exact float64 `json:"exact"`
 	BM25  float64 `json:"bm25"`
 }
 
 type evalExperimentSpec struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Weights     evalRRFWeights `json:"weights"`
+	Name             string               `json:"name"`
+	Description      string               `json:"description"`
+	Weights          evalRRFWeights       `json:"weights"`
+	RRFConstant      float64              `json:"rrf_constant"`
+	BM25Source       string               `json:"bm25_source,omitempty"`
+	BM25FieldWeights evalBM25FieldWeights `json:"bm25_field_weights,omitempty"`
 }
 
 type evalChannelCandidateResult struct {
@@ -96,7 +99,6 @@ type evalChannelCandidateResult struct {
 
 type evalChannelResults struct {
 	Dense []evalChannelCandidateResult `json:"dense_top_8"`
-	Exact []evalChannelCandidateResult `json:"exact_top_8"`
 	BM25  []evalChannelCandidateResult `json:"bm25_top_8"`
 }
 
@@ -107,12 +109,9 @@ type evalCandidateResult struct {
 	EndMS             int64   `json:"end_ms"`
 	DenseRank         int     `json:"dense_rank"`
 	DenseScore        float64 `json:"dense_score"`
-	ExactRank         int     `json:"exact_rank"`
-	ExactScore        float64 `json:"exact_score"`
 	BM25Rank          int     `json:"bm25_rank"`
 	BM25Score         float64 `json:"bm25_score"`
 	DenseContribution float64 `json:"dense_rrf_contribution"`
-	ExactContribution float64 `json:"exact_rrf_contribution"`
 	BM25Contribution  float64 `json:"bm25_rrf_contribution"`
 	RRFScore          float64 `json:"rrf_score"`
 }
@@ -137,12 +136,15 @@ type evalQuestionResult struct {
 }
 
 type evalExperimentSummary struct {
-	Name                     string         `json:"name"`
-	Description              string         `json:"description"`
-	Weights                  evalRRFWeights `json:"weights"`
-	Metrics                  evalMetrics    `json:"metrics"`
-	RecallDeltaVsDensePoints float64        `json:"recall_delta_vs_dense_points"`
-	MRRDeltaVsDensePoints    float64        `json:"mrr_delta_vs_dense_points"`
+	Name                     string               `json:"name"`
+	Description              string               `json:"description"`
+	Weights                  evalRRFWeights       `json:"weights"`
+	RRFConstant              float64              `json:"rrf_constant"`
+	BM25Source               string               `json:"bm25_source,omitempty"`
+	BM25FieldWeights         evalBM25FieldWeights `json:"bm25_field_weights,omitempty"`
+	Metrics                  evalMetrics          `json:"metrics"`
+	RecallDeltaVsDensePoints float64              `json:"recall_delta_vs_dense_points"`
+	MRRDeltaVsDensePoints    float64              `json:"mrr_delta_vs_dense_points"`
 }
 
 type evalRunConfig struct {
@@ -155,7 +157,6 @@ type evalRunConfig struct {
 	MinSimilarity          float64 `json:"min_similarity"`
 	ChannelTopK            int     `json:"channel_top_k"`
 	FinalTopK              int     `json:"final_top_k"`
-	RRFConstant            float64 `json:"rrf_constant"`
 }
 
 type evalRunRecord struct {
@@ -202,12 +203,9 @@ type evalCandidate struct {
 	Segment           model.VideoSegment
 	DenseRank         int
 	DenseScore        float64
-	ExactRank         int
-	ExactScore        float64
 	BM25Rank          int
 	BM25Score         float64
 	DenseContribution float64
-	ExactContribution float64
 	BM25Contribution  float64
 	RRFScore          float64
 }
@@ -215,7 +213,6 @@ type evalCandidate struct {
 type evalRawChannels struct {
 	Segments []model.VideoSegment
 	Dense    []evalDenseHit
-	Exact    []evalWindowHit
 	BM25     []evalWindowHit
 }
 
@@ -234,17 +231,27 @@ func (a evalAggregate) Metrics() evalMetrics {
 
 func evalExperimentSpecs() []evalExperimentSpec {
 	return []evalExperimentSpec{
-		{Name: "dense_only", Description: "仅使用 Dense Vector", Weights: evalRRFWeights{Dense: 1}},
-		{Name: "exact_only", Description: "仅使用 Exact Match", Weights: evalRRFWeights{Exact: 1}},
-		{Name: "bm25_only", Description: "仅使用 BM25", Weights: evalRRFWeights{BM25: 1}},
-		{Name: "exact_bm25_equal", Description: "仅词法双路，检验 Exact 与 BM25 的相关性", Weights: evalRRFWeights{Exact: 1, BM25: 1}},
-		{Name: "dense_exact_equal", Description: "Dense + Exact 等权消融", Weights: evalRRFWeights{Dense: 1, Exact: 1}},
-		{Name: "dense_bm25_equal", Description: "Dense + BM25 等权消融", Weights: evalRRFWeights{Dense: 1, BM25: 1}},
-		{Name: "dense_bm25_weighted", Description: "Dense + 低权重 BM25，用于隔离 Exact 的增量价值", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}},
-		{Name: "hybrid_equal", Description: "三路等权业务逻辑基线", Weights: evalRRFWeights{Dense: 1, Exact: 1, BM25: 1}},
-		{Name: "hybrid_weighted", Description: "Dense 主导，降低两个相关词法通道的总投票权", Weights: evalRRFWeights{Dense: 1, Exact: 0.25, BM25: 0.5}},
-		{Name: "hybrid_dense_heavy", Description: "更强 Dense 偏置的权重敏感性实验", Weights: evalRRFWeights{Dense: 1, Exact: 0.1, BM25: 0.25}},
+		{Name: "dense_only", Description: "E1 仅使用 Dense Vector 的主基线", Weights: evalRRFWeights{Dense: 1}},
+		{Name: "bm25_only", Description: "E2 仅使用 BM25 的词法检索基线", Weights: evalRRFWeights{BM25: 1}, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_equal", Description: "E3 Dense + BM25 等权融合", Weights: evalRRFWeights{Dense: 1, BM25: 1}, RRFConstant: evalFusionRRFConstant, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_0_5", Description: "E4 中等 BM25 权重", Weights: evalRRFWeights{Dense: 1, BM25: 0.5}, RRFConstant: evalFusionRRFConstant, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_0_25", Description: "E5 当前最优 BM25 权重候选", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}, RRFConstant: evalFusionRRFConstant, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_0_1", Description: "E6 弱 BM25 补充", Weights: evalRRFWeights{Dense: 1, BM25: 0.1}, RRFConstant: evalFusionRRFConstant, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_k_5", Description: "E7 固定最优权重，更强调前排排名", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}, RRFConstant: 5, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_k_10", Description: "E8 固定最优权重的当前 k 基线", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}, RRFConstant: 10, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_k_30", Description: "E9 固定最优权重，中等平滑", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}, RRFConstant: 30, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_k_60", Description: "E10 固定最优权重，经典 RRF 参数", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}, RRFConstant: 60, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_raw", Description: "E11 Dense + 当前 ASR/OCR BM25", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}, RRFConstant: 10, BM25Source: "raw", BM25FieldWeights: evalBM25FieldWeights{Transcript: 1, OCR: 1}},
+		{Name: "dense_bm25_retrieval", Description: "E12 Dense + retrieval_text BM25", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}, RRFConstant: 10, BM25Source: "retrieval", BM25FieldWeights: evalBM25FieldWeights{Retrieval: 1}},
+		{Name: "dense_bm25_hybrid_fields", Description: "E13 Dense + 加权字段 BM25", Weights: evalRRFWeights{Dense: 1, BM25: 0.25}, RRFConstant: 10, BM25Source: "hybrid", BM25FieldWeights: evalBM25FieldWeights{Retrieval: 1, Transcript: 0.25, OCR: 0.25}},
 	}
+}
+
+func evalRRFConstantLabel(value float64) string {
+	if value <= 0 {
+		return "-"
+	}
+	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
 func TestRetrievalOfflineEval(t *testing.T) {
@@ -270,7 +277,7 @@ func TestRetrievalOfflineEval(t *testing.T) {
 		t.Fatalf("评测数据库配置无效: %v", err)
 	}
 
-	datasetPath := retrievalEvalPath(repoRoot, retrievalEvalDatasetEnv, filepath.Join("docs", "evaldata", "retrieval_questions.jsonl"))
+	datasetPath := retrievalEvalPath(repoRoot, retrievalEvalDatasetEnv, filepath.Join("docs", "evaldata", "retrieval_tuning_questions.jsonl"))
 	resultsPath := retrievalEvalPath(repoRoot, retrievalEvalResultsEnv, filepath.Join("docs", "evaldata", "retrieval_eval_runs.jsonl"))
 	questions, err := loadEvalQuestions(datasetPath)
 	if err != nil {
@@ -280,7 +287,8 @@ func TestRetrievalOfflineEval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("计算评测集哈希: %v", err)
 	}
-	databaseSnapshotPath := filepath.Join(repoRoot, "docs", "evaldata", "evaluation_database.sql")
+	// 正式评测与调参使用不同冻结快照，运行记录必须计算本次实际快照的哈希。
+	databaseSnapshotPath := retrievalEvalPath(repoRoot, retrievalEvalSnapshotEnv, filepath.Join("docs", "evaldata", "retrieval_tuning_database.sql"))
 	databaseSnapshotHash, err := evalFileSHA256(databaseSnapshotPath)
 	if err != nil {
 		t.Fatalf("计算评测数据库快照哈希: %v", err)
@@ -310,7 +318,7 @@ func TestRetrievalOfflineEval(t *testing.T) {
 	questionResults := make([]evalQuestionResult, 0, len(questions))
 	ctx := context.Background()
 	for index, question := range questions {
-		// 每题只请求一次 Embedding，所有消融实验共享完全相同的三路原始候选。
+		// 每题只请求一次 Embedding，全部实验共享完全相同的 Dense 结果和数据库窗口。
 		channels, err := runEvalChannels(ctx, retriever, question)
 		if err != nil {
 			t.Fatalf("问题 %s 执行测试专用检索: %v", question.QuestionID, err)
@@ -321,7 +329,8 @@ func TestRetrievalOfflineEval(t *testing.T) {
 		}
 		experimentResults := make([]evalQuestionExperimentResult, 0, len(specs))
 		for experimentIndex, spec := range specs {
-			candidates := evalFuseRetrievalChannels(channels.Segments, channels.Dense, channels.Exact, channels.BM25, spec.Weights)
+			bm25Hits := evalBM25HitsForExperiment(question.Question, channels, spec)
+			candidates := evalFuseRetrievalChannels(channels.Segments, channels.Dense, bm25Hits, spec.Weights, spec.RRFConstant)
 			metrics := measureEvidenceGroupsAt5(candidates, goldGroups)
 			aggregates[experimentIndex].Add(metrics)
 			experimentResults = append(experimentResults, evalQuestionExperimentResult{Name: spec.Name, Metrics: metrics, Candidates: evalCandidateResults(candidates)})
@@ -331,8 +340,9 @@ func TestRetrievalOfflineEval(t *testing.T) {
 			VideoTitle: question.VideoTitle, Question: question.Question, Answer: question.Answer, Tags: question.Tags,
 			GoldEvidenceGroups: question.GoldEvidenceGroups, Channels: evalChannelResult(channels), Experiments: experimentResults,
 		})
-		weighted := experimentResults[len(experimentResults)-2].Metrics
-		t.Logf("进度 %d/%d question_id=%s weighted_recall=%.2f weighted_rr=%.2f", index+1, len(questions), question.QuestionID, weighted.RecallAt5, weighted.RRAt5)
+		// E8 是最优权重在 k=10 时的第二阶段基线，进度日志固定展示该组。
+		candidate := experimentResults[7].Metrics
+		t.Logf("进度 %d/%d question_id=%s e8_recall=%.2f e8_rr=%.2f", index+1, len(questions), question.QuestionID, candidate.RecallAt5, candidate.RRAt5)
 	}
 
 	summaries := evalExperimentSummaries(specs, aggregates)
@@ -346,7 +356,7 @@ func TestRetrievalOfflineEval(t *testing.T) {
 			DatasetPath: evalRelativePath(repoRoot, datasetPath), DatasetSHA256: datasetHash,
 			DatabaseSnapshotPath: evalRelativePath(repoRoot, databaseSnapshotPath), DatabaseSnapshotSHA256: databaseSnapshotHash,
 			DatabaseIdentity: databaseIdentity(mustParseEvalDatabaseURL(evalDatabaseURL)), EmbeddingModel: cfg.RAGEmbeddingModel,
-			MinSimilarity: cfg.ChatRAGMinSimilarity, ChannelTopK: evalChannelTopK, FinalTopK: evalFinalTopK, RRFConstant: evalRRFConstant,
+			MinSimilarity: cfg.ChatRAGMinSimilarity, ChannelTopK: evalChannelTopK, FinalTopK: evalFinalTopK,
 		},
 		Experiments: summaries,
 		Questions:   questionResults,
@@ -362,10 +372,11 @@ func TestRetrievalOfflineEval(t *testing.T) {
 	}
 	t.Logf("questions=%d run_id=%s", len(questions), run.RunID)
 	for _, summary := range summaries {
-		t.Logf("%-24s Recall@5=%.4f MRR@5=%.4f delta=%+.2f/%+.2f points weights=%.2f/%.2f/%.2f",
+		t.Logf("%-28s Recall@5=%.4f MRR@5=%.4f delta=%+.2f/%+.2f points weights=%.2f/%.2f k=%s bm25=%s fields=%.2f/%.2f/%.2f",
 			summary.Name, summary.Metrics.RecallAt5, summary.Metrics.RRAt5,
 			summary.RecallDeltaVsDensePoints, summary.MRRDeltaVsDensePoints,
-			summary.Weights.Dense, summary.Weights.Exact, summary.Weights.BM25)
+			summary.Weights.Dense, summary.Weights.BM25, evalRRFConstantLabel(summary.RRFConstant), evalBM25SourceLabel(summary.BM25Source),
+			summary.BM25FieldWeights.Retrieval, summary.BM25FieldWeights.Transcript, summary.BM25FieldWeights.OCR)
 	}
 	t.Logf("完整运行记录已追加至 %s", resultsPath)
 	t.Logf("本次逐题详细结果已保存至 %s", detailPath)
@@ -409,9 +420,32 @@ func runEvalChannels(ctx context.Context, retriever *evalRetriever, question eva
 	if err != nil {
 		return evalRawChannels{}, err
 	}
-	exact := evalRankTextWindows(segments, evalRankExact(question.Question, documents, 0), evalChannelTopK)
 	bm25 := evalRankTextWindows(segments, evalRankBM25(question.Question, documents, 0), evalChannelTopK)
-	return evalRawChannels{Segments: segments, Dense: dense, Exact: exact, BM25: bm25}, nil
+	return evalRawChannels{Segments: segments, Dense: dense, BM25: bm25}, nil
+}
+
+func evalBM25HitsForExperiment(query string, channels evalRawChannels, spec evalExperimentSpec) []evalWindowHit {
+	if spec.Weights.BM25 <= 0 {
+		return nil
+	}
+	switch spec.BM25Source {
+	case "", "raw":
+		return channels.BM25
+	case "retrieval":
+		return evalRankBM25Fields(query, channels.Segments, spec.BM25FieldWeights, false, evalChannelTopK)
+	case "hybrid":
+		// 混合字段组使用与独立 BM25 消融相同的查询相关 ASR/OCR 句段过滤。
+		return evalRankBM25Fields(query, channels.Segments, spec.BM25FieldWeights, true, evalChannelTopK)
+	default:
+		panic("未知的 BM25 文本来源: " + spec.BM25Source)
+	}
+}
+
+func evalBM25SourceLabel(source string) string {
+	if source == "" {
+		return "-"
+	}
+	return source
 }
 
 func (r *evalRetriever) loadSegments(ctx context.Context, tenantID, videoID string) ([]model.VideoSegment, error) {
@@ -550,36 +584,6 @@ func evalRankBM25(query string, documents []evalTextDocument, limit int) []evalR
 	return evalSortRankedTexts(ranked, limit)
 }
 
-func evalRankExact(query string, documents []evalTextDocument, limit int) []evalRankedText {
-	terms := evalExactTerms(query)
-	if len(terms) == 0 {
-		return nil
-	}
-	normalizedQuery := strings.ToLower(strings.TrimSpace(query))
-	ranked := make([]evalRankedText, 0, len(documents))
-	for _, document := range documents {
-		text := strings.ToLower(document.Text)
-		var score float64
-		if len([]rune(normalizedQuery)) >= 2 && strings.Contains(text, normalizedQuery) {
-			score += 20
-		}
-		for _, term := range terms {
-			if !strings.Contains(text, term) {
-				continue
-			}
-			weight := 1.0
-			if evalIsHighValueExactTerm(term) {
-				weight = 5
-			}
-			score += weight * (1 + math.Log(float64(strings.Count(text, term))))
-		}
-		if score > 0 {
-			ranked = append(ranked, evalRankedText{Document: document, Score: score})
-		}
-	}
-	return evalSortRankedTexts(ranked, limit)
-}
-
 func evalSortRankedTexts(ranked []evalRankedText, limit int) []evalRankedText {
 	sort.SliceStable(ranked, func(i, j int) bool {
 		if ranked[i].Score == ranked[j].Score {
@@ -594,23 +598,6 @@ func evalSortRankedTexts(ranked []evalRankedText, limit int) []evalRankedText {
 		return ranked[:limit]
 	}
 	return ranked
-}
-
-func evalExactTerms(query string) []string {
-	all := evalLexicalTokens(query)
-	seen := make(map[string]struct{}, len(all))
-	terms := make([]string, 0, len(all))
-	for _, token := range all {
-		if _, stop := evalLexicalStopTokens[token]; stop {
-			continue
-		}
-		if _, ok := seen[token]; ok {
-			continue
-		}
-		seen[token] = struct{}{}
-		terms = append(terms, token)
-	}
-	return terms
 }
 
 func evalLexicalTokens(input string) []string {
@@ -654,15 +641,6 @@ func evalLexicalTokens(input string) []string {
 	return tokens
 }
 
-func evalIsHighValueExactTerm(term string) bool {
-	for _, current := range term {
-		if unicode.IsDigit(current) || (current <= unicode.MaxASCII && (unicode.IsLetter(current) || strings.ContainsRune("._:+#/%-", current))) {
-			return true
-		}
-	}
-	return false
-}
-
 func evalRankTextWindows(segments []model.VideoSegment, hits []evalRankedText, limit int) []evalWindowHit {
 	bestScores := make(map[string]float64)
 	for _, hit := range hits {
@@ -701,7 +679,10 @@ func evalRankTextWindows(segments []model.VideoSegment, hits []evalRankedText, l
 	return results
 }
 
-func evalFuseRetrievalChannels(segments []model.VideoSegment, dense []evalDenseHit, exact, bm25 []evalWindowHit, weights evalRRFWeights) []evalCandidate {
+func evalFuseRetrievalChannels(segments []model.VideoSegment, dense []evalDenseHit, bm25 []evalWindowHit, weights evalRRFWeights, rrfConstant float64) []evalCandidate {
+	if rrfConstant < 0 {
+		panic("RRF constant 不能为负数")
+	}
 	candidates := make(map[string]*evalCandidate, len(segments))
 	segmentByID := make(map[string]model.VideoSegment, len(segments))
 	for _, segment := range segments {
@@ -724,15 +705,6 @@ func evalFuseRetrievalChannels(segments []model.VideoSegment, dense []evalDenseH
 			candidate.DenseRank, candidate.DenseScore = index+1, hit.Similarity
 		}
 	}
-	if weights.Exact > 0 {
-		for _, hit := range exact {
-			if _, ok := segmentByID[hit.SegmentID]; !ok {
-				continue
-			}
-			candidate := ensure(hit.SegmentID)
-			candidate.ExactRank, candidate.ExactScore = hit.Rank, hit.Score
-		}
-	}
 	if weights.BM25 > 0 {
 		for _, hit := range bm25 {
 			if _, ok := segmentByID[hit.SegmentID]; !ok {
@@ -745,15 +717,12 @@ func evalFuseRetrievalChannels(segments []model.VideoSegment, dense []evalDenseH
 	result := make([]evalCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.DenseRank > 0 {
-			candidate.DenseContribution = weights.Dense / (evalRRFConstant + float64(candidate.DenseRank))
-		}
-		if candidate.ExactRank > 0 {
-			candidate.ExactContribution = weights.Exact / (evalRRFConstant + float64(candidate.ExactRank))
+			candidate.DenseContribution = weights.Dense / (rrfConstant + float64(candidate.DenseRank))
 		}
 		if candidate.BM25Rank > 0 {
-			candidate.BM25Contribution = weights.BM25 / (evalRRFConstant + float64(candidate.BM25Rank))
+			candidate.BM25Contribution = weights.BM25 / (rrfConstant + float64(candidate.BM25Rank))
 		}
-		candidate.RRFScore = candidate.DenseContribution + candidate.ExactContribution + candidate.BM25Contribution
+		candidate.RRFScore = candidate.DenseContribution + candidate.BM25Contribution
 		result = append(result, *candidate)
 	}
 	sort.SliceStable(result, func(i, j int) bool {
@@ -835,7 +804,7 @@ func evalChannelResult(channels evalRawChannels) evalChannelResults {
 		segment := segmentByID[hit.SegmentID]
 		dense = append(dense, evalChannelCandidateResult{Rank: index + 1, SegmentID: hit.SegmentID, StartMS: segment.StartMS, EndMS: segment.EndMS, Score: hit.Similarity})
 	}
-	return evalChannelResults{Dense: dense, Exact: evalTextChannelResults(channels.Exact, segmentByID), BM25: evalTextChannelResults(channels.BM25, segmentByID)}
+	return evalChannelResults{Dense: dense, BM25: evalTextChannelResults(channels.BM25, segmentByID)}
 }
 
 func evalTextChannelResults(hits []evalWindowHit, segmentByID map[string]model.VideoSegment) []evalChannelCandidateResult {
@@ -852,9 +821,9 @@ func evalCandidateResults(candidates []evalCandidate) []evalCandidateResult {
 	for index, candidate := range candidates {
 		results = append(results, evalCandidateResult{
 			ResultRank: index + 1, SegmentID: candidate.Segment.ID, StartMS: candidate.Segment.StartMS, EndMS: candidate.Segment.EndMS,
-			DenseRank: candidate.DenseRank, DenseScore: candidate.DenseScore, ExactRank: candidate.ExactRank, ExactScore: candidate.ExactScore,
-			BM25Rank: candidate.BM25Rank, BM25Score: candidate.BM25Score, DenseContribution: candidate.DenseContribution,
-			ExactContribution: candidate.ExactContribution, BM25Contribution: candidate.BM25Contribution, RRFScore: candidate.RRFScore,
+			DenseRank: candidate.DenseRank, DenseScore: candidate.DenseScore, BM25Rank: candidate.BM25Rank,
+			BM25Score: candidate.BM25Score, DenseContribution: candidate.DenseContribution,
+			BM25Contribution: candidate.BM25Contribution, RRFScore: candidate.RRFScore,
 		})
 	}
 	return results
@@ -866,7 +835,8 @@ func evalExperimentSummaries(specs []evalExperimentSpec, aggregates []evalAggreg
 	for index, spec := range specs {
 		metrics := aggregates[index].Metrics()
 		summaries = append(summaries, evalExperimentSummary{
-			Name: spec.Name, Description: spec.Description, Weights: spec.Weights, Metrics: metrics,
+			Name: spec.Name, Description: spec.Description, Weights: spec.Weights, RRFConstant: spec.RRFConstant,
+			BM25Source: spec.BM25Source, BM25FieldWeights: spec.BM25FieldWeights, Metrics: metrics,
 			RecallDeltaVsDensePoints: (metrics.RecallAt5 - denseMetrics.RecallAt5) * 100,
 			MRRDeltaVsDensePoints:    (metrics.RRAt5 - denseMetrics.RRAt5) * 100,
 		})
@@ -1081,28 +1051,53 @@ func TestMeasureEvidenceGroupsAt5TreatsAlternativesAsOneEvidence(t *testing.T) {
 	}
 }
 
-func TestWeightedRRFPreventsLexicalDoubleVoteFromBeatingDenseFirst(t *testing.T) {
-	segments := []model.VideoSegment{{ID: "dense", StartMS: 0}, {ID: "lexical", StartMS: 60_000}}
+func TestWeightedBM25DoesNotBeatDenseFirstWithoutDenseSupport(t *testing.T) {
+	segments := []model.VideoSegment{{ID: "dense", StartMS: 0}, {ID: "bm25", StartMS: 60_000}}
 	dense := []evalDenseHit{{SegmentID: "dense", Similarity: 0.9}}
-	exact := []evalWindowHit{{SegmentID: "lexical", Rank: 1, Score: 10}}
-	bm25 := []evalWindowHit{{SegmentID: "lexical", Rank: 1, Score: 10}}
-	result := evalFuseRetrievalChannels(segments, dense, exact, bm25, evalRRFWeights{Dense: 1, Exact: 0.25, BM25: 0.5})
+	bm25 := []evalWindowHit{{SegmentID: "bm25", Rank: 1, Score: 10}}
+	result := evalFuseRetrievalChannels(segments, dense, bm25, evalRRFWeights{Dense: 1, BM25: 0.25}, evalFusionRRFConstant)
 	if len(result) != 2 || result[0].Segment.ID != "dense" {
 		t.Fatalf("weighted RRF order = %#v, want dense first", result)
 	}
 }
 
-func TestEvalExperimentSpecsIncludeDenseBM25WeightedAblation(t *testing.T) {
-	for _, spec := range evalExperimentSpecs() {
-		if spec.Name != "dense_bm25_weighted" {
-			continue
-		}
-		if spec.Weights != (evalRRFWeights{Dense: 1, BM25: 0.25}) {
-			t.Fatalf("dense_bm25_weighted weights = %+v, want 1/0/0.25", spec.Weights)
-		}
-		return
+func TestEvalExperimentSpecsMatchTwoStageDesign(t *testing.T) {
+	expected := []struct {
+		name     string
+		weights  evalRRFWeights
+		constant float64
+	}{
+		{name: "dense_only", weights: evalRRFWeights{Dense: 1}},
+		{name: "bm25_only", weights: evalRRFWeights{BM25: 1}},
+		{name: "dense_bm25_equal", weights: evalRRFWeights{Dense: 1, BM25: 1}, constant: 10},
+		{name: "dense_bm25_0_5", weights: evalRRFWeights{Dense: 1, BM25: 0.5}, constant: 10},
+		{name: "dense_bm25_0_25", weights: evalRRFWeights{Dense: 1, BM25: 0.25}, constant: 10},
+		{name: "dense_bm25_0_1", weights: evalRRFWeights{Dense: 1, BM25: 0.1}, constant: 10},
+		{name: "dense_bm25_k_5", weights: evalRRFWeights{Dense: 1, BM25: 0.25}, constant: 5},
+		{name: "dense_bm25_k_10", weights: evalRRFWeights{Dense: 1, BM25: 0.25}, constant: 10},
+		{name: "dense_bm25_k_30", weights: evalRRFWeights{Dense: 1, BM25: 0.25}, constant: 30},
+		{name: "dense_bm25_k_60", weights: evalRRFWeights{Dense: 1, BM25: 0.25}, constant: 60},
+		{name: "dense_bm25_raw", weights: evalRRFWeights{Dense: 1, BM25: 0.25}, constant: 10},
+		{name: "dense_bm25_retrieval", weights: evalRRFWeights{Dense: 1, BM25: 0.25}, constant: 10},
+		{name: "dense_bm25_hybrid_fields", weights: evalRRFWeights{Dense: 1, BM25: 0.25}, constant: 10},
 	}
-	t.Fatal("missing dense_bm25_weighted ablation")
+	specs := evalExperimentSpecs()
+	if len(specs) != len(expected) {
+		t.Fatalf("experiment count = %d, want %d", len(specs), len(expected))
+	}
+	for index, want := range expected {
+		got := specs[index]
+		if got.Name != want.name || got.Weights != want.weights || got.RRFConstant != want.constant {
+			t.Fatalf("experiment %d = %s %+v k=%v, want %s %+v k=%v", index+1, got.Name, got.Weights, got.RRFConstant, want.name, want.weights, want.constant)
+		}
+	}
+	if specs[10].BM25Source != "raw" || specs[11].BM25Source != "retrieval" || specs[12].BM25Source != "hybrid" {
+		t.Fatalf("新增 BM25 来源实验配置错误: %q/%q/%q", specs[10].BM25Source, specs[11].BM25Source, specs[12].BM25Source)
+	}
+	wantHybridFields := evalBM25FieldWeights{Retrieval: 1, Transcript: 0.25, OCR: 0.25}
+	if specs[12].BM25FieldWeights != wantHybridFields {
+		t.Fatalf("混合字段权重 = %+v, want %+v", specs[12].BM25FieldWeights, wantHybridFields)
+	}
 }
 
 func TestAppendEvalRunPreservesCompletedHistory(t *testing.T) {
@@ -1171,7 +1166,7 @@ func TestRetrievalEvalDatasetUsesEvidenceGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	questions, err := loadEvalQuestions(filepath.Join(repoRoot, "docs", "evaldata", "retrieval_questions.jsonl"))
+	questions, err := loadEvalQuestions(filepath.Join(repoRoot, "docs", "evaldata", "retrieval_tuning_questions.jsonl"))
 	if err != nil {
 		t.Fatalf("load evaluation dataset: %v", err)
 	}
@@ -1188,6 +1183,39 @@ func TestRetrievalEvalDatasetUsesEvidenceGroups(t *testing.T) {
 	}
 	if alternativeGroups == 0 {
 		t.Fatal("evaluation dataset has no equivalent answer window groups")
+	}
+}
+
+func TestRetrievalEvaluationDatasetUsesEvidenceGroups(t *testing.T) {
+	repoRoot, err := retrievalEvalRepoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	questions, err := loadEvalQuestions(filepath.Join(repoRoot, "docs", "evaldata", "retrieval_evaluation_questions.jsonl"))
+	if err != nil {
+		t.Fatalf("load formal evaluation dataset: %v", err)
+	}
+	if len(questions) != 80 {
+		t.Fatalf("formal evaluation question count = %d, want 80", len(questions))
+	}
+	// 正式集必须同时覆盖等价答案窗口与多证据问题，避免评测只反映单窗口命中。
+	alternativeGroups := 0
+	multiEvidenceQuestions := 0
+	for _, question := range questions {
+		if len(question.GoldEvidenceGroups) > 1 {
+			multiEvidenceQuestions++
+		}
+		for _, group := range question.GoldEvidenceGroups {
+			if len(group) > 1 {
+				alternativeGroups++
+			}
+		}
+	}
+	if alternativeGroups == 0 {
+		t.Fatal("formal evaluation dataset has no equivalent answer window groups")
+	}
+	if multiEvidenceQuestions == 0 {
+		t.Fatal("formal evaluation dataset has no multi-evidence questions")
 	}
 }
 

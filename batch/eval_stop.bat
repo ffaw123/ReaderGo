@@ -30,8 +30,8 @@ set "EVAL_PID="
 set /p "EVAL_PID="<"%READERGO_EVAL_PID_FILE%"
 set "READERGO_EVAL_PID=%EVAL_PID%"
 
-rem 只终止由 eval_start 记录且命令行确认为离线评测的 Go 进程，避免误杀其他 Go 服务。
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$idText = $env:READERGO_EVAL_PID; [int]$id = 0; if (-not [int]::TryParse($idText, [ref]$id)) { exit 2 }; $p = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $id) -ErrorAction SilentlyContinue; if ($null -eq $p) { exit 3 }; if ($p.Name -ine 'go.exe' -or $p.CommandLine -notmatch 'TestRetrievalOfflineEval') { exit 4 }; $null = taskkill.exe /PID $id /T /F; exit $LASTEXITCODE"
+rem 只终止由评测启动脚本记录且命令行确认为离线评测的 Go 进程，避免误杀其他 Go 服务。
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$idText = $env:READERGO_EVAL_PID; [int]$id = 0; if (-not [int]::TryParse($idText, [ref]$id)) { exit 2 }; $p = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $id) -ErrorAction SilentlyContinue; if ($null -eq $p) { exit 3 }; if ($p.Name -ine 'go.exe' -or $p.CommandLine -notmatch 'TestRetrieval(?:OfflineEval|BM25SourceEval)') { exit 4 }; $null = taskkill.exe /PID $id /T /F; exit $LASTEXITCODE"
 set "STOP_EXIT_CODE=%ERRORLEVEL%"
 del /q "%READERGO_EVAL_PID_FILE%" 2>nul
 
