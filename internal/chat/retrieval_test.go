@@ -1,75 +1,98 @@
 package chat
 
 import (
+	"math"
 	"testing"
 
 	"readergo/internal/model"
 )
 
-func TestBuildSegmentTextDocumentsUsesVideoSegmentCopies(t *testing.T) {
-	documents := buildSegmentTextDocuments([]model.VideoSegment{
-		{ID: "both", Transcript: " ASR 原文 ", OCRText: " OCR 原文 "},
-		{ID: "empty"},
-	})
-	if len(documents) != 2 {
-		t.Fatalf("got %d documents, want ASR and OCR documents", len(documents))
+func TestFuseRetrievalChannelsSupportsIndependentAndSharedHits(t *testing.T) {
+	segments := []model.VideoSegment{
+		{ID: "dense-only", StartMS: 0},
+		{ID: "bm25-only", StartMS: 1},
+		{ID: "shared", StartMS: 2},
 	}
-	if documents[0].SegmentID != "both" || documents[0].SourceType != "asr" || documents[0].Text != "ASR 原文" {
-		t.Fatalf("ASR document = %#v", documents[0])
+	dense := []semanticHit{{SegmentID: "dense-only"}, {SegmentID: "shared"}}
+	bm25 := []bm25WindowHit{{SegmentID: "bm25-only", Rank: 1}, {SegmentID: "shared", Rank: 2}}
+	result := fuseRetrievalChannels(segments, dense, bm25)
+	if len(result) != 3 || result[0].Segment.ID != "shared" {
+		t.Fatalf("result = %#v, want shared hit first and both single-channel fallbacks", result)
 	}
-	if documents[1].SegmentID != "both" || documents[1].SourceType != "ocr" || documents[1].Text != "OCR 原文" {
-		t.Fatalf("OCR document = %#v", documents[1])
+	if result[0].DenseRank != 2 || result[0].BM25Rank != 2 {
+		t.Fatalf("shared ranks = %#v", result[0])
 	}
 }
 
-func TestFuseRetrievalChannelsUsesThreeIndependentRanks(t *testing.T) {
-	segments := []model.VideoSegment{
-		{ID: "a", StartMS: 0, EndMS: 60000},
-		{ID: "b", StartMS: 60000, EndMS: 120000},
-	}
-	dense := []semanticHit{{SegmentID: "b", Similarity: .9}}
-	exact := []rankedSegmentText{
-		{Document: segmentTextDocument{SegmentID: "a", SourceType: "asr"}, Score: 5},
-		{Document: segmentTextDocument{SegmentID: "b", SourceType: "ocr"}, Score: 5},
-	}
-	bm25 := []rankedSegmentText{{Document: segmentTextDocument{SegmentID: "a", SourceType: "asr"}, Score: 3}}
-
-	result := fuseRetrievalChannels(segments, dense, exact, bm25)
-	if len(result) != 2 {
-		t.Fatalf("got %d candidates, want 2", len(result))
-	}
-	if result[0].Segment.ID != "a" || result[0].ExactRank != 1 || result[0].BM25Rank != 1 {
-		t.Fatalf("top candidate = %#v, want segment a with exact and BM25 ranks", result[0])
-	}
-	if result[1].Segment.ID != "b" || result[1].DenseRank != 1 || result[1].ExactRank != 1 {
-		t.Fatalf("second candidate = %#v, want segment b with dense and exact ranks", result[1])
+func TestFuseRetrievalChannelsDeduplicatesWindows(t *testing.T) {
+	segments := []model.VideoSegment{{ID: "same"}}
+	result := fuseRetrievalChannels(segments,
+		[]semanticHit{{SegmentID: "same"}, {SegmentID: "same"}},
+		[]bm25WindowHit{{SegmentID: "same", Rank: 1}, {SegmentID: "same", Rank: 2}},
+	)
+	if len(result) != 1 || result[0].DenseRank != 1 || result[0].BM25Rank != 1 {
+		t.Fatalf("deduplicated result = %#v", result)
 	}
 }
 
-func TestSegmentTextMapsDirectlyToOwningWindow(t *testing.T) {
-	segments := []model.VideoSegment{
-		{ID: "left", StartMS: 0, EndMS: 60000},
-		{ID: "right", StartMS: 60000, EndMS: 120000},
+func TestFuseRetrievalChannelsTruncatesEachInputToEightAndFinalToFive(t *testing.T) {
+	segments := make([]model.VideoSegment, 18)
+	dense := make([]semanticHit, 9)
+	bm25 := make([]bm25WindowHit, 9)
+	for index := range segments {
+		segments[index] = model.VideoSegment{ID: string(rune('a' + index)), StartMS: int64(index)}
+		if index < 9 {
+			dense[index] = semanticHit{SegmentID: segments[index].ID}
+			bm25[index] = bm25WindowHit{SegmentID: segments[index+9].ID, Rank: index + 1}
+		}
 	}
-	exact := []rankedSegmentText{{Document: segmentTextDocument{SegmentID: "right", SourceType: "asr"}, Score: 1}}
-	result := fuseRetrievalChannels(segments, nil, exact, nil)
-	if len(result) != 1 || result[0].Segment.ID != "right" {
-		t.Fatalf("segment mapping = %#v, want only right window", result)
+	result := fuseRetrievalChannels(segments, dense, bm25)
+	if len(result) != retrievalFinalTopK {
+		t.Fatalf("final count = %d, want %d", len(result), retrievalFinalTopK)
+	}
+	for _, candidate := range result {
+		if candidate.Segment.ID == "i" || candidate.Segment.ID == "r" {
+			t.Fatalf("ninth channel candidate leaked into result: %#v", result)
+		}
 	}
 }
 
-func TestSegmentRankingUsesHigherASROrOCRScore(t *testing.T) {
-	segments := []model.VideoSegment{
-		{ID: "crowded", StartMS: 0, EndMS: 60000},
-		{ID: "later", StartMS: 60000, EndMS: 120000},
+func TestFuseRetrievalChannelsUsesFixedWeightedRRF(t *testing.T) {
+	segments := []model.VideoSegment{{ID: "dense", StartMS: 0}, {ID: "bm25", StartMS: 1}, {ID: "both", StartMS: 2}}
+	result := fuseRetrievalChannels(segments,
+		[]semanticHit{{SegmentID: "dense"}, {SegmentID: "both"}},
+		[]bm25WindowHit{{SegmentID: "bm25", Rank: 1}, {SegmentID: "both", Rank: 2}},
+	)
+	if result[0].Segment.ID != "both" || result[1].Segment.ID != "dense" || result[2].Segment.ID != "bm25" {
+		t.Fatalf("weighted RRF order = %#v", result)
 	}
-	hits := []rankedSegmentText{
-		{Document: segmentTextDocument{SegmentID: "crowded", SourceType: "asr"}, Score: 90},
-		{Document: segmentTextDocument{SegmentID: "crowded", SourceType: "ocr"}, Score: 100},
-		{Document: segmentTextDocument{SegmentID: "later", SourceType: "asr"}, Score: 10},
+	want := 1.0/12.0 + 0.25/12.0
+	if math.Abs(result[0].RRFScore-want) > 1e-12 {
+		t.Fatalf("shared score = %.15f, want %.15f", result[0].RRFScore, want)
 	}
-	ranks := segmentWindowRanks(segments, hits, 8)
-	if ranks["crowded"] != 1 || ranks["later"] != 2 {
-		t.Fatalf("window ranks = %#v, want the best ASR/OCR score per window", ranks)
+	if math.Abs(result[1].RRFScore-1.0/11.0) > 1e-12 || math.Abs(result[2].RRFScore-0.25/11.0) > 1e-12 {
+		t.Fatalf("single-channel contributions = %#v", result)
+	}
+}
+
+func TestFuseRetrievalChannelsBreaksTiesByStartTime(t *testing.T) {
+	segments := []model.VideoSegment{{ID: "later", StartMS: 20}, {ID: "earlier", StartMS: 10}}
+	// 构造同一排名的 BM25 命中，验证融合总分相同时只按窗口时间稳定排序。
+	result := fuseRetrievalChannels(segments, nil, []bm25WindowHit{{SegmentID: "later", Rank: 1}, {SegmentID: "earlier", Rank: 1}})
+	if len(result) != 2 || result[0].Segment.ID != "earlier" {
+		t.Fatalf("tie order = %#v", result)
+	}
+}
+
+func TestFuseRetrievalChannelsAllowsEmptyChannels(t *testing.T) {
+	segments := []model.VideoSegment{{ID: "one"}}
+	if got := fuseRetrievalChannels(segments, nil, nil); len(got) != 0 {
+		t.Fatalf("empty channels = %#v", got)
+	}
+	if got := fuseRetrievalChannels(segments, []semanticHit{{SegmentID: "one"}}, nil); len(got) != 1 {
+		t.Fatalf("dense fallback = %#v", got)
+	}
+	if got := fuseRetrievalChannels(segments, nil, []bm25WindowHit{{SegmentID: "one", Rank: 1}}); len(got) != 1 {
+		t.Fatalf("BM25 fallback = %#v", got)
 	}
 }

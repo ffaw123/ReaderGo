@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"readergo/internal/model"
 )
 
 const (
@@ -12,15 +14,26 @@ const (
 	bm25B  = 0.75
 )
 
-type segmentTextDocument struct {
-	SegmentID  string
-	SourceType string
-	Text       string
+// bm25FieldWeights 固定生产检索中三个窗口字段的权重。
+type bm25FieldWeights struct {
+	RetrievalText float64
+	Transcript    float64
+	OCRText       float64
 }
 
-type rankedSegmentText struct {
-	Document segmentTextDocument
-	Score    float64
+var productionBM25FieldWeights = bm25FieldWeights{RetrievalText: 1, Transcript: 0.25, OCRText: 0.25}
+
+// bm25WindowHit 表示一个窗口在 BM25F 通道中的唯一命中及稳定排名。
+type bm25WindowHit struct {
+	SegmentID string
+	Rank      int
+	Score     float64
+}
+
+type bm25WindowFields struct {
+	retrievalText []string
+	transcript    []string
+	ocrText       []string
 }
 
 var lexicalStopTokens = map[string]struct{}{
@@ -28,123 +41,140 @@ var lexicalStopTokens = map[string]struct{}{
 	"为什么": {}, "是否": {}, "有没有": {}, "提到": {}, "一下": {}, "请问": {}, "关于": {},
 }
 
-func rankBM25(query string, documents []segmentTextDocument, limit int) []rankedSegmentText {
+// rankBM25Windows 以一个 video_segment 为一篇文档，对三个字段执行一次 BM25F 评分。
+func rankBM25Windows(query string, segments []model.VideoSegment, limit int) []bm25WindowHit {
 	queryTokens := lexicalTokens(query)
-	if len(queryTokens) == 0 || len(documents) == 0 {
+	if len(queryTokens) == 0 || len(segments) == 0 {
 		return nil
 	}
-	documentTokens := make([][]string, len(documents))
+
+	documents := make([]bm25WindowFields, len(segments))
 	documentFrequency := make(map[string]int)
-	totalLength := 0
-	for index, document := range documents {
-		tokens := lexicalTokens(document.Text)
-		documentTokens[index] = tokens
-		totalLength += len(tokens)
-		seen := make(map[string]struct{}, len(tokens))
-		for _, token := range tokens {
-			if _, ok := seen[token]; ok {
-				continue
+	var retrievalTextTotal, transcriptTotal, ocrTextTotal int
+	for index, segment := range segments {
+		document := bm25WindowFields{
+			retrievalText: lexicalTokens(segment.RetrievalText),
+			transcript:    lexicalTokens(filterRawTextByQuery(segment.Transcript, queryTokens)),
+			ocrText:       lexicalTokens(filterRawTextByQuery(segment.OCRText, queryTokens)),
+		}
+		documents[index] = document
+		retrievalTextTotal += len(document.retrievalText)
+		transcriptTotal += len(document.transcript)
+		ocrTextTotal += len(document.ocrText)
+
+		// 文档频率按窗口去重，同一词同时出现在三个字段中也只计数一次。
+		seen := make(map[string]struct{})
+		for _, field := range [][]string{document.retrievalText, document.transcript, document.ocrText} {
+			for _, token := range field {
+				seen[token] = struct{}{}
 			}
-			seen[token] = struct{}{}
+		}
+		for token := range seen {
 			documentFrequency[token]++
 		}
 	}
-	averageLength := float64(totalLength) / float64(len(documents))
-	if averageLength == 0 {
-		return nil
+
+	averageLength := func(total int) float64 {
+		if total == 0 {
+			return 1
+		}
+		return float64(total) / float64(len(segments))
 	}
+	retrievalTextAverage := averageLength(retrievalTextTotal)
+	transcriptAverage := averageLength(transcriptTotal)
+	ocrTextAverage := averageLength(ocrTextTotal)
 	queryFrequency := make(map[string]int)
 	for _, token := range queryTokens {
 		queryFrequency[token]++
 	}
 
-	ranked := make([]rankedSegmentText, 0, len(documents))
-	for index, tokens := range documentTokens {
-		termFrequency := make(map[string]int)
-		for _, token := range tokens {
-			termFrequency[token]++
-		}
+	type scoredWindow struct {
+		segmentID string
+		startMS   int64
+		score     float64
+	}
+	ranked := make([]scoredWindow, 0, len(segments))
+	for index, document := range documents {
 		var score float64
 		for token, queryCount := range queryFrequency {
-			frequency := termFrequency[token]
-			if frequency == 0 {
+			// 三个字段先各自做长度归一化，再按固定权重合并词频。
+			weightedTF := bm25NormalizedTF(token, document.retrievalText, productionBM25FieldWeights.RetrievalText, retrievalTextAverage) +
+				bm25NormalizedTF(token, document.transcript, productionBM25FieldWeights.Transcript, transcriptAverage) +
+				bm25NormalizedTF(token, document.ocrText, productionBM25FieldWeights.OCRText, ocrTextAverage)
+			if weightedTF == 0 {
 				continue
 			}
 			df := documentFrequency[token]
-			idf := math.Log(1 + (float64(len(documents)-df)+0.5)/(float64(df)+0.5))
-			lengthNorm := 1 - bm25B + bm25B*float64(len(tokens))/averageLength
-			score += float64(queryCount) * idf * (float64(frequency) * (bm25K1 + 1)) / (float64(frequency) + bm25K1*lengthNorm)
+			idf := math.Log(1 + (float64(len(segments)-df)+0.5)/(float64(df)+0.5))
+			score += float64(queryCount) * idf * ((bm25K1 + 1) * weightedTF) / (bm25K1 + weightedTF)
 		}
 		if score > 0 {
-			ranked = append(ranked, rankedSegmentText{Document: documents[index], Score: score})
+			ranked = append(ranked, scoredWindow{segmentID: segments[index].ID, startMS: segments[index].StartMS, score: score})
 		}
 	}
-	return sortRankedSegmentTexts(ranked, limit)
-}
-
-func rankExact(query string, documents []segmentTextDocument, limit int) []rankedSegmentText {
-	terms := exactTerms(query)
-	if len(terms) == 0 {
-		return nil
-	}
-	normalizedQuery := strings.ToLower(strings.TrimSpace(query))
-	ranked := make([]rankedSegmentText, 0, len(documents))
-	for _, document := range documents {
-		text := strings.ToLower(document.Text)
-		var score float64
-		if len([]rune(normalizedQuery)) >= 2 && strings.Contains(text, normalizedQuery) {
-			score += 20
-		}
-		for _, term := range terms {
-			if !strings.Contains(text, term) {
-				continue
-			}
-			weight := 1.0
-			if isHighValueExactTerm(term) {
-				weight = 5
-			}
-			// 多次出现仍只做温和增益，避免长 ASR 因重复口头语垄断精确召回。
-			occurrences := strings.Count(text, term)
-			score += weight * (1 + math.Log(float64(occurrences)))
-		}
-		if score > 0 {
-			ranked = append(ranked, rankedSegmentText{Document: document, Score: score})
-		}
-	}
-	return sortRankedSegmentTexts(ranked, limit)
-}
-
-func sortRankedSegmentTexts(ranked []rankedSegmentText, limit int) []rankedSegmentText {
 	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].Score == ranked[j].Score {
-			if ranked[i].Document.SegmentID == ranked[j].Document.SegmentID {
-				return ranked[i].Document.SourceType < ranked[j].Document.SourceType
+		if ranked[i].score == ranked[j].score {
+			if ranked[i].startMS == ranked[j].startMS {
+				return ranked[i].segmentID < ranked[j].segmentID
 			}
-			return ranked[i].Document.SegmentID < ranked[j].Document.SegmentID
+			return ranked[i].startMS < ranked[j].startMS
 		}
-		return ranked[i].Score > ranked[j].Score
+		return ranked[i].score > ranked[j].score
 	})
 	if limit > 0 && len(ranked) > limit {
-		return ranked[:limit]
+		ranked = ranked[:limit]
 	}
-	return ranked
+
+	hits := make([]bm25WindowHit, 0, len(ranked))
+	currentRank := 0
+	for index, window := range ranked {
+		if index == 0 || window.score != ranked[index-1].score {
+			currentRank = index + 1
+		}
+		hits = append(hits, bm25WindowHit{SegmentID: window.segmentID, Rank: currentRank, Score: window.score})
+	}
+	return hits
 }
 
-func exactTerms(query string) []string {
-	all := lexicalTokens(query)
-	seen := make(map[string]struct{}, len(all))
-	terms := make([]string, 0, len(all))
-	for _, token := range all {
-		if _, stop := lexicalStopTokens[token]; stop {
-			continue
-		}
-		if _, ok := seen[token]; ok {
-			continue
-		}
-		seen[token] = struct{}{}
-		terms = append(terms, token)
+// filterRawTextByQuery 只保留至少包含一个查询 Token 的 ASR/OCR 句段。
+func filterRawTextByQuery(text string, queryTokens []string) string {
+	if len(queryTokens) == 0 || strings.TrimSpace(text) == "" {
+		return ""
 	}
-	return terms
+	querySet := make(map[string]struct{}, len(queryTokens))
+	for _, token := range queryTokens {
+		querySet[token] = struct{}{}
+	}
+	chunks := strings.FieldsFunc(text, func(current rune) bool {
+		return strings.ContainsRune("。！？!?；;，,\n\r", current)
+	})
+	selected := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		for _, token := range lexicalTokens(chunk) {
+			if _, ok := querySet[token]; ok {
+				selected = append(selected, chunk)
+				break
+			}
+		}
+	}
+	return strings.Join(selected, " ")
+}
+
+func bm25NormalizedTF(token string, tokens []string, weight, averageLength float64) float64 {
+	if weight <= 0 || len(tokens) == 0 {
+		return 0
+	}
+	frequency := 0
+	for _, current := range tokens {
+		if current == token {
+			frequency++
+		}
+	}
+	if frequency == 0 {
+		return 0
+	}
+	lengthNorm := 1 - bm25B + bm25B*float64(len(tokens))/averageLength
+	return weight * float64(frequency) / lengthNorm
 }
 
 func lexicalTokens(input string) []string {
@@ -187,13 +217,4 @@ func lexicalTokens(input string) []string {
 	flushLatin()
 	flushHan()
 	return tokens
-}
-
-func isHighValueExactTerm(term string) bool {
-	for _, current := range term {
-		if unicode.IsDigit(current) || (current <= unicode.MaxASCII && (unicode.IsLetter(current) || strings.ContainsRune("._:+#/%-", current))) {
-			return true
-		}
-	}
-	return false
 }

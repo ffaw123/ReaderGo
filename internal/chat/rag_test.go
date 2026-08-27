@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -25,6 +26,21 @@ func TestBuildRAGWindowsUsesVideoSegmentEvidence(t *testing.T) {
 	}
 	if windows[0].Evidence[1].SourceID != "segment-1:ocr" || windows[0].Evidence[1].Text != "OCR 原文" {
 		t.Fatalf("OCR evidence = %#v", windows[0].Evidence[1])
+	}
+}
+
+func TestRAGWindowJSONContainsOnlyActiveRetrievalRanks(t *testing.T) {
+	windows := buildRAGWindows(retrievalResult{Candidates: []segmentCandidate{{
+		Segment: model.VideoSegment{ID: "segment-1", Transcript: "证据"},
+		Primary: true, DenseRank: 1, BM25Rank: 2,
+	}}})
+	payload, err := json.Marshal(windows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := string(payload)
+	if strings.Contains(encoded, "exact_rank") || !strings.Contains(encoded, "dense_rank") || !strings.Contains(encoded, "bm25_rank") {
+		t.Fatalf("candidate JSON contains stale or missing ranks: %s", encoded)
 	}
 }
 

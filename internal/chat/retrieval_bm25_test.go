@@ -292,3 +292,41 @@ func TestEvalRankBM25FieldsUsesConfiguredSources(t *testing.T) {
 		t.Fatalf("混合字段检索结果不符合预期: %+v", hybrid)
 	}
 }
+
+func TestProductionRetrievalMatchesIndependentEvaluationSpecification(t *testing.T) {
+	segments := []model.VideoSegment{
+		{ID: "s1", StartMS: 0, RetrievalText: "向量数据库 索引", Transcript: "开场闲聊。向量数据库用于检索。", OCRText: "无关标题"},
+		{ID: "s2", StartMS: 60_000, RetrievalText: "数据库部署", Transcript: "无关内容", OCRText: "向量数据库；页脚噪声"},
+		{ID: "s3", StartMS: 120_000, RetrievalText: "其他主题", Transcript: "向量数据库，向量数据库", OCRText: "向量数据库"},
+		{ID: "s4", StartMS: 180_000, RetrievalText: "完全无关", Transcript: "没有命中", OCRText: ""},
+	}
+	query := "向量数据库"
+	productionBM25 := rankBM25Windows(query, segments, retrievalChannelTopK)
+	evaluationBM25 := evalRankBM25Fields(query, segments, evalBM25FieldWeights{Retrieval: 1, Transcript: 0.25, OCR: 0.25}, true, evalChannelTopK)
+	if len(productionBM25) != len(evaluationBM25) {
+		t.Fatalf("BM25 hit counts differ: production=%#v evaluation=%#v", productionBM25, evaluationBM25)
+	}
+	for index := range productionBM25 {
+		got, want := productionBM25[index], evaluationBM25[index]
+		if got.SegmentID != want.SegmentID || got.Rank != want.Rank || math.Abs(got.Score-want.Score) > 1e-12 {
+			t.Fatalf("BM25 hit %d differs: production=%#v evaluation=%#v", index, got, want)
+		}
+	}
+
+	dense := []semanticHit{{SegmentID: "s4", Similarity: 0.95}, {SegmentID: "s2", Similarity: 0.90}, {SegmentID: "s1", Similarity: 0.85}}
+	production := fuseRetrievalChannels(segments, dense, productionBM25)
+	evalDense := make([]evalDenseHit, len(dense))
+	for index, hit := range dense {
+		evalDense[index] = evalDenseHit{SegmentID: hit.SegmentID, Similarity: hit.Similarity}
+	}
+	evaluation := evalFuseRetrievalChannels(segments, evalDense, evaluationBM25, evalRRFWeights{Dense: 1, BM25: 0.25}, 10)
+	if len(production) != len(evaluation) {
+		t.Fatalf("fusion counts differ: production=%#v evaluation=%#v", production, evaluation)
+	}
+	for index := range production {
+		got, want := production[index], evaluation[index]
+		if got.Segment.ID != want.Segment.ID || got.DenseRank != want.DenseRank || got.BM25Rank != want.BM25Rank || math.Abs(got.RRFScore-want.RRFScore) > 1e-12 {
+			t.Fatalf("fusion candidate %d differs: production=%#v evaluation=%#v", index, got, want)
+		}
+	}
+}

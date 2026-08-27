@@ -23,7 +23,9 @@ const (
 	queryEmbeddingDimensions = 1024
 	retrievalChannelTopK     = 8
 	retrievalFinalTopK       = 5
-	retrievalRRFConstant     = 60.0
+	retrievalRRFConstant     = 10.0
+	retrievalDenseWeight     = 1.0
+	retrievalBM25Weight      = 0.25
 	maxContextWindows        = 10
 )
 
@@ -42,7 +44,6 @@ type semanticHit struct {
 type segmentCandidate struct {
 	Segment   model.VideoSegment
 	DenseRank int
-	ExactRank int
 	BM25Rank  int
 	RRFScore  float64
 	Primary   bool
@@ -75,7 +76,6 @@ func (r *retriever) Retrieve(ctx context.Context, tenantID, videoID, query strin
 	if err != nil {
 		return retrievalResult{}, err
 	}
-	documents := buildSegmentTextDocuments(segments)
 	vector, err := r.embedQuery(ctx, query)
 	if err != nil {
 		return retrievalResult{}, err
@@ -84,10 +84,9 @@ func (r *retriever) Retrieve(ctx context.Context, tenantID, videoID, query strin
 	if err != nil {
 		return retrievalResult{}, err
 	}
-	// 在线检索直接使用 video_segments 中的 ASR/OCR 快照，避免重复读取和映射原始结果表。
-	exact := rankExact(query, documents, 0)
-	bm25 := rankBM25(query, documents, 0)
-	candidates := fuseRetrievalChannels(segments, dense, exact, bm25)
+	// BM25F 直接以窗口为文档，ASR/OCR 只作为字段参与一次评分，避免重复占用候选名额。
+	bm25 := rankBM25Windows(query, segments, retrievalChannelTopK)
+	candidates := fuseRetrievalChannels(segments, dense, bm25)
 	candidates = expandNeighborWindows(segments, candidates)
 	return retrievalResult{Candidates: candidates}, nil
 }
@@ -99,19 +98,6 @@ func (r *retriever) loadSegments(ctx context.Context, tenantID, videoID string) 
 		return nil, fmt.Errorf("load retrieval windows: %w", err)
 	}
 	return segments, nil
-}
-
-func buildSegmentTextDocuments(segments []model.VideoSegment) []segmentTextDocument {
-	documents := make([]segmentTextDocument, 0, len(segments)*2)
-	for _, segment := range segments {
-		if text := strings.TrimSpace(segment.Transcript); text != "" {
-			documents = append(documents, segmentTextDocument{SegmentID: segment.ID, SourceType: "asr", Text: text})
-		}
-		if text := strings.TrimSpace(segment.OCRText); text != "" {
-			documents = append(documents, segmentTextDocument{SegmentID: segment.ID, SourceType: "ocr", Text: text})
-		}
-	}
-	return documents
 }
 
 func (r *retriever) embedQuery(ctx context.Context, query string) ([]float64, error) {
@@ -174,7 +160,7 @@ func formatVector(vector []float64) (string, error) {
 	return builder.String(), nil
 }
 
-func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, exact, bm25 []rankedSegmentText) []segmentCandidate {
+func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, bm25 []bm25WindowHit) []segmentCandidate {
 	candidates := make(map[string]*segmentCandidate, len(segments))
 	segmentByID := make(map[string]model.VideoSegment, len(segments))
 	for _, segment := range segments {
@@ -189,42 +175,46 @@ func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, e
 		return candidate
 	}
 	for index, hit := range dense {
+		if index >= retrievalChannelTopK {
+			break
+		}
 		if segment, ok := segmentByID[hit.SegmentID]; ok {
-			ensure(segment).DenseRank = index + 1
+			candidate := ensure(segment)
+			if candidate.DenseRank == 0 {
+				candidate.DenseRank = index + 1
+			}
 		}
 	}
-	exactWindowRanks := segmentWindowRanks(segments, exact, retrievalChannelTopK)
-	for segmentID, rank := range exactWindowRanks {
-		segment := segmentByID[segmentID]
-		candidate := ensure(segment)
-		if candidate.ExactRank == 0 || rank < candidate.ExactRank {
-			candidate.ExactRank = rank
+	for index, hit := range bm25 {
+		if index >= retrievalChannelTopK {
+			break
 		}
-	}
-	bm25WindowRanks := segmentWindowRanks(segments, bm25, retrievalChannelTopK)
-	for segmentID, rank := range bm25WindowRanks {
-		segment := segmentByID[segmentID]
-		candidate := ensure(segment)
-		if candidate.BM25Rank == 0 || rank < candidate.BM25Rank {
-			candidate.BM25Rank = rank
+		if hit.Rank <= 0 {
+			continue
+		}
+		if segment, ok := segmentByID[hit.SegmentID]; ok {
+			candidate := ensure(segment)
+			if candidate.BM25Rank == 0 || hit.Rank < candidate.BM25Rank {
+				candidate.BM25Rank = hit.Rank
+			}
 		}
 	}
 
 	result := make([]segmentCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.DenseRank > 0 {
-			candidate.RRFScore += 1 / (retrievalRRFConstant + float64(candidate.DenseRank))
-		}
-		if candidate.ExactRank > 0 {
-			candidate.RRFScore += 1 / (retrievalRRFConstant + float64(candidate.ExactRank))
+			candidate.RRFScore += retrievalDenseWeight / (retrievalRRFConstant + float64(candidate.DenseRank))
 		}
 		if candidate.BM25Rank > 0 {
-			candidate.RRFScore += 1 / (retrievalRRFConstant + float64(candidate.BM25Rank))
+			candidate.RRFScore += retrievalBM25Weight / (retrievalRRFConstant + float64(candidate.BM25Rank))
 		}
 		result = append(result, *candidate)
 	}
 	sort.SliceStable(result, func(i, j int) bool {
 		if result[i].RRFScore == result[j].RRFScore {
+			if result[i].Segment.StartMS == result[j].Segment.StartMS {
+				return result[i].Segment.ID < result[j].Segment.ID
+			}
 			return result[i].Segment.StartMS < result[j].Segment.StartMS
 		}
 		return result[i].RRFScore > result[j].RRFScore
@@ -233,46 +223,6 @@ func fuseRetrievalChannels(segments []model.VideoSegment, dense []semanticHit, e
 		result = result[:retrievalFinalTopK]
 	}
 	return result
-}
-
-func segmentWindowRanks(segments []model.VideoSegment, hits []rankedSegmentText, limit int) map[string]int {
-	bestScores := make(map[string]float64)
-	for _, hit := range hits {
-		// 同一窗口的 ASR 和 OCR 独立评分，窗口排名只采用其中更高的得分。
-		if hit.Score > bestScores[hit.Document.SegmentID] {
-			bestScores[hit.Document.SegmentID] = hit.Score
-		}
-	}
-	type scoredWindow struct {
-		ID      string
-		Score   float64
-		StartMS int64
-	}
-	ranked := make([]scoredWindow, 0, len(bestScores))
-	for _, segment := range segments {
-		if score := bestScores[segment.ID]; score > 0 {
-			ranked = append(ranked, scoredWindow{ID: segment.ID, Score: score, StartMS: segment.StartMS})
-		}
-	}
-	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].Score == ranked[j].Score {
-			return ranked[i].StartMS < ranked[j].StartMS
-		}
-		return ranked[i].Score > ranked[j].Score
-	})
-	if limit > 0 && len(ranked) > limit {
-		ranked = ranked[:limit]
-	}
-	ranks := make(map[string]int, len(ranked))
-	currentRank := 0
-	for index, window := range ranked {
-		if index == 0 || window.Score != ranked[index-1].Score {
-			currentRank = index + 1
-		}
-		// 得分相同的窗口共享排名，时间顺序只用于保证结果稳定。
-		ranks[window.ID] = currentRank
-	}
-	return ranks
 }
 
 func expandNeighborWindows(all []model.VideoSegment, primary []segmentCandidate) []segmentCandidate {

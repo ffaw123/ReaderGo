@@ -41,7 +41,6 @@ type ragWindow struct {
 	EndMS          int64         `json:"end_ms"`
 	Primary        bool          `json:"primary"`
 	DenseRank      int           `json:"dense_rank,omitempty"`
-	ExactRank      int           `json:"exact_rank,omitempty"`
 	BM25Rank       int           `json:"bm25_rank,omitempty"`
 	SegmentSummary string        `json:"segment_summary"`
 	KeyFacts       []string      `json:"key_facts"`
@@ -98,7 +97,7 @@ func buildRAGWindows(result retrievalResult) []ragWindow {
 	for _, candidate := range result.Candidates {
 		window := ragWindow{
 			SegmentID: candidate.Segment.ID, StartMS: candidate.Segment.StartMS, EndMS: candidate.Segment.EndMS,
-			Primary: candidate.Primary, DenseRank: candidate.DenseRank, ExactRank: candidate.ExactRank, BM25Rank: candidate.BM25Rank,
+			Primary: candidate.Primary, DenseRank: candidate.DenseRank, BM25Rank: candidate.BM25Rank,
 			SegmentSummary: candidate.Segment.SegmentSummary, KeyFacts: candidate.Segment.KeyFacts,
 		}
 		windowRemaining := min(ragMaxWindowEvidence, remaining)
