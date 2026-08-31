@@ -29,6 +29,8 @@ async function request(path, options = {}) {
     }
     const error = new Error(payload?.error || `请求失败（${response.status}）`)
     error.status = response.status
+    error.code = payload?.code
+    error.details = payload
     throw error
   }
   return payload
@@ -132,7 +134,7 @@ export const api = {
       },
       onDelta,
     ),
-  createUpload: (file, title, identity) =>
+  createUpload: (file, title, identity, contentSHA256) =>
     request('/api/uploads', {
       method: 'POST',
       body: JSON.stringify({
@@ -141,6 +143,7 @@ export const api = {
         file_size: file.size,
         file_last_modified_ms: identity.file_last_modified_ms,
         file_fingerprint: identity.file_fingerprint,
+        content_sha256: contentSHA256,
         title,
       }),
     }),
@@ -242,6 +245,35 @@ export function sameFileIdentity(left, right) {
     left.file_last_modified_ms === right.file_last_modified_ms &&
     left.file_fingerprint === right.file_fingerprint,
   )
+}
+
+// 完整内容哈希在独立 Worker 中分块计算，避免大文件占满主线程或一次性进入内存。
+export function calculateContentSHA256(file, onProgress, signal) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('../workers/sha256.worker.js', import.meta.url), { type: 'module' })
+    let settled = false
+    const finish = (callback) => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener('abort', onAbort)
+      worker.terminate()
+      callback()
+    }
+    const onAbort = () => finish(() => reject(new DOMException('文件校验已取消', 'AbortError')))
+
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'progress') onProgress?.(data.progress)
+      if (data.type === 'complete') finish(() => resolve(data.sha256))
+      if (data.type === 'error') finish(() => reject(new Error(data.message || '无法计算文件 SHA-256')))
+    }
+    worker.onerror = () => finish(() => reject(new Error('文件校验线程意外退出')))
+    worker.postMessage({ file })
+  })
 }
 
 export async function uploadFileParts(file, session, onProgress, signal) {

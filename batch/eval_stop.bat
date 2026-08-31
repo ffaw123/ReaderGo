@@ -36,9 +36,9 @@ set "STOP_EXIT_CODE=%ERRORLEVEL%"
 del /q "%READERGO_EVAL_PID_FILE%" 2>nul
 
 :remove_database_container
-rem 评测服务使用匿名卷；-v 仅删除该容器挂载的临时卷，不会删除业务 postgres_data。
+rem 先删除评测容器，再精确删除评测具名卷；不能使用 down -v，以免删除业务卷。
 echo 正在停止评测 PostgreSQL，并删除评测容器及其临时数据卷...
-docker compose --profile eval rm -f -s -v postgres-eval
+call :remove_eval_database
 set "DATABASE_REMOVE_EXIT_CODE=%ERRORLEVEL%"
 popd
 
@@ -67,6 +67,14 @@ if "%STOP_EXIT_CODE%"=="4" (
 echo 无法终止测评任务，退出码为 %STOP_EXIT_CODE%；评测 PostgreSQL 容器和临时数据卷已删除。
 endlocal
 exit /b %STOP_EXIT_CODE%
+
+:remove_eval_database
+docker compose --profile eval rm -f -s -v postgres-eval
+if errorlevel 1 exit /b %ERRORLEVEL%
+docker volume inspect readergo_postgres_eval_data >nul 2>&1
+if errorlevel 1 exit /b 0
+docker volume rm readergo_postgres_eval_data
+exit /b %ERRORLEVEL%
 
 :set_eval_flag
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$path = $env:READERGO_EVAL_ENV_FILE; $value = '%~1'; $content = [IO.File]::ReadAllText($path); $newline = if ($content.Contains([Environment]::NewLine)) { [Environment]::NewLine } else { [char]10 }; $pattern = [regex]'(?m)^RUN_RETRIEVAL_EVAL=[^\r\n]*'; if ($pattern.IsMatch($content)) { $content = $pattern.Replace($content, ('RUN_RETRIEVAL_EVAL=' + $value), 1) } else { if ($content.Length -gt 0 -and -not $content.EndsWith($newline)) { $content += $newline }; $content += 'RUN_RETRIEVAL_EVAL=' + $value + $newline }; [IO.File]::WriteAllText($path, $content, [Text.UTF8Encoding]::new($false))"

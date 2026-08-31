@@ -23,6 +23,7 @@ CREATE TABLE videos (
   title text NOT NULL DEFAULT '', 
   status video_status NOT NULL DEFAULT 'uploading',
   upload_method text NOT NULL DEFAULT 'url' CHECK (upload_method IN ('local_direct','url')),
+  content_sha256 text CHECK (content_sha256 IS NULL OR content_sha256 ~ '^[0-9a-f]{64}$'),
   paused_from_status text CHECK (paused_from_status IS NULL OR paused_from_status IN ('uploading','processing')),
   duration_ms bigint NOT NULL DEFAULT 0,
   object_key text NOT NULL DEFAULT '', 
@@ -32,6 +33,10 @@ CREATE TABLE videos (
 );
 -- 常用列表查询按租户与创建时间过滤。
 CREATE INDEX videos_tenant_id_idx ON videos(tenant_id, created_at DESC);
+-- 数据库负责并发去重；Redis 只负责减少同一文件的热点查询。
+CREATE UNIQUE INDEX videos_tenant_content_sha256_active_idx
+ON videos(tenant_id, content_sha256)
+WHERE content_sha256 IS NOT NULL AND status <> 'failed';
 -- processing_jobs 记录可重试的异步处理任务。
 CREATE TABLE processing_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), 

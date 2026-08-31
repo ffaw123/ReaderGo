@@ -7,11 +7,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"readergo/internal/cache"
 	"readergo/internal/config"
 	"readergo/internal/db"
 	"readergo/internal/media"
 	"readergo/internal/outbox"
 	"readergo/internal/queue"
+	"readergo/internal/uploaddedupe"
 	"readergo/internal/worker"
 
 	"github.com/google/uuid"
@@ -35,6 +37,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	redisClient, err := cache.NewRedis(context.Background(), configValue.RedisURL, configValue.RedisKeyPrefix)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer redisClient.Close()
+	uploadDeduper := uploaddedupe.New(database, redisClient, configValue.UploadDedupTTL)
 	prepareProcessor, err := worker.NewPrepareProcessor(database, ffmpeg, configValue.MinIOEndpoint, configValue.MinIOAccessKey, configValue.MinIOSecretKey, configValue.MinIOSecure, configValue.MinIOBucket, worker.PrepareOptions{
 		MaxFileSize:           int64(configValue.PrepareMaxFileSizeMiB) * 1024 * 1024,
 		MaxDuration:           configValue.PrepareMaxDuration,
@@ -73,7 +81,7 @@ func main() {
 	handler := worker.New(database, worker.NewRouterProcessor(prepareProcessor, asrProcessor, ocrProcessor, ragIndexProcessor, embeddingProcessor, summaryProcessor), writer, worker.Options{
 		WorkerID: "worker-" + uuid.NewString(), MaxAttempts: configValue.JobMaxAttempts,
 		RetryDelays: configValue.JobRetryDelays, LeaseTTL: configValue.JobLeaseTTL,
-		HeartbeatInterval: configValue.JobHeartbeatInterval,
+		HeartbeatInterval: configValue.JobHeartbeatInterval, UploadDeduper: uploadDeduper,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

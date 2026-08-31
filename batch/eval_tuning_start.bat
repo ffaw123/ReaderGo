@@ -52,9 +52,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem 每次从冻结快照开始，先清理可能残留的评测容器和匿名数据卷，不触碰业务 postgres_data。
+rem 每次从冻结快照开始，精确清理评测容器和具名卷，不触碰业务 postgres_data。
 echo 正在清理旧评测数据库容器和临时数据卷...
-docker compose --profile eval rm -f -s -v postgres-eval
+call :remove_eval_database
 if errorlevel 1 (
   echo 旧评测数据库清理失败。
   popd
@@ -65,7 +65,7 @@ echo 正在启动离线调参 PostgreSQL，并自动导入 retrieval_tuning_data
 docker compose --profile eval up -d --wait postgres-eval
 if errorlevel 1 (
   echo 离线测评专用 PostgreSQL 启动失败。
-  docker compose --profile eval rm -f -s -v postgres-eval >nul 2>&1
+  call :remove_eval_database >nul 2>&1
   popd
   exit /b 1
 )
@@ -73,7 +73,7 @@ if errorlevel 1 (
 call :set_eval_flag 1
 if errorlevel 1 (
   echo 无法将 RUN_RETRIEVAL_EVAL 设置为 1。
-  docker compose --profile eval rm -f -s -v postgres-eval >nul 2>&1
+  call :remove_eval_database >nul 2>&1
   popd
   exit /b 1
 )
@@ -102,6 +102,14 @@ echo 窗口将保持打开，请查看评测结果后按任意键关闭，或直
 pause >nul
 endlocal
 exit /b 0
+
+:remove_eval_database
+docker compose --profile eval rm -f -s -v postgres-eval
+if errorlevel 1 exit /b %ERRORLEVEL%
+docker volume inspect readergo_postgres_eval_data >nul 2>&1
+if errorlevel 1 exit /b 0
+docker volume rm readergo_postgres_eval_data
+exit /b %ERRORLEVEL%
 
 :set_eval_flag
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$path = $env:READERGO_EVAL_ENV_FILE; $value = '%~1'; $content = [IO.File]::ReadAllText($path); $newline = if ($content.Contains([Environment]::NewLine)) { [Environment]::NewLine } else { [char]10 }; $pattern = [regex]'(?m)^RUN_RETRIEVAL_EVAL=[^\r\n]*'; if ($pattern.IsMatch($content)) { $content = $pattern.Replace($content, ('RUN_RETRIEVAL_EVAL=' + $value), 1) } else { if ($content.Length -gt 0 -and -not $content.EndsWith($newline)) { $content += $newline }; $content += 'RUN_RETRIEVAL_EVAL=' + $value + $newline }; [IO.File]::WriteAllText($path, $content, [Text.UTF8Encoding]::new($false))"

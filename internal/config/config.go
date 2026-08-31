@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 )
 
 // Config 保存 API 与 Worker 共用的运行时配置。
@@ -16,6 +17,8 @@ import (
 type Config struct {
 	HTTPAddr, DatabaseURL, JWTSecret              string
 	JWTTTLHours                                   int
+	RedisURL, RedisKeyPrefix                      string
+	UploadDedupTTL                                time.Duration
 	MinIOEndpoint, MinIOAccessKey, MinIOSecretKey string
 	MinIOBucket                                   string
 	MinIOSecure                                   bool
@@ -114,10 +117,13 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	c := Config{
-		HTTPAddr:    value("HTTP_ADDR", ":8080"),
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-		JWTSecret:   os.Getenv("JWT_SECRET"),
-		JWTTTLHours: intValue("JWT_TTL_HOURS", 24),
+		HTTPAddr:       value("HTTP_ADDR", ":8080"),
+		DatabaseURL:    os.Getenv("DATABASE_URL"),
+		JWTSecret:      os.Getenv("JWT_SECRET"),
+		JWTTTLHours:    intValue("JWT_TTL_HOURS", 24),
+		RedisURL:       value("REDIS_URL", "redis://localhost:6379/0"),
+		RedisKeyPrefix: value("REDIS_KEY_PREFIX", "readergo"),
+		UploadDedupTTL: durationValue("UPLOAD_DEDUP_TTL", 15*time.Minute),
 
 		MinIOEndpoint:  os.Getenv("MINIO_ENDPOINT"),
 		MinIOAccessKey: os.Getenv("MINIO_ACCESS_KEY"),
@@ -186,6 +192,15 @@ func Load() (Config, error) {
 	}
 	if c.DatabaseURL == "" || len(c.JWTSecret) < 32 || c.MinIOEndpoint == "" || c.MinIOAccessKey == "" || c.MinIOSecretKey == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL, MinIO credentials, and a JWT_SECRET of at least 32 characters are required")
+	}
+	if _, err := redis.ParseURL(c.RedisURL); err != nil {
+		return Config{}, fmt.Errorf("REDIS_URL must be a valid redis URL: %w", err)
+	}
+	if strings.TrimSpace(c.RedisKeyPrefix) == "" || strings.Contains(c.RedisKeyPrefix, ":") {
+		return Config{}, fmt.Errorf("REDIS_KEY_PREFIX must be non-empty and must not contain ':'")
+	}
+	if c.UploadDedupTTL < time.Minute || c.UploadDedupTTL > 24*time.Hour {
+		return Config{}, fmt.Errorf("UPLOAD_DEDUP_TTL must be between 1m and 24h")
 	}
 	if c.UploadPartSizeMiB < 16 || c.UploadPartSizeMiB > 64 {
 		return Config{}, fmt.Errorf("UPLOAD_PART_SIZE_MIB must be between 16 and 64")

@@ -19,9 +19,11 @@ import (
 	"readergo/internal/outbox"
 	"readergo/internal/queue"
 	"readergo/internal/storage"
+	"readergo/internal/uploaddedupe"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -33,6 +35,7 @@ type Server struct {
 	chat     *chatservice.Service
 	outbox   *outbox.Writer
 	uploads  *storage.MultipartStore
+	deduper  *uploaddedupe.Service
 	partSize int64
 }
 
@@ -53,6 +56,8 @@ const (
 	maxPartURLBatch = 16
 	// S3 Multipart Upload 协议规定的最大分片数。
 	maxMultipartParts = 10000
+	// 只把上传内容去重索引冲突转换为业务 409，其他唯一约束错误仍按服务端错误处理。
+	uploadDedupConstraint = "videos_tenant_content_sha256_active_idx"
 )
 
 // createUploadRequest 仅接收客户端元数据，文件二进制不会经过 Gin 服务。
@@ -62,6 +67,7 @@ type createUploadRequest struct {
 	FileSize           int64  `json:"file_size" binding:"required,gt=0"`
 	FileLastModifiedMS int64  `json:"file_last_modified_ms" binding:"required,gt=0"`
 	FileFingerprint    string `json:"file_fingerprint" binding:"required,len=64"`
+	ContentSHA256      string `json:"content_sha256" binding:"required,len=64"`
 	Title              string `json:"title" binding:"max=512"`
 }
 
@@ -84,8 +90,12 @@ func (s *Server) createUpload(c *gin.Context) {
 		bad(c, "valid filename, file metadata and fingerprint are required")
 		return
 	}
-	if _, err := hex.DecodeString(in.FileFingerprint); err != nil || in.FileFingerprint != strings.ToLower(in.FileFingerprint) {
+	if !validLowerSHA256(in.FileFingerprint) {
 		bad(c, "file_fingerprint must be a lowercase SHA-256 hex string")
+		return
+	}
+	if !validLowerSHA256(in.ContentSHA256) {
+		bad(c, "content_sha256 must be a lowercase SHA-256 hex string")
 		return
 	}
 	// 文件大小和固定分片大小决定总数；最后一个分片可小于 partSize。
@@ -97,13 +107,36 @@ func (s *Server) createUpload(c *gin.Context) {
 	}
 	// tenantID 只能来自已验证 JWT，不能由请求体指定。
 	tenantID := auth.UserID(c)
+	if s.deduper != nil {
+		entry, found, err := s.deduper.Find(c.Request.Context(), tenantID, in.ContentSHA256)
+		if err != nil {
+			fail(c, err)
+			return
+		}
+		if found {
+			respondUploadDuplicate(c, entry.VideoID)
+			return
+		}
+	}
 	// 预先生成视频 ID，才能构造包含租户和视频归属的对象路径。
 	videoID := uuid.NewString()
 	// 使用固定对象名，不信任 filename 的扩展名；上传完成后由 FFprobe 校验真实媒体格式。
 	objectKey := fmt.Sprintf("tenants/%s/videos/%s/source/original", tenantID, videoID)
 	// 先创建 uploading 视频记录，让后续完成上传流程拥有稳定的资源归属。
-	v := model.Video{ID: videoID, TenantID: tenantID, SourceURL: "local://" + in.Filename, Title: in.Title, Status: model.VideoStatusUploading, UploadMethod: queue.UploadMethodLocalDirect, ObjectKey: objectKey}
+	contentSHA256 := in.ContentSHA256
+	v := model.Video{ID: videoID, TenantID: tenantID, SourceURL: "local://" + in.Filename, Title: in.Title, Status: model.VideoStatusUploading, ContentSHA256: &contentSHA256, UploadMethod: queue.UploadMethodLocalDirect, ObjectKey: objectKey}
 	if e := s.db.Create(&v).Error; e != nil {
+		if isUploadDedupConflict(e) && s.deduper != nil {
+			entry, found, findErr := s.deduper.Find(c.Request.Context(), tenantID, in.ContentSHA256)
+			if findErr == nil && found {
+				respondUploadDuplicate(c, entry.VideoID)
+				return
+			}
+			if findErr != nil {
+				fail(c, findErr)
+				return
+			}
+		}
 		fail(c, e)
 		return
 	}
@@ -139,7 +172,30 @@ func (s *Server) createUpload(c *gin.Context) {
 		fail(c, e)
 		return
 	}
+	if s.deduper != nil {
+		// 只有客户端已获得可用上传会话后才建立正缓存，避免缓存后续初始化失败的记录。
+		s.deduper.Remember(c.Request.Context(), tenantID, in.ContentSHA256, videoID)
+	}
 	c.JSON(http.StatusCreated, uploadSessionResponse(session, nil, parts))
+}
+
+func validLowerSHA256(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func isUploadDedupConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == uploadDedupConstraint
+}
+
+func respondUploadDuplicate(c *gin.Context, videoID string) {
+	c.JSON(http.StatusConflict, gin.H{
+		"error": "该视频已提交，无需重复上传", "code": "UPLOAD_DUPLICATE", "video_id": videoID,
+	})
 }
 
 // uploadPartURLs 按需批量签发 URL；客户端以 4 到 8 路并行 PUT 这些 URL 即可。
@@ -243,11 +299,20 @@ func (s *Server) cancelUploadSession(c *gin.Context) {
 
 // terminateUpload 在数据库行锁内中止 MinIO 会话，保证取消不会与完成操作并发穿透。
 func (s *Server) terminateUpload(ctx context.Context, sessionID, tenantID, terminalStatus, reason string) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	var contentSHA256 string
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var session model.UploadSession
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND tenant_id = ?", sessionID, tenantID).First(&session).Error; err != nil {
 			return err
+		}
+		var video model.Video
+		if err := tx.Select("id", "content_sha256").
+			Where("id = ? AND tenant_id = ?", session.VideoID, session.TenantID).First(&video).Error; err != nil {
+			return err
+		}
+		if video.ContentSHA256 != nil {
+			contentSHA256 = *video.ContentSHA256
 		}
 		if session.Status == terminalStatus {
 			return nil
@@ -265,6 +330,11 @@ func (s *Server) terminateUpload(ctx context.Context, sessionID, tenantID, termi
 			Where("id = ? AND tenant_id = ?", session.VideoID, session.TenantID).
 			Updates(map[string]any{"status": model.VideoStatusFailed, "error_message": reason}).Error
 	})
+	if err == nil && s.deduper != nil && contentSHA256 != "" {
+		// 数据库已允许相同文件重试后，再尽力删除可能存在的 Redis 正缓存。
+		s.deduper.Forget(ctx, tenantID, contentSHA256)
+	}
+	return err
 }
 
 // RunUploadCleanup 定期中止过期会话；失败会保留 uploading 状态，下一轮继续重试清理。
@@ -483,9 +553,9 @@ func firstPartNumbers(partCount int) []int {
 	return numbers
 }
 
-// New 使用数据库、鉴权、事务 Outbox 和视频上传组件创建 API 服务。
-func New(db *gorm.DB, authService *auth.Service, chatService *chatservice.Service, outboxWriter *outbox.Writer, uploads *storage.MultipartStore, partSize int64) *Server {
-	return &Server{db: db, auth: authService, chat: chatService, outbox: outboxWriter, uploads: uploads, partSize: partSize}
+// New 使用数据库、鉴权、事务 Outbox、视频上传和去重组件创建 API 服务。
+func New(db *gorm.DB, authService *auth.Service, chatService *chatservice.Service, outboxWriter *outbox.Writer, uploads *storage.MultipartStore, deduper *uploaddedupe.Service, partSize int64) *Server {
+	return &Server{db: db, auth: authService, chat: chatService, outbox: outboxWriter, uploads: uploads, deduper: deduper, partSize: partSize}
 }
 
 // Router 注册公开鉴权路由和必须携带 JWT 的业务路由。

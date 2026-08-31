@@ -1,11 +1,14 @@
 package api
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"readergo/internal/model"
 	"readergo/internal/storage"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestProcessingDurationMS(t *testing.T) {
@@ -26,6 +29,29 @@ func TestProcessingDurationMS(t *testing.T) {
 	}
 	if got := processingDurationMS(model.VideoStatusReady, nil, startedAt); got != 0 {
 		t.Fatalf("empty jobs duration = %d, want 0", got)
+	}
+}
+
+func TestValidLowerSHA256(t *testing.T) {
+	valid := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	if !validLowerSHA256(valid) {
+		t.Fatal("valid lowercase SHA-256 was rejected")
+	}
+	for _, value := range []string{valid[:63], strings.ToUpper(valid), strings.Repeat("g", 64)} {
+		if validLowerSHA256(value) {
+			t.Fatalf("invalid SHA-256 %q was accepted", value)
+		}
+	}
+}
+
+func TestIsUploadDedupConflictOnlyMatchesExpectedConstraint(t *testing.T) {
+	dedupErr := &pgconn.PgError{Code: "23505", ConstraintName: uploadDedupConstraint}
+	if !isUploadDedupConflict(dedupErr) {
+		t.Fatal("dedup unique conflict was not recognized")
+	}
+	otherErr := &pgconn.PgError{Code: "23505", ConstraintName: "users_email_key"}
+	if isUploadDedupConflict(otherErr) {
+		t.Fatal("unrelated unique conflict was treated as upload duplicate")
 	}
 }
 

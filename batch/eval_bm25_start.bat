@@ -47,7 +47,7 @@ if exist "%READERGO_EVAL_PID_FILE%" (
 
 rem 每次从冻结的调参快照恢复独立数据库，不会触碰业务 postgres_data。
 echo 正在清理旧评测数据库容器和临时数据卷...
-docker compose --profile eval rm -f -s -v postgres-eval
+call :remove_eval_database
 if errorlevel 1 (
   echo 旧评测数据库清理失败。
   popd
@@ -58,7 +58,7 @@ echo 正在启动 BM25 消融测试 PostgreSQL，并导入 retrieval_tuning_data
 docker compose --profile eval up -d --wait postgres-eval
 if errorlevel 1 (
   echo BM25 消融测试 PostgreSQL 启动失败。
-  docker compose --profile eval rm -f -s -v postgres-eval >nul 2>&1
+  call :remove_eval_database >nul 2>&1
   popd
   exit /b 1
 )
@@ -85,3 +85,11 @@ echo 窗口将保持打开，请查看结果后按任意键关闭，或直接手
 pause >nul
 endlocal
 exit /b 0
+
+:remove_eval_database
+docker compose --profile eval rm -f -s -v postgres-eval
+if errorlevel 1 exit /b %ERRORLEVEL%
+docker volume inspect readergo_postgres_eval_data >nul 2>&1
+if errorlevel 1 exit /b 0
+docker volume rm readergo_postgres_eval_data
+exit /b %ERRORLEVEL%

@@ -40,6 +40,8 @@ type Video struct {
 	SourceURL string `json:"source_url"`
 	Title     string `json:"title"`
 	Status    string `json:"status"`
+	// ContentSHA256 是本地源文件的完整内容摘要；URL 视频在下载校验前为空。
+	ContentSHA256 *string `gorm:"type:text" json:"-"`
 	// UploadMethod 持久化源文件进入方式，供暂停恢复时安全重建 RabbitMQ 消息。
 	UploadMethod     string    `json:"-"`
 	PausedFromStatus *string   `json:"paused_from_status,omitempty"`

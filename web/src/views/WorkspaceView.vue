@@ -33,7 +33,7 @@ import {
   X,
   Zap,
 } from 'lucide-vue-next'
-import { api, createFileIdentity, sameFileIdentity, uploadFileParts } from '../services/api'
+import { api, calculateContentSHA256, createFileIdentity, sameFileIdentity, uploadFileParts } from '../services/api'
 import { demoMessages, demoVideos } from '../lib/demo'
 
 const router = useRouter()
@@ -66,12 +66,14 @@ const uploadProgress = ref(0)
 const uploadError = ref('')
 const pendingUpload = ref(null)
 const uploadCanPause = ref(false)
+const uploadHashing = ref(false)
 const uploadCancelBusy = ref(false)
 const pauseSettled = ref(true)
 const statusActionBusy = ref(false)
 let statusTimer
 let toastTimer
 let uploadAbortController
+let hashAbortController
 
 const selectedVideo = computed(() => videos.value.find((video) => video.id === selectedId.value) || null)
 const hasStreamingAssistant = computed(() => messages.value.some((message) => message.streaming))
@@ -198,7 +200,7 @@ function loadPendingUpload() {
   }
 }
 
-function savePendingUpload(uploadSession, identity, title) {
+function savePendingUpload(uploadSession, identity, title, contentSHA256) {
   pendingUpload.value = {
     upload_id: uploadSession.upload_id,
     video_id: uploadSession.video_id,
@@ -206,6 +208,7 @@ function savePendingUpload(uploadSession, identity, title) {
     file_size: identity.file_size,
     file_last_modified_ms: identity.file_last_modified_ms,
     file_fingerprint: identity.file_fingerprint,
+    content_sha256: contentSHA256,
     expires_at: uploadSession.expires_at,
     progress: uploadSession.progress || 0,
     title,
@@ -635,6 +638,10 @@ function pauseLocalUpload() {
   uploadAbortController.abort()
 }
 
+function cancelHashCalculation() {
+  hashAbortController?.abort()
+}
+
 async function cancelPendingUpload() {
   if (!pendingUpload.value || uploadCancelBusy.value) {
     closeUpload()
@@ -720,6 +727,7 @@ async function submitUpload() {
       const file = selectedFile.value
       const title = file.name.replace(/\.[^.]+$/, '')
       const identity = await createFileIdentity(file)
+      let contentSHA256 = pendingUpload.value?.content_sha256 || ''
       let uploadSession
       if (pendingUpload.value) {
         if (!sameFileIdentity(identity, pendingUpload.value)) {
@@ -733,8 +741,19 @@ async function submitUpload() {
         }
       }
       if (!uploadSession) {
-        uploadSession = await api.createUpload(file, title, identity)
-        savePendingUpload(uploadSession, identity, title)
+        if (!contentSHA256) {
+          hashAbortController = new AbortController()
+          uploadHashing.value = true
+          uploadProgress.value = 0
+          try {
+            contentSHA256 = await calculateContentSHA256(file, (progress) => (uploadProgress.value = progress), hashAbortController.signal)
+          } finally {
+            hashAbortController = null
+            uploadHashing.value = false
+          }
+        }
+        uploadSession = await api.createUpload(file, title, identity, contentSHA256)
+        savePendingUpload(uploadSession, identity, title, contentSHA256)
       } else if (!sameFileIdentity(identity, uploadSession)) {
         throw new Error('服务端上传会话与所选文件不一致，已拒绝恢复')
       }
@@ -759,12 +778,30 @@ async function submitUpload() {
   } catch (error) {
     // 任一分片耗尽重试时立即终止同批并发 PUT，避免界面进入恢复态后后台仍继续传输。
     uploadAbortController?.abort()
-    if (error.name === 'AbortError') {
+    if (error.code === 'UPLOAD_DUPLICATE' && error.details?.video_id) {
+      try {
+        const video = await api.getVideo(error.details.video_id)
+        video.conversationId = getConversationId(video)
+        rememberVideo(video, video.conversationId)
+        videos.value = [video, ...videos.value.filter((item) => item.id !== video.id)]
+        selectedId.value = video.id
+        uploadProgress.value = 0
+        uploadBusy.value = false
+        closeUpload()
+        notify('该视频已存在，已为你打开')
+      } catch (loadError) {
+        uploadError.value = loadError.message
+      }
+    } else if (error.name === 'AbortError' && error.message === '文件校验已取消') {
+      uploadError.value = '文件校验已取消'
+    } else if (error.name === 'AbortError') {
       uploadError.value = '上传已暂停，继续时会从 MinIO 中缺失的分片恢复'
     } else {
       uploadError.value = pendingUpload.value ? `${error.message}；可稍后继续上传` : error.message
     }
   } finally {
+    hashAbortController = null
+    uploadHashing.value = false
     uploadAbortController = null
     uploadCanPause.value = false
     uploadBusy.value = false
@@ -825,6 +862,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  // 离开页面时同时停止本地哈希 Worker 和正在进行的 MinIO PUT。
+  hashAbortController?.abort()
   uploadAbortController?.abort()
   clearInterval(statusTimer)
   clearTimeout(toastTimer)
@@ -1213,7 +1252,7 @@ onBeforeUnmount(() => {
 
             <div v-if="uploadBusy || pendingUpload" class="upload-progress">
               <div>
-                <span>{{ uploadCanPause ? '正在上传视频分片' : pendingUpload ? '上传已暂停，可继续恢复' : '正在创建处理任务' }}</span>
+                <span>{{ uploadHashing ? '正在校验视频内容' : uploadCanPause ? '正在上传视频分片' : pendingUpload ? '上传已暂停，可继续恢复' : '正在创建处理任务' }}</span>
                 <strong>{{ uploadProgress }}%</strong>
               </div>
               <div class="progress-track"><span :style="{ width: `${Math.max(uploadProgress, 8)}%` }"></span></div>
@@ -1227,8 +1266,8 @@ onBeforeUnmount(() => {
               {{ pendingUpload ? '关闭或刷新后，重新选择同一文件即可继续' : '提交后可以关闭页面，处理会继续进行' }}
             </span>
             <div>
-              <button class="secondary-button" :disabled="uploadCancelBusy" @click="pendingUpload ? cancelPendingUpload() : closeUpload()">
-                {{ uploadCancelBusy ? '正在取消' : pendingUpload ? '取消上传' : '取消' }}
+              <button class="secondary-button" :disabled="uploadCancelBusy" @click="pendingUpload ? cancelPendingUpload() : uploadHashing ? cancelHashCalculation() : closeUpload()">
+                {{ uploadCancelBusy ? '正在取消' : pendingUpload ? '取消上传' : uploadHashing ? '取消校验' : '取消' }}
               </button>
               <button v-if="uploadCanPause" class="primary-button" @click="pauseLocalUpload">
                 <Pause :size="17" />

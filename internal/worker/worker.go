@@ -11,6 +11,7 @@ import (
 	"readergo/internal/model"
 	"readergo/internal/outbox"
 	"readergo/internal/queue"
+	"readergo/internal/uploaddedupe"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -29,6 +30,7 @@ type Options struct {
 	RetryDelays       []time.Duration
 	LeaseTTL          time.Duration
 	HeartbeatInterval time.Duration
+	UploadDeduper     *uploaddedupe.Service
 }
 
 // Consumer 只处理业务状态；RabbitMQ delivery tag 和 ACK 始终留在 queue 消费层。
@@ -37,13 +39,14 @@ type Consumer struct {
 	processor Processor
 	outbox    *outbox.Writer
 	options   Options
+	deduper   *uploaddedupe.Service
 }
 
 func New(db *gorm.DB, processor Processor, writer *outbox.Writer, options Options) *Consumer {
 	if options.WorkerID == "" {
 		options.WorkerID = uuid.NewString()
 	}
-	return &Consumer{db: db, processor: processor, outbox: writer, options: options}
+	return &Consumer{db: db, processor: processor, outbox: writer, options: options, deduper: options.UploadDeduper}
 }
 
 // Handle 在终态或下一次可靠通知已经提交后返回 nil，RabbitMQ 层此时才会 ACK。
@@ -258,7 +261,8 @@ func (x *Consumer) completeJob(ctx context.Context, job model.ProcessingJob, upl
 // 状态变更与 Outbox 写入保持原子性，避免任务状态已经变化但对应消息没有可靠生成。
 func (x *Consumer) handleProcessFailure(ctx context.Context, job model.ProcessingJob, uploadMethod string, processErr error) error {
 	errorMessage := processErr.Error()
-	return x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	var failedTenantID, failedContentSHA256 string
+	err := x.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var video model.Video
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&video, "id = ?", job.VideoID).Error; err != nil {
 			return err
@@ -296,8 +300,12 @@ func (x *Consumer) handleProcessFailure(ctx context.Context, job model.Processin
 		}).Error; err != nil {
 			return err
 		}
-		if _, err := x.reconcileVideoStatusLocked(tx, &video, uploadMethod); err != nil {
+		finalStatus, err := x.reconcileVideoStatusLocked(tx, &video, uploadMethod)
+		if err != nil {
 			return err
+		}
+		if finalStatus == model.VideoStatusFailed && video.ContentSHA256 != nil {
+			failedTenantID, failedContentSHA256 = video.TenantID, *video.ContentSHA256
 		}
 		if action == failureActionFailWithoutDeadLetter {
 			// 用户输入问题已经通过视频状态反馈，无需污染供运维排障使用的 DLQ。
@@ -306,6 +314,11 @@ func (x *Consumer) handleProcessFailure(ctx context.Context, job model.Processin
 		// 永久错误或耗尽重试的临时错误写入 DLX Outbox，由 Dispatcher 可靠发布到对应 DLQ。
 		return x.outbox.EnqueueDeadLetter(tx, current, uploadMethod)
 	})
+	if err == nil && x.deduper != nil && failedContentSHA256 != "" {
+		// Worker 终止处理后立即释放去重缓存，使用户无需等待 TTL 即可重新上传。
+		x.deduper.Forget(ctx, failedTenantID, failedContentSHA256)
+	}
+	return err
 }
 
 func (x *Consumer) retryDelay(failedAttempt int) time.Duration {
