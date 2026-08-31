@@ -818,7 +818,12 @@ async function submitUpload() {
   } catch (error) {
     // 任一分片耗尽重试时立即终止同批并发 PUT，避免界面进入恢复态后后台仍继续传输。
     uploadAbortController?.abort()
-    if (error.code === 'UPLOAD_DUPLICATE' && error.details?.video_id) {
+    if (error.code === 'UPLOAD_RATE_LIMITED') {
+      const retryAfterSeconds = Number(error.details?.retry_after_seconds) || 1
+      uploadProgress.value = 0
+      // 保留当前文件或 URL，用户等待令牌恢复后可以直接重新提交。
+      uploadError.value = `上传过于频繁，请在 ${retryAfterSeconds} 秒后重试`
+    } else if (error.code === 'UPLOAD_DUPLICATE' && error.details?.video_id) {
       try {
         const video = await api.getVideo(error.details.video_id)
         video.conversationId = getConversationId(video)

@@ -60,3 +60,21 @@ func TestRedisSetNX(t *testing.T) {
 		t.Fatalf("second SetNX = (%v, %v), want false", created, err)
 	}
 }
+
+func TestRedisEval(t *testing.T) {
+	server := miniredis.RunT(t)
+	client, err := NewRedis(context.Background(), "redis://"+server.Addr()+"/0", "readergo-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	key := client.Key("script", "counter")
+	result, err := client.Eval(context.Background(), `return redis.call('INCR', KEYS[1])`, []string{key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := result.(int64); !ok || value != 1 {
+		t.Fatalf("Eval result = %#v, want int64(1)", result)
+	}
+}

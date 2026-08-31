@@ -88,6 +88,11 @@ func (c *Client) SetNX(ctx context.Context, key string, value any, ttl time.Dura
 	return c.raw.SetNX(ctx, key, encoded, ttl).Result()
 }
 
+// Eval 原子执行由业务模块维护的 Lua 脚本；通用缓存层不解释脚本返回值。
+func (c *Client) Eval(ctx context.Context, script string, keys []string, args ...any) (any, error) {
+	return c.raw.Eval(ctx, script, keys, args...).Result()
+}
+
 func (c *Client) Close() error {
 	return c.raw.Close()
 }

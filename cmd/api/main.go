@@ -14,6 +14,7 @@ import (
 	"readergo/internal/outbox"
 	"readergo/internal/storage"
 	"readergo/internal/uploaddedupe"
+	"readergo/internal/uploadratelimit"
 	"syscall"
 	"time"
 )
@@ -35,6 +36,7 @@ func main() {
 	}
 	defer redisClient.Close()
 	uploadDeduper := uploaddedupe.New(d, redisClient, c.UploadDedupTTL)
+	uploadLimiter := uploadratelimit.New(redisClient, c.UploadRateLimitCapacity, c.UploadRateLimitRefillInterval, c.UploadRateLimitKeyTTL)
 	uploads, e := storage.NewMultipartStore(c.MinIOEndpoint, c.MinIOAccessKey, c.MinIOSecretKey, c.MinIOBucket, c.MinIOSecure, time.Duration(c.UploadURLTTLMinutes)*time.Minute)
 	if e != nil {
 		log.Fatal(e)
@@ -55,7 +57,7 @@ func main() {
 	}
 	// 视频任务仍只写入 Outbox；同步对话则由 chatService 在当前请求中完成。
 	writer := outbox.NewWriter(c.RabbitMQJobsExchange, c.RabbitMQDLXExchange)
-	server := api.New(d, auth.New(c.JWTSecret, c.JWTTTLHours), chatService, writer, uploads, uploadDeduper, int64(c.UploadPartSizeMiB)*1024*1024)
+	server := api.New(d, auth.New(c.JWTSecret, c.JWTTTLHours), chatService, writer, uploads, uploadDeduper, uploadLimiter, c.UploadRateLimitCapacity, int64(c.UploadPartSizeMiB)*1024*1024)
 	cleanupCtx, stopCleanup := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopCleanup()
 	// 过期会话会同时清理 MinIO 临时分片并保留数据库审计终态。

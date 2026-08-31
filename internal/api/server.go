@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"readergo/internal/queue"
 	"readergo/internal/storage"
 	"readergo/internal/uploaddedupe"
+	"readergo/internal/uploadratelimit"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -30,13 +32,19 @@ import (
 
 // Server 汇集 HTTP 接口依赖，避免处理器直接依赖全局变量。
 type Server struct {
-	db       *gorm.DB
-	auth     *auth.Service
-	chat     *chatservice.Service
-	outbox   *outbox.Writer
-	uploads  *storage.MultipartStore
-	deduper  *uploaddedupe.Service
-	partSize int64
+	db                  *gorm.DB
+	auth                *auth.Service
+	chat                *chatservice.Service
+	outbox              *outbox.Writer
+	uploads             *storage.MultipartStore
+	deduper             *uploaddedupe.Service
+	uploadLimiter       uploadLimiter
+	uploadLimitCapacity int
+	partSize            int64
+}
+
+type uploadLimiter interface {
+	Allow(ctx context.Context, tenantID string) (uploadratelimit.Result, error)
 }
 
 var (
@@ -107,6 +115,9 @@ func (s *Server) createUpload(c *gin.Context) {
 	}
 	// tenantID 只能来自已验证 JWT，不能由请求体指定。
 	tenantID := auth.UserID(c)
+	if !s.allowUpload(c) {
+		return
+	}
 	if s.deduper != nil {
 		entry, found, err := s.deduper.Find(c.Request.Context(), tenantID, in.ContentSHA256)
 		if err != nil {
@@ -553,9 +564,12 @@ func firstPartNumbers(partCount int) []int {
 	return numbers
 }
 
-// New 使用数据库、鉴权、事务 Outbox、视频上传和去重组件创建 API 服务。
-func New(db *gorm.DB, authService *auth.Service, chatService *chatservice.Service, outboxWriter *outbox.Writer, uploads *storage.MultipartStore, deduper *uploaddedupe.Service, partSize int64) *Server {
-	return &Server{db: db, auth: authService, chat: chatService, outbox: outboxWriter, uploads: uploads, deduper: deduper, partSize: partSize}
+// New 使用数据库、鉴权、事务 Outbox、视频上传、去重和限流组件创建 API 服务。
+func New(db *gorm.DB, authService *auth.Service, chatService *chatservice.Service, outboxWriter *outbox.Writer, uploads *storage.MultipartStore, deduper *uploaddedupe.Service, limiter uploadLimiter, uploadLimitCapacity int, partSize int64) *Server {
+	return &Server{
+		db: db, auth: authService, chat: chatService, outbox: outboxWriter, uploads: uploads,
+		deduper: deduper, uploadLimiter: limiter, uploadLimitCapacity: uploadLimitCapacity, partSize: partSize,
+	}
 }
 
 // Router 注册公开鉴权路由和必须携带 JWT 的业务路由。
@@ -669,6 +683,9 @@ func (s *Server) createVideo(c *gin.Context) {
 		return
 	}
 	tenant := auth.UserID(c)
+	if !s.allowUpload(c) {
+		return
+	}
 	v := model.Video{TenantID: tenant, SourceURL: in.SourceURL, Title: in.Title, Status: model.VideoStatusUploading, UploadMethod: queue.UploadMethodURL}
 	j := model.ProcessingJob{TenantID: tenant, VideoID: v.ID, TaskType: model.TaskPrepare, Status: model.JobStatusPending, Attempt: 1}
 	if e = s.db.Transaction(func(tx *gorm.DB) error {
@@ -1099,6 +1116,35 @@ func (s *Server) messages(c *gin.Context) {
 
 // bad 统一返回安全的客户端参数错误。
 func bad(c *gin.Context, msg string) { c.JSON(http.StatusBadRequest, gin.H{"error": msg}) }
+
+// allowUpload 统一限制本地文件和 URL 视频创建；Redis 故障时失败关闭，不能绕过额度。
+func (s *Server) allowUpload(c *gin.Context) bool {
+	if s.uploadLimiter == nil {
+		log.Printf("upload rate limiter is not configured")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "上传限流服务暂时不可用", "code": "UPLOAD_RATE_LIMIT_UNAVAILABLE"})
+		return false
+	}
+	result, err := s.uploadLimiter.Allow(c.Request.Context(), auth.UserID(c))
+	if err != nil {
+		log.Printf("consume upload rate limit token: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "上传限流服务暂时不可用", "code": "UPLOAD_RATE_LIMIT_UNAVAILABLE"})
+		return false
+	}
+	c.Header("X-RateLimit-Limit", strconv.Itoa(s.uploadLimitCapacity))
+	c.Header("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
+	if result.Allowed {
+		return true
+	}
+	retryAfterSeconds := int((result.RetryAfter + time.Second - 1) / time.Second)
+	if retryAfterSeconds < 1 {
+		retryAfterSeconds = 1
+	}
+	c.Header("Retry-After", strconv.Itoa(retryAfterSeconds))
+	c.JSON(http.StatusTooManyRequests, gin.H{
+		"error": "上传过于频繁，请稍后重试", "code": "UPLOAD_RATE_LIMITED", "retry_after_seconds": retryAfterSeconds,
+	})
+	return false
+}
 
 // fail 不向客户端泄露底层数据库或基础设施错误详情。
 func fail(c *gin.Context, e error) {

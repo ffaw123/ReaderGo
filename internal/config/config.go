@@ -19,6 +19,9 @@ type Config struct {
 	JWTTTLHours                                   int
 	RedisURL, RedisKeyPrefix                      string
 	UploadDedupTTL                                time.Duration
+	UploadRateLimitCapacity                       int
+	UploadRateLimitRefillInterval                 time.Duration
+	UploadRateLimitKeyTTL                         time.Duration
 	MinIOEndpoint, MinIOAccessKey, MinIOSecretKey string
 	MinIOBucket                                   string
 	MinIOSecure                                   bool
@@ -116,14 +119,21 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	uploadRateLimitCapacity, err := strictIntValue("UPLOAD_RATE_LIMIT_CAPACITY", 5)
+	if err != nil {
+		return Config{}, err
+	}
 	c := Config{
-		HTTPAddr:       value("HTTP_ADDR", ":8080"),
-		DatabaseURL:    os.Getenv("DATABASE_URL"),
-		JWTSecret:      os.Getenv("JWT_SECRET"),
-		JWTTTLHours:    intValue("JWT_TTL_HOURS", 24),
-		RedisURL:       value("REDIS_URL", "redis://localhost:6379/0"),
-		RedisKeyPrefix: value("REDIS_KEY_PREFIX", "readergo"),
-		UploadDedupTTL: durationValue("UPLOAD_DEDUP_TTL", 15*time.Minute),
+		HTTPAddr:                      value("HTTP_ADDR", ":8080"),
+		DatabaseURL:                   os.Getenv("DATABASE_URL"),
+		JWTSecret:                     os.Getenv("JWT_SECRET"),
+		JWTTTLHours:                   intValue("JWT_TTL_HOURS", 24),
+		RedisURL:                      value("REDIS_URL", "redis://localhost:6379/0"),
+		RedisKeyPrefix:                value("REDIS_KEY_PREFIX", "readergo"),
+		UploadDedupTTL:                durationValue("UPLOAD_DEDUP_TTL", 15*time.Minute),
+		UploadRateLimitCapacity:       uploadRateLimitCapacity,
+		UploadRateLimitRefillInterval: durationValue("UPLOAD_RATE_LIMIT_REFILL_INTERVAL", 90*time.Second),
+		UploadRateLimitKeyTTL:         durationValue("UPLOAD_RATE_LIMIT_KEY_TTL", 15*time.Minute),
 
 		MinIOEndpoint:  os.Getenv("MINIO_ENDPOINT"),
 		MinIOAccessKey: os.Getenv("MINIO_ACCESS_KEY"),
@@ -201,6 +211,9 @@ func Load() (Config, error) {
 	}
 	if c.UploadDedupTTL < time.Minute || c.UploadDedupTTL > 24*time.Hour {
 		return Config{}, fmt.Errorf("UPLOAD_DEDUP_TTL must be between 1m and 24h")
+	}
+	if err := validateUploadRateLimit(c.UploadRateLimitCapacity, c.UploadRateLimitRefillInterval, c.UploadRateLimitKeyTTL); err != nil {
+		return Config{}, err
 	}
 	if c.UploadPartSizeMiB < 16 || c.UploadPartSizeMiB > 64 {
 		return Config{}, fmt.Errorf("UPLOAD_PART_SIZE_MIB must be between 16 and 64")
@@ -281,6 +294,20 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("YT_DLP_MAX_HEIGHT must be between 144 and 4320")
 	}
 	return c, nil
+}
+
+func validateUploadRateLimit(capacity int, refillInterval, keyTTL time.Duration) error {
+	if capacity < 1 || capacity > 100 {
+		return fmt.Errorf("UPLOAD_RATE_LIMIT_CAPACITY must be between 1 and 100")
+	}
+	if refillInterval < time.Second || refillInterval > 24*time.Hour {
+		return fmt.Errorf("UPLOAD_RATE_LIMIT_REFILL_INTERVAL must be between 1s and 24h")
+	}
+	minimumTTL := time.Duration(capacity) * refillInterval
+	if keyTTL < minimumTTL || keyTTL > 7*24*time.Hour {
+		return fmt.Errorf("UPLOAD_RATE_LIMIT_KEY_TTL must be between %s and 168h", minimumTTL)
+	}
+	return nil
 }
 
 func boolValue(k string, fallback bool) bool {
