@@ -37,6 +37,8 @@ import { api, calculateContentSHA256, createFileIdentity, sameFileIdentity, uplo
 import { demoMessages, demoVideos } from '../lib/demo'
 
 const router = useRouter()
+// 这里只限制页面进入时的按需请求频率，不会每十秒自动轮询视频列表。
+const videoListRefreshIntervalMs = 10 * 1000
 const session = ref(null)
 const previewMode = ref(sessionStorage.getItem('readergo_preview') === 'true')
 const videos = ref([])
@@ -184,6 +186,10 @@ function cacheKey() {
   return `readergo_videos_${session.value?.user?.id || 'anonymous'}`
 }
 
+function videoListCacheKey() {
+  return `readergo_video_list_${session.value?.user?.id || 'anonymous'}`
+}
+
 function pendingUploadKey() {
   return `readergo_pending_upload_${session.value?.user?.id || 'anonymous'}`
 }
@@ -236,10 +242,32 @@ function getCachedEntries() {
   }
 }
 
+function getCachedVideoList() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(videoListCacheKey()) || 'null')
+    if (!cached || !Array.isArray(cached.items)) return { fetchedAt: 0, items: [] }
+    return { fetchedAt: Number(cached.fetched_at) || 0, items: cached.items }
+  } catch {
+    return { fetchedAt: 0, items: [] }
+  }
+}
+
+function saveCachedVideoList(items, fetchedAt) {
+  localStorage.setItem(
+    videoListCacheKey(),
+    JSON.stringify({ fetched_at: fetchedAt, items }),
+  )
+}
+
 function rememberVideo(video, conversationId = '') {
   const entries = getCachedEntries().filter((item) => item.id !== video.id)
   entries.unshift({ id: video.id, title: video.title, conversationId })
-  localStorage.setItem(cacheKey(), JSON.stringify(entries.slice(0, 50)))
+  localStorage.setItem(cacheKey(), JSON.stringify(entries))
+
+  // 上传成功后直接把接口返回的视频写入列表缓存，不为更新列表再发送一次请求。
+  const cached = getCachedVideoList()
+  const items = [video, ...cached.items.filter((item) => item.id !== video.id)]
+  saveCachedVideoList(items, cached.fetchedAt)
 }
 
 function getConversationId(video) {
@@ -271,20 +299,32 @@ async function loadVideos() {
     return
   }
   loadingVideos.value = true
-  const entries = getCachedEntries()
-  const loaded = await Promise.all(
-    entries.map(async (entry) => {
-      try {
-        const video = await api.getVideo(entry.id)
-        return { ...video, conversationId: entry.conversationId }
-      } catch {
-        return null
-      }
-    }),
-  )
-  videos.value = loaded.filter(Boolean)
-  selectedId.value = videos.value[0]?.id || ''
-  loadingVideos.value = false
+  const cached = getCachedVideoList()
+  const now = Date.now()
+  const cacheIsFresh = now >= cached.fetchedAt && now - cached.fetchedAt < videoListRefreshIntervalMs
+  let items = cached.items
+  try {
+    if (!cacheIsFresh) {
+      const result = await api.listVideos()
+      items = Array.isArray(result?.items) ? result.items : []
+      saveCachedVideoList(items, Date.now())
+    }
+    // 会话 ID 仍沿用原有本地索引；视频目录本身以服务端列表为准。
+    const localEntries = new Map(getCachedEntries().map((entry) => [entry.id, entry]))
+    videos.value = items.map((video) => ({
+      ...video,
+      conversationId: localEntries.get(video.id)?.conversationId || '',
+    }))
+    // 服务端按 created_at 倒序返回，因此第一条就是默认展示的最新视频。
+    selectedId.value = videos.value[0]?.id || ''
+  } catch (error) {
+    // 网络临时不可用时保留最近列表；401 已由请求层清理登录态并跳转。
+    videos.value = cached.items
+    selectedId.value = videos.value[0]?.id || ''
+    if (error.status !== 401) notify(error.message, 'error')
+  } finally {
+    loadingVideos.value = false
+  }
 }
 
 function selectVideo(video) {

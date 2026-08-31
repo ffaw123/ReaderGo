@@ -113,6 +113,7 @@ async function streamRequest(path, options, onDelta) {
 export const api = {
   login: (body) => request('/api/auth/login', { method: 'POST', body: JSON.stringify(body) }),
   register: (body) => request('/api/auth/register', { method: 'POST', body: JSON.stringify(body) }),
+  listVideos: () => request('/api/videos'),
   createVideo: (body) => request('/api/videos', { method: 'POST', body: JSON.stringify(body) }),
   getVideo: (id) => request(`/api/videos/${id}`),
   getVideoStatus: (id, details = false) => request(`/api/videos/${id}/status${details ? '?details=true' : ''}`),

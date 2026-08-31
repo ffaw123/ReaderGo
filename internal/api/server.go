@@ -575,6 +575,7 @@ func (s *Server) Router() *gin.Engine {
 	p.POST("/uploads/:id/parts", s.uploadPartURLs)
 	p.POST("/uploads/:id/complete", s.completeUpload)
 	p.DELETE("/uploads/:id", s.cancelUploadSession)
+	p.GET("/videos", s.listVideos)
 	p.GET("/videos/:id", s.getVideo) // 这里的id是指视频id
 	p.GET("/videos/:id/status", s.videoStatus)
 	p.POST("/videos/:id/pause", s.pauseVideo)
@@ -702,6 +703,21 @@ func (s *Server) getVideo(c *gin.Context) {
 	if ok {
 		c.JSON(http.StatusOK, v)
 	}
+}
+
+// listVideos 返回当前用户的全部视频，前端默认展示第一条最新记录。
+func (s *Server) listVideos(c *gin.Context) {
+	tenantID := auth.UserID(c)
+	items := make([]model.Video, 0)
+	err := s.db.WithContext(c.Request.Context()).
+		Where("tenant_id = ?", tenantID).
+		Order("created_at DESC").
+		Find(&items).Error
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
 // pauseVideo 只改变视频的期望运行状态；正在执行的任务由 Worker 确认取消后回到 pending。
