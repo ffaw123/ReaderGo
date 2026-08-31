@@ -72,46 +72,45 @@ type Config struct {
 	PrepareMaxDuration time.Duration
 }
 
+const (
+	// 以下参数属于服务内部策略，统一以内嵌常量维护，避免普通用户误改后破坏任务一致性。
+	internalJWTTTLHours                  = 24
+	internalRedisKeyPrefix               = "readergo"
+	internalUploadDedupTTL               = 15 * time.Minute
+	internalUploadRateLimitCapacity      = 5
+	internalUploadRateLimitRefill        = 90 * time.Second
+	internalUploadRateLimitKeyTTL        = 15 * time.Minute
+	internalMinIOBucket                  = "videos"
+	internalRabbitMQJobsExchange         = "readergo.video.jobs"
+	internalRabbitMQDLXExchange          = "readergo.video.dlx"
+	internalRabbitMQPrefetch             = 1
+	internalRabbitMQConsumerTimeout      = 6 * time.Hour
+	internalJobMaxAttempts               = 4
+	internalJobLeaseTTL                  = 2 * time.Minute
+	internalJobHeartbeatInterval         = 30 * time.Second
+	internalOutboxPollInterval           = 500 * time.Millisecond
+	internalOutboxBatchSize              = 100
+	internalOCRSceneThreshold            = 0.3
+	internalOCRHashDistance              = 5
+	internalRAGRequestTimeout            = 2 * time.Minute
+	internalChatRequestTimeout           = time.Minute
+	internalChatMaxInputRunes            = 4000
+	internalChatHistoryTurns             = 3
+	internalChatRAGMinSimilarity         = 0.25
+	internalIntentRequestTimeout         = 20 * time.Second
+	internalIntentConfidenceThreshold    = 0.75
+	internalUploadPartSizeMiB            = 32
+	internalUploadURLTTLMinutes          = 15
+	internalPrepareConnectTimeout        = 10 * time.Second
+	internalPrepareResponseHeaderTimeout = 30 * time.Second
+	internalPrepareDownloadTimeout       = 2 * time.Hour
+	internalPrepareMaxRedirects          = 5
+)
+
 // Load 优先加载本地 .env，再校验生产环境必填配置。
 func Load() (Config, error) {
 	_ = godotenv.Load()
-	retryDelays, err := durationListValue("JOB_RETRY_DELAYS", "30s,5m,30m")
-	if err != nil {
-		return Config{}, err
-	}
-	rabbitPrefetch, err := strictIntValue("RABBITMQ_PREFETCH", 1)
-	if err != nil {
-		return Config{}, err
-	}
-	jobMaxAttempts, err := strictIntValue("JOB_MAX_ATTEMPTS", 4)
-	if err != nil {
-		return Config{}, err
-	}
-	outboxBatchSize, err := strictIntValue("OUTBOX_BATCH_SIZE", 100)
-	if err != nil {
-		return Config{}, err
-	}
-	intentConfidenceThreshold, err := strictFloatValue("INTENT_CONFIDENCE_THRESHOLD", 0.75)
-	if err != nil {
-		return Config{}, err
-	}
-	chatRAGMinSimilarity, err := strictFloatValue("CHAT_RAG_MIN_SIMILARITY", 0.25)
-	if err != nil {
-		return Config{}, err
-	}
-	chatMaxInputRunes, err := strictIntValue("CHAT_MAX_INPUT_RUNES", 4000)
-	if err != nil {
-		return Config{}, err
-	}
-	chatHistoryTurns, err := strictIntValue("CHAT_HISTORY_TURNS", 3)
-	if err != nil {
-		return Config{}, err
-	}
 	prepareMaxFileSizeMiB, err := strictIntValue("PREPARE_MAX_FILE_SIZE_MIB", 2048)
-	if err != nil {
-		return Config{}, err
-	}
-	prepareMaxRedirects, err := strictIntValue("PREPARE_MAX_REDIRECTS", 5)
 	if err != nil {
 		return Config{}, err
 	}
@@ -119,83 +118,79 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	uploadRateLimitCapacity, err := strictIntValue("UPLOAD_RATE_LIMIT_CAPACITY", 5)
-	if err != nil {
-		return Config{}, err
-	}
 	c := Config{
 		HTTPAddr:                      value("HTTP_ADDR", ":8080"),
 		DatabaseURL:                   os.Getenv("DATABASE_URL"),
 		JWTSecret:                     os.Getenv("JWT_SECRET"),
-		JWTTTLHours:                   intValue("JWT_TTL_HOURS", 24),
+		JWTTTLHours:                   internalJWTTTLHours,
 		RedisURL:                      value("REDIS_URL", "redis://localhost:6379/0"),
-		RedisKeyPrefix:                value("REDIS_KEY_PREFIX", "readergo"),
-		UploadDedupTTL:                durationValue("UPLOAD_DEDUP_TTL", 15*time.Minute),
-		UploadRateLimitCapacity:       uploadRateLimitCapacity,
-		UploadRateLimitRefillInterval: durationValue("UPLOAD_RATE_LIMIT_REFILL_INTERVAL", 90*time.Second),
-		UploadRateLimitKeyTTL:         durationValue("UPLOAD_RATE_LIMIT_KEY_TTL", 15*time.Minute),
+		RedisKeyPrefix:                internalRedisKeyPrefix,
+		UploadDedupTTL:                internalUploadDedupTTL,
+		UploadRateLimitCapacity:       internalUploadRateLimitCapacity,
+		UploadRateLimitRefillInterval: internalUploadRateLimitRefill,
+		UploadRateLimitKeyTTL:         internalUploadRateLimitKeyTTL,
 
 		MinIOEndpoint:  os.Getenv("MINIO_ENDPOINT"),
 		MinIOAccessKey: os.Getenv("MINIO_ACCESS_KEY"),
 		MinIOSecretKey: os.Getenv("MINIO_SECRET_KEY"),
-		MinIOBucket:    value("MINIO_BUCKET", "videos"),
+		MinIOBucket:    internalMinIOBucket,
 		MinIOSecure:    boolValue("MINIO_SECURE", false),
 
 		RabbitMQURL:             value("RABBITMQ_URL", "amqp://readergo:readergo-secret@localhost:5672/readergo"),
-		RabbitMQJobsExchange:    value("RABBITMQ_JOBS_EXCHANGE", "readergo.video.jobs"),
-		RabbitMQDLXExchange:     value("RABBITMQ_DLX_EXCHANGE", "readergo.video.dlx"),
-		RabbitMQPrefetch:        rabbitPrefetch,
-		RabbitMQConsumerTimeout: durationMillisecondsValue("RABBITMQ_CONSUMER_TIMEOUT_MS", 6*time.Hour),
+		RabbitMQJobsExchange:    internalRabbitMQJobsExchange,
+		RabbitMQDLXExchange:     internalRabbitMQDLXExchange,
+		RabbitMQPrefetch:        internalRabbitMQPrefetch,
+		RabbitMQConsumerTimeout: internalRabbitMQConsumerTimeout,
 
-		JobMaxAttempts:       jobMaxAttempts,
-		JobRetryDelays:       retryDelays,
-		JobLeaseTTL:          durationValue("JOB_LEASE_TTL", 2*time.Minute),
-		JobHeartbeatInterval: durationValue("JOB_HEARTBEAT_INTERVAL", 30*time.Second),
-		OutboxPollInterval:   durationMillisecondsValue("OUTBOX_POLL_INTERVAL_MS", 500*time.Millisecond),
-		OutboxBatchSize:      outboxBatchSize,
+		JobMaxAttempts:       internalJobMaxAttempts,
+		JobRetryDelays:       []time.Duration{30 * time.Second, 5 * time.Minute, 30 * time.Minute},
+		JobLeaseTTL:          internalJobLeaseTTL,
+		JobHeartbeatInterval: internalJobHeartbeatInterval,
+		OutboxPollInterval:   internalOutboxPollInterval,
+		OutboxBatchSize:      internalOutboxBatchSize,
 
 		FFmpegPath:     value("FFMPEG_PATH", "ffmpeg"),
 		ASRAPIKey:      os.Getenv("ASR_API_KEY"),
 		ASRBaseURL:     value("ASR_BASE_URL", "https://api.xiaomimimo.com/v1"),
 		ASRModel:       value("ASR_MODEL", "mimo-v2.5-asr"),
-		ASRConcurrency: intValue("ASR_CONCURRENCY", 10),
+		ASRConcurrency: intValue("ASR_CONCURRENCY", 3),
 
 		OCRAPIKey:         os.Getenv("OCR_API_KEY"),
 		OCRBaseURL:        os.Getenv("OCR_BASE_URL"),
 		OCRModel:          value("OCR_MODEL", "qwen-vl-ocr"),
-		OCRSceneThreshold: floatValue("OCR_SCENE_THRESHOLD", 0.3),
-		OCRHashDistance:   intValue("OCR_HASH_DISTANCE", 5),
-		OCRConcurrency:    intValue("OCR_CONCURRENCY", 10),
+		OCRSceneThreshold: internalOCRSceneThreshold,
+		OCRHashDistance:   internalOCRHashDistance,
+		OCRConcurrency:    intValue("OCR_CONCURRENCY", 5),
 
 		RAGAPIKey:         os.Getenv("RAG_API_KEY"),
 		RAGBaseURL:        value("RAG_BASE_URL", "https://api.openai.com/v1"),
 		RAGChatModel:      value("RAG_CHAT_MODEL", "gpt-4.1-mini"),
 		RAGEmbeddingModel: value("RAG_EMBEDDING_MODEL", "text-embedding-3-small"),
 		RAGConcurrency:    intValue("RAG_CONCURRENCY", 10),
-		RAGRequestTimeout: durationValue("RAG_REQUEST_TIMEOUT", 2*time.Minute),
+		RAGRequestTimeout: internalRAGRequestTimeout,
 
 		ChatAPIKey:           os.Getenv("CHAT_API_KEY"),
 		ChatBaseURL:          value("CHAT_BASE_URL", "https://api.openai.com/v1"),
 		ChatModel:            value("CHAT_MODEL", "gpt-4.1-mini"),
-		ChatRequestTimeout:   durationValue("CHAT_REQUEST_TIMEOUT", time.Minute),
-		ChatRAGMinSimilarity: chatRAGMinSimilarity,
-		ChatMaxInputRunes:    chatMaxInputRunes,
-		ChatHistoryTurns:     chatHistoryTurns,
+		ChatRequestTimeout:   internalChatRequestTimeout,
+		ChatRAGMinSimilarity: internalChatRAGMinSimilarity,
+		ChatMaxInputRunes:    internalChatMaxInputRunes,
+		ChatHistoryTurns:     internalChatHistoryTurns,
 
 		IntentAPIKey:              os.Getenv("INTENT_API_KEY"),
 		IntentBaseURL:             value("INTENT_BASE_URL", "https://api.openai.com/v1"),
 		IntentModel:               value("INTENT_MODEL", "gpt-4.1-mini"),
-		IntentRequestTimeout:      durationValue("INTENT_REQUEST_TIMEOUT", 20*time.Second),
-		IntentConfidenceThreshold: intentConfidenceThreshold,
+		IntentRequestTimeout:      internalIntentRequestTimeout,
+		IntentConfidenceThreshold: internalIntentConfidenceThreshold,
 
-		UploadPartSizeMiB:   intValue("UPLOAD_PART_SIZE_MIB", 32),
-		UploadURLTTLMinutes: intValue("UPLOAD_URL_TTL_MINUTES", 15),
+		UploadPartSizeMiB:   internalUploadPartSizeMiB,
+		UploadURLTTLMinutes: internalUploadURLTTLMinutes,
 
 		PrepareMaxFileSizeMiB:        prepareMaxFileSizeMiB,
-		PrepareConnectTimeout:        durationValue("PREPARE_CONNECT_TIMEOUT", 10*time.Second),
-		PrepareResponseHeaderTimeout: durationValue("PREPARE_RESPONSE_HEADER_TIMEOUT", 30*time.Second),
-		PrepareDownloadTimeout:       durationValue("PREPARE_DOWNLOAD_TIMEOUT", 2*time.Hour),
-		PrepareMaxRedirects:          prepareMaxRedirects,
+		PrepareConnectTimeout:        internalPrepareConnectTimeout,
+		PrepareResponseHeaderTimeout: internalPrepareResponseHeaderTimeout,
+		PrepareDownloadTimeout:       internalPrepareDownloadTimeout,
+		PrepareMaxRedirects:          internalPrepareMaxRedirects,
 		PrepareMaxDuration:           durationValue("PREPARE_MAX_DURATION", 6*time.Hour),
 		YTDLPPath:                    value("YT_DLP_PATH", "yt-dlp"),
 		YTDLPMaxHeight:               ytdlpMaxHeight,
@@ -206,49 +201,12 @@ func Load() (Config, error) {
 	if _, err := redis.ParseURL(c.RedisURL); err != nil {
 		return Config{}, fmt.Errorf("REDIS_URL must be a valid redis URL: %w", err)
 	}
-	if strings.TrimSpace(c.RedisKeyPrefix) == "" || strings.Contains(c.RedisKeyPrefix, ":") {
-		return Config{}, fmt.Errorf("REDIS_KEY_PREFIX must be non-empty and must not contain ':'")
-	}
-	if c.UploadDedupTTL < time.Minute || c.UploadDedupTTL > 24*time.Hour {
-		return Config{}, fmt.Errorf("UPLOAD_DEDUP_TTL must be between 1m and 24h")
-	}
-	if err := validateUploadRateLimit(c.UploadRateLimitCapacity, c.UploadRateLimitRefillInterval, c.UploadRateLimitKeyTTL); err != nil {
-		return Config{}, err
-	}
-	if c.UploadPartSizeMiB < 16 || c.UploadPartSizeMiB > 64 {
-		return Config{}, fmt.Errorf("UPLOAD_PART_SIZE_MIB must be between 16 and 64")
-	}
 	parsedRabbitURL, err := url.Parse(c.RabbitMQURL)
 	if err != nil || (parsedRabbitURL.Scheme != "amqp" && parsedRabbitURL.Scheme != "amqps") || parsedRabbitURL.Host == "" {
 		return Config{}, fmt.Errorf("RABBITMQ_URL must be a valid amqp or amqps URL")
 	}
-	if strings.TrimSpace(c.RabbitMQJobsExchange) == "" || strings.TrimSpace(c.RabbitMQDLXExchange) == "" {
-		return Config{}, fmt.Errorf("RabbitMQ exchange names must not be empty")
-	}
-	if c.RabbitMQPrefetch < 1 || c.RabbitMQPrefetch > 1000 {
-		return Config{}, fmt.Errorf("RABBITMQ_PREFETCH must be between 1 and 1000")
-	}
-	if c.RabbitMQConsumerTimeout <= 0 {
-		return Config{}, fmt.Errorf("RABBITMQ_CONSUMER_TIMEOUT_MS must be positive")
-	}
-	if c.JobMaxAttempts < 1 || c.JobMaxAttempts > 100 || len(c.JobRetryDelays) < c.JobMaxAttempts-1 {
-		return Config{}, fmt.Errorf("JOB_RETRY_DELAYS must provide at least JOB_MAX_ATTEMPTS - 1 positive delays")
-	}
-	// 心跳必须显著早于租约到期，避免正常长任务被 Reconciler 误回收。
-	if c.JobLeaseTTL <= 0 || c.JobHeartbeatInterval <= 0 || c.JobHeartbeatInterval*2 >= c.JobLeaseTTL {
-		return Config{}, fmt.Errorf("JOB_HEARTBEAT_INTERVAL must be positive and less than half of JOB_LEASE_TTL")
-	}
-	if c.OutboxPollInterval <= 0 || c.OutboxBatchSize < 1 || c.OutboxBatchSize > 1000 {
-		return Config{}, fmt.Errorf("Outbox poll interval and batch size must be within valid bounds")
-	}
 	if c.ASRConcurrency < 1 || c.ASRConcurrency > 10 {
 		return Config{}, fmt.Errorf("ASR_CONCURRENCY must be between 1 and 10")
-	}
-	if c.OCRSceneThreshold <= 0 || c.OCRSceneThreshold > 1 {
-		return Config{}, fmt.Errorf("OCR_SCENE_THRESHOLD must be greater than 0 and at most 1")
-	}
-	if c.OCRHashDistance < 0 || c.OCRHashDistance > 64 {
-		return Config{}, fmt.Errorf("OCR_HASH_DISTANCE must be between 0 and 64")
 	}
 	if c.OCRConcurrency < 1 || c.OCRConcurrency > 10 {
 		return Config{}, fmt.Errorf("OCR_CONCURRENCY must be between 1 and 10")
@@ -256,33 +214,8 @@ func Load() (Config, error) {
 	if c.RAGConcurrency < 1 || c.RAGConcurrency > 10 {
 		return Config{}, fmt.Errorf("RAG_CONCURRENCY must be between 1 and 10")
 	}
-	if c.RAGRequestTimeout <= 0 {
-		return Config{}, fmt.Errorf("RAG_REQUEST_TIMEOUT must be positive")
-	}
-	if c.ChatRequestTimeout <= 0 || c.IntentRequestTimeout <= 0 {
-		return Config{}, fmt.Errorf("CHAT_REQUEST_TIMEOUT and INTENT_REQUEST_TIMEOUT must be positive")
-	}
-	if c.IntentConfidenceThreshold <= 0 || c.IntentConfidenceThreshold > 1 {
-		return Config{}, fmt.Errorf("INTENT_CONFIDENCE_THRESHOLD must be greater than 0 and at most 1")
-	}
-	if c.ChatRAGMinSimilarity < -1 || c.ChatRAGMinSimilarity > 1 {
-		return Config{}, fmt.Errorf("CHAT_RAG_MIN_SIMILARITY must be between -1 and 1")
-	}
-	if c.ChatMaxInputRunes < 1 || c.ChatMaxInputRunes > 20000 || c.ChatHistoryTurns < 1 || c.ChatHistoryTurns > 10 {
-		return Config{}, fmt.Errorf("CHAT_MAX_INPUT_RUNES and CHAT_HISTORY_TURNS are outside the supported range")
-	}
-	// 预签名 URL 的过期时间远短于上传会话，客户端可在失效后重新申请同一分片的 URL。
-	if c.UploadURLTTLMinutes < 1 || c.UploadURLTTLMinutes > 60 {
-		return Config{}, fmt.Errorf("UPLOAD_URL_TTL_MINUTES must be between 1 and 60")
-	}
 	if c.PrepareMaxFileSizeMiB < 1 || c.PrepareMaxFileSizeMiB > 10240 {
 		return Config{}, fmt.Errorf("PREPARE_MAX_FILE_SIZE_MIB must be between 1 and 10240")
-	}
-	if c.PrepareConnectTimeout <= 0 || c.PrepareResponseHeaderTimeout <= 0 || c.PrepareDownloadTimeout <= 0 {
-		return Config{}, fmt.Errorf("prepare download timeouts must be positive")
-	}
-	if c.PrepareMaxRedirects < 0 || c.PrepareMaxRedirects > 10 {
-		return Config{}, fmt.Errorf("PREPARE_MAX_REDIRECTS must be between 0 and 10")
 	}
 	if c.PrepareMaxDuration <= 0 || c.PrepareMaxDuration > 24*time.Hour {
 		return Config{}, fmt.Errorf("PREPARE_MAX_DURATION must be positive and at most 24h")
@@ -294,20 +227,6 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("YT_DLP_MAX_HEIGHT must be between 144 and 4320")
 	}
 	return c, nil
-}
-
-func validateUploadRateLimit(capacity int, refillInterval, keyTTL time.Duration) error {
-	if capacity < 1 || capacity > 100 {
-		return fmt.Errorf("UPLOAD_RATE_LIMIT_CAPACITY must be between 1 and 100")
-	}
-	if refillInterval < time.Second || refillInterval > 24*time.Hour {
-		return fmt.Errorf("UPLOAD_RATE_LIMIT_REFILL_INTERVAL must be between 1s and 24h")
-	}
-	minimumTTL := time.Duration(capacity) * refillInterval
-	if keyTTL < minimumTTL || keyTTL > 7*24*time.Hour {
-		return fmt.Errorf("UPLOAD_RATE_LIMIT_KEY_TTL must be between %s and 168h", minimumTTL)
-	}
-	return nil
 }
 
 func boolValue(k string, fallback bool) bool {
@@ -345,47 +264,10 @@ func strictIntValue(k string, fallback int) (int, error) {
 	return parsed, nil
 }
 
-func floatValue(k string, fallback float64) float64 {
-	v, e := strconv.ParseFloat(value(k, strconv.FormatFloat(fallback, 'f', -1, 64)), 64)
-	if e != nil {
-		return fallback
-	}
-	return v
-}
-
-func strictFloatValue(k string, fallback float64) (float64, error) {
-	parsed, err := strconv.ParseFloat(value(k, strconv.FormatFloat(fallback, 'f', -1, 64)), 64)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be a number", k)
-	}
-	return parsed, nil
-}
-
 func durationValue(k string, fallback time.Duration) time.Duration {
 	d, err := time.ParseDuration(value(k, fallback.String()))
 	if err != nil {
 		return 0
 	}
 	return d
-}
-
-func durationMillisecondsValue(k string, fallback time.Duration) time.Duration {
-	milliseconds, err := strconv.ParseInt(value(k, strconv.FormatInt(fallback.Milliseconds(), 10)), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return time.Duration(milliseconds) * time.Millisecond
-}
-
-func durationListValue(k, fallback string) ([]time.Duration, error) {
-	parts := strings.Split(value(k, fallback), ",")
-	delays := make([]time.Duration, 0, len(parts))
-	for _, part := range parts {
-		delay, err := time.ParseDuration(strings.TrimSpace(part))
-		if err != nil || delay <= 0 {
-			return nil, fmt.Errorf("%s must contain comma-separated positive durations", k)
-		}
-		delays = append(delays, delay)
-	}
-	return delays, nil
 }

@@ -3,25 +3,11 @@ setlocal EnableExtensions
 chcp 65001 >nul
 
 pushd "%~dp0.."
-set "READERGO_EVAL_ENV_FILE=%CD%\.env"
 set "READERGO_EVAL_PID_FILE=%TEMP%\ReaderGo\eval.pid"
-
-if not exist "%READERGO_EVAL_ENV_FILE%" (
-  echo 未找到项目根目录下的 .env 文件。
-  popd
-  exit /b 1
-)
-
-call :set_eval_flag 0
-if errorlevel 1 (
-  echo 无法将 RUN_RETRIEVAL_EVAL 设置为 0。
-  popd
-  exit /b 1
-)
 
 if exist "%READERGO_EVAL_PID_FILE%" goto stop_eval_process
 
-echo 当前没有记录中的测评进程，评测开关已关闭。
+echo 当前没有记录中的测评进程。
 set "STOP_EXIT_CODE=3"
 goto remove_database_container
 
@@ -74,8 +60,4 @@ if errorlevel 1 exit /b %ERRORLEVEL%
 docker volume inspect readergo_postgres_eval_data >nul 2>&1
 if errorlevel 1 exit /b 0
 docker volume rm readergo_postgres_eval_data
-exit /b %ERRORLEVEL%
-
-:set_eval_flag
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$path = $env:READERGO_EVAL_ENV_FILE; $value = '%~1'; $content = [IO.File]::ReadAllText($path); $newline = if ($content.Contains([Environment]::NewLine)) { [Environment]::NewLine } else { [char]10 }; $pattern = [regex]'(?m)^RUN_RETRIEVAL_EVAL=[^\r\n]*'; if ($pattern.IsMatch($content)) { $content = $pattern.Replace($content, ('RUN_RETRIEVAL_EVAL=' + $value), 1) } else { if ($content.Length -gt 0 -and -not $content.EndsWith($newline)) { $content += $newline }; $content += 'RUN_RETRIEVAL_EVAL=' + $value + $newline }; [IO.File]::WriteAllText($path, $content, [Text.UTF8Encoding]::new($false))"
 exit /b %ERRORLEVEL%

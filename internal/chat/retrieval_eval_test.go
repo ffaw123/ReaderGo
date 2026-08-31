@@ -260,13 +260,13 @@ func TestRetrievalOfflineEval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 先加载根目录 .env，评测开关因此既可写入文件，也可由命令行环境变量覆盖。
+	// 根目录 .env 只提供业务与模型凭据；评测开关和数据路径由启动脚本通过进程环境变量传入。
 	envErr := godotenv.Load(filepath.Join(repoRoot, ".env"))
 	if envErr != nil && !errors.Is(envErr, os.ErrNotExist) {
 		t.Fatalf("加载项目 .env: %v", envErr)
 	}
 	if os.Getenv(retrievalEvalRunEnv) != "1" {
-		t.Skip("将 .env 中 RUN_RETRIEVAL_EVAL 设为 1 后才执行离线检索测评")
+		t.Skip("仅通过评测启动脚本设置 RUN_RETRIEVAL_EVAL=1 后执行离线检索测评")
 	}
 	cfg, err := config.Load()
 	if err != nil {
