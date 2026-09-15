@@ -20,6 +20,9 @@ func TestLoadUsesInternalPolicyValues(t *testing.T) {
 	for key, value := range required {
 		t.Setenv(key, value)
 	}
+	t.Setenv("VISION_API_KEY", "")
+	t.Setenv("VISION_BASE_URL", "")
+	t.Setenv("VISION_MODEL", "")
 
 	// 即使旧环境变量仍残留，内部策略也必须以代码常量为准。
 	overrides := map[string]string{
@@ -95,7 +98,46 @@ func TestLoadUsesInternalPolicyValues(t *testing.T) {
 	if configValue.IntentRequestTimeout != 20*time.Second || configValue.IntentConfidenceThreshold != 0.75 {
 		t.Fatal("固定 Intent 策略不符合预期")
 	}
+	if configValue.VisionConfigured() || configValue.VisionRequestTimeout != 90*time.Second || configValue.VisionTotalTimeout != 5*time.Minute {
+		t.Fatal("固定 Vision 策略不符合预期")
+	}
 	if configValue.UploadPartSizeMiB != 32 || configValue.UploadURLTTLMinutes != 15 || configValue.PrepareConnectTimeout != 10*time.Second || configValue.PrepareResponseHeaderTimeout != 30*time.Second || configValue.PrepareDownloadTimeout != 2*time.Hour || configValue.PrepareMaxRedirects != 5 {
 		t.Fatal("固定上传与下载策略不符合预期")
+	}
+}
+
+func TestLoadValidatesConfiguredVisionService(t *testing.T) {
+	required := map[string]string{
+		"DATABASE_URL": "postgres://readergo:readergo@localhost:5432/readergo?sslmode=disable", "JWT_SECRET": "12345678901234567890123456789012",
+		"MINIO_ENDPOINT": "localhost:9000", "MINIO_ACCESS_KEY": "readergo", "MINIO_SECRET_KEY": "readergo",
+		"VISION_API_KEY": "vision-key", "VISION_MODEL": "vision-model", "VISION_BASE_URL": "not-a-url",
+	}
+	for key, value := range required {
+		t.Setenv(key, value)
+	}
+	if _, err := Load(); err == nil {
+		t.Fatal("启用 Vision 时接受了无效的 VISION_BASE_URL")
+	}
+	t.Setenv("VISION_BASE_URL", "http://localhost:8000/v1")
+	configValue, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configValue.VisionConfigured() || configValue.VisionModel != "vision-model" {
+		t.Fatal("Vision 外部配置未正确加载")
+	}
+}
+
+func TestLoadRejectsPartialVisionConfiguration(t *testing.T) {
+	required := map[string]string{
+		"DATABASE_URL": "postgres://readergo:readergo@localhost:5432/readergo?sslmode=disable", "JWT_SECRET": "12345678901234567890123456789012",
+		"MINIO_ENDPOINT": "localhost:9000", "MINIO_ACCESS_KEY": "readergo", "MINIO_SECRET_KEY": "readergo",
+		"VISION_API_KEY": "", "VISION_MODEL": "vision-model", "VISION_BASE_URL": "",
+	}
+	for key, value := range required {
+		t.Setenv(key, value)
+	}
+	if _, err := Load(); err == nil {
+		t.Fatal("不完整的 Vision 服务配置未被拒绝")
 	}
 }

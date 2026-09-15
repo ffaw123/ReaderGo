@@ -56,6 +56,11 @@ const accountOpen = ref(false)
 const sidebarOpen = ref(false)
 const search = ref('')
 const draft = ref('')
+const visionEnabled = ref(false)
+const visionStart = ref('')
+const visionEnd = ref('')
+const visionAvailable = ref(false)
+const visionProgress = ref('')
 const toast = ref(null)
 const chatScroll = ref(null)
 const fileInput = ref(null)
@@ -86,6 +91,9 @@ const filteredVideos = computed(() => {
 const userName = computed(() => session.value?.user?.display_name || session.value?.user?.email?.split('@')[0] || '探索者')
 const userInitial = computed(() => userName.value.slice(0, 1).toUpperCase())
 const isReady = computed(() => selectedVideo.value?.status === 'ready')
+const canUseVision = computed(() => Boolean(
+  !previewMode.value && visionAvailable.value && isReady.value && selectedVideo.value?.duration_ms > 0,
+))
 const activeProcessingJobs = computed(() =>
   previewMode.value ? selectedVideo.value?.jobs || [] : processingJobs.value,
 )
@@ -284,8 +292,43 @@ function messageSourceLabel(message) {
     clarify: '需要澄清',
     capability_pending: '内容处理中',
     capability_failed: '处理能力不可用',
+    vision_agent: '基于指定画面',
   }
   return labels[message?.metadata?.mode] || 'ReaderGo 回答'
+}
+
+function parseVideoTime(value) {
+  const matched = String(value || '').trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?$/)
+  if (!matched) throw new Error('时间格式应为 MM:SS、HH:MM:SS 或带毫秒的形式')
+  const hasHours = matched[1] !== undefined
+  const hours = hasHours ? Number(matched[1]) : 0
+  const minutes = Number(matched[2])
+  const seconds = Number(matched[3])
+  if (seconds >= 60 || (hasHours && minutes >= 60)) throw new Error('分钟或秒数超出有效范围')
+  const milliseconds = Number((matched[4] || '').padEnd(3, '0') || 0)
+  return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
+}
+
+function currentVisionRequest() {
+  if (!visionEnabled.value) return { enabled: false }
+  if (!canUseVision.value) throw new Error('当前视频暂时不能使用画面理解')
+  const startMS = parseVideoTime(visionStart.value)
+  const endMS = parseVideoTime(visionEnd.value)
+  if (endMS <= startMS) throw new Error('结束时间必须晚于开始时间')
+  if (endMS - startMS > 30_000) throw new Error('画面理解时间区间不能超过30秒')
+  if (endMS > Number(selectedVideo.value.duration_ms || 0)) throw new Error('时间区间不能超过视频时长')
+  return { enabled: true, range: { start_ms: startMS, end_ms: endMS } }
+}
+
+async function loadCapabilities() {
+  if (previewMode.value) return
+  try {
+    const result = await api.getCapabilities()
+    visionAvailable.value = Boolean(result?.vision?.enabled)
+  } catch (error) {
+    visionAvailable.value = false
+    if (error.status !== 401) notify(error.message, 'error')
+  }
 }
 
 function handleMessageAction(action) {
@@ -445,8 +488,19 @@ async function ensureConversation(video) {
 async function sendMessage() {
   const content = draft.value.trim()
   if (!content || sending.value || !selectedVideo.value) return
+  let vision
+  try {
+    // 发送前固定本次画面参数，后续切换开关不会改变正在执行的请求。
+    vision = retryMessage.value?.content === content
+      ? retryMessage.value.vision
+      : currentVisionRequest()
+  } catch (error) {
+    notify(error.message, 'error')
+    return
+  }
   draft.value = ''
   sending.value = true
+  visionProgress.value = vision.enabled ? '正在准备画面理解' : ''
   const clientMessageId = retryMessage.value?.content === content
     ? retryMessage.value.id
     : crypto.randomUUID()
@@ -475,7 +529,7 @@ async function sendMessage() {
     } else {
       const conversationId = await ensureConversation(selectedVideo.value)
       // client_message_id 让网络重试返回同一组消息，不会重复调用模型。
-      const response = await api.sendMessage(conversationId, content, clientMessageId, (delta) => {
+      const response = await api.sendMessage(conversationId, content, clientMessageId, vision, (delta) => {
         if (!delta) return
         let assistant = messages.value.find((message) => message.id === streamingAssistantId)
         if (!assistant) {
@@ -493,6 +547,8 @@ async function sendMessage() {
         }
         assistant.content += delta
         nextTick().then(scrollChat)
+      }, (progress) => {
+        visionProgress.value = progress?.message || ''
       })
       messages.value = messages.value.map((message) =>
         message.id === optimistic.id ? response.user_message : message,
@@ -508,10 +564,11 @@ async function sendMessage() {
     )
     draft.value = content
     // 请求可能已在服务端完成；保持同一 ID 可安全取回首次结果。
-    retryMessage.value = { id: clientMessageId, content }
+    retryMessage.value = { id: clientMessageId, content, vision }
     notify(error.message, 'error')
   } finally {
     sending.value = false
+    visionProgress.value = ''
     await nextTick()
     scrollChat()
   }
@@ -888,6 +945,9 @@ watch(
     pauseSettled.value = true
     summaryOpen.value = false
     processingJobs.value = []
+    visionEnabled.value = false
+    visionStart.value = ''
+    visionEnd.value = ''
     // 切换视频时立即清空旧摘要，避免新请求完成前短暂展示上一个视频的内容。
     summary.value = ''
     await loadSelectedContent()
@@ -903,7 +963,7 @@ watch(
 onMounted(async () => {
   parseSession()
   loadPendingUpload()
-  await loadVideos()
+  await Promise.all([loadVideos(), loadCapabilities()])
 })
 
 onBeforeUnmount(() => {
@@ -1156,23 +1216,49 @@ onBeforeUnmount(() => {
                     >
                       {{ message.metadata.action.label }}
                     </button>
+                    <button
+                      v-if="message.metadata?.mode === 'summary' && message.metadata?.vision_requested && !message.metadata?.vision_used"
+                      type="button"
+                      @click="visionEnabled = false"
+                    >
+                      关闭画面理解
+                    </button>
                   </div>
                   <p>{{ message.content }}</p>
                   <div v-if="message.citations?.length" class="citations">
-                    <button v-for="citation in message.citations" :key="citation.segment_id" :title="`视频片段 ${citation.label}`">
-                      <Play :size="11" fill="currentColor" /> {{ citation.label }} · 相关片段
+                    <button v-for="citation in message.citations" :key="`${citation.segment_id}-${citation.start_ms}`" :title="`视频片段 ${citation.label}`">
+                      <Play :size="11" fill="currentColor" /> {{ citation.label }} · {{ citation.source_type === 'vision_frame' ? '查看画面' : '相关片段' }}
                     </button>
                   </div>
                 </div>
               </article>
               <article v-if="sending && !hasStreamingAssistant" class="message message--assistant">
                 <span class="message-avatar"><Sparkles :size="16" /></span>
-                <div class="typing"><i></i><i></i><i></i></div>
+                <div>
+                  <div class="typing"><i></i><i></i><i></i></div>
+                  <small v-if="visionProgress" class="vision-progress">{{ visionProgress }}</small>
+                </div>
               </article>
             </template>
           </div>
 
           <footer class="composer-wrap">
+            <div class="vision-controls" :class="{ 'vision-controls--active': visionEnabled }">
+              <label class="vision-toggle">
+                <input v-model="visionEnabled" type="checkbox" :disabled="!canUseVision || sending" />
+                <span aria-hidden="true"></span>
+                <strong>画面理解</strong>
+              </label>
+              <small v-if="!canUseVision">{{ visionAvailable ? '视频处理完成后可用' : '画面理解服务未启用' }}</small>
+              <template v-if="visionEnabled">
+                <div class="vision-range-inputs">
+                  <label>开始 <input v-model.trim="visionStart" inputmode="decimal" placeholder="01:20" :disabled="sending" /></label>
+                  <span>至</span>
+                  <label>结束 <input v-model.trim="visionEnd" inputmode="decimal" placeholder="01:30" :disabled="sending" /></label>
+                </div>
+                <p><Info :size="12" /> 画面理解已开启。请输入不超过 30 秒的时间区间，例如 01:20 到 01:30。系统首先每 5 秒查看一帧，并可能在该区间内继续细看。</p>
+              </template>
+            </div>
             <div class="composer" :class="{ 'composer--active': draft }">
               <textarea
                 v-model="draft"

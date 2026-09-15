@@ -22,6 +22,7 @@ ReaderGo 是一个面向长视频内容的 AI 理解与问答系统。用户上�
 4. **多模态视频理解**：结合 ASR 语音转写与 OCR 画面文字识别，按时间轴融合生成分段内容和章节摘要。
 5. **智能意图识别**：自动判断用户问题类型，并选择快捷回复、通用问答或视频内容检索等合适的回答路径。
 6. **多路 RAG 检索**：融合向量检索和 BM25，提升视频问答的相关性与可追溯性。
+7. **按需画面理解**：可在用户指定区间内调用独立 vLLM 多模态模型，并通过有界抽帧 Agent Loop 细化观察。
 
 ## RAG 检索测评
 
@@ -102,7 +103,7 @@ flowchart TD
 Copy-Item .env.example .env
 ```
 
-在 `.env` 中填写基础设施地址、JWT 密钥，以及 ASR、OCR、RAG、Chat 和 Intent 对应的模型配置；内部任务、超时和检索策略已使用代码内置值。网址上传支持公开视频直链以及 Bilibili 完整单视频页面（不支持短链），文件大小、时长和清晰度上限可通过 `PREPARE_MAX_FILE_SIZE_MIB`、`PREPARE_MAX_DURATION`、`YT_DLP_MAX_HEIGHT` 调整。然后双击运行 [`batch/start.bat`](batch/start.bat)，或在 PowerShell 中执行：
+在 `.env` 中填写基础设施地址、JWT 密钥，以及 ASR、OCR、RAG、Chat 和 Intent 对应的模型配置；内部任务、超时和检索策略已使用代码内置值。需要提供按需画面理解能力时，完整填写 `VISION_API_KEY`、`VISION_BASE_URL`、`VISION_MODEL`；用户侧开关位于前端且默认关闭，不再使用环境变量控制。网址上传支持公开视频直链以及 Bilibili 完整单视频页面（不支持短链），文件大小、时长和清晰度上限可通过 `PREPARE_MAX_FILE_SIZE_MIB`、`PREPARE_MAX_DURATION`、`YT_DLP_MAX_HEIGHT` 调整。然后双击运行 [`batch/start.bat`](batch/start.bat)，或在 PowerShell 中执行：
 
 ```powershell
 .\batch\start.bat

@@ -47,6 +47,9 @@ func (r *repository) BeginUserMessage(ctx context.Context, in ReplyInput) (begin
 		var existing model.Message
 		err := tx.Where("conversation_id = ? AND client_message_id = ?", conversation.ID, in.ClientMessageID).First(&existing).Error
 		if err == nil {
+			if !sameReplyRequest(existing, in) {
+				return ErrIdempotencyPayloadMismatch
+			}
 			result.UserMessage = existing
 			switch existing.GenerationStatus {
 			case "completed":
@@ -79,9 +82,13 @@ func (r *repository) BeginUserMessage(ctx context.Context, in ReplyInput) (begin
 		}
 
 		clientMessageID := in.ClientMessageID
+		metadata := model.NewJSONDocument(map[string]any{})
+		if in.Vision.Enabled {
+			metadata = model.NewJSONDocument(map[string]any{"vision": in.Vision})
+		}
 		message := model.Message{
 			ID: uuid.NewString(), ConversationID: conversation.ID, Role: "user", Content: in.Content,
-			Citations: model.NewJSONDocument([]Citation{}), Metadata: model.NewJSONDocument(map[string]any{}),
+			Citations: model.NewJSONDocument([]Citation{}), Metadata: metadata,
 			ClientMessageID: &clientMessageID, GenerationStatus: "generating", GenerationStartedAt: time.Now().UTC(), CreatedAt: time.Now().UTC(),
 		}
 		if err := tx.Create(&message).Error; err != nil {
@@ -91,6 +98,28 @@ func (r *repository) BeginUserMessage(ctx context.Context, in ReplyInput) (begin
 		return nil
 	})
 	return result, err
+}
+
+func sameReplyRequest(existing model.Message, in ReplyInput) bool {
+	if existing.Content != in.Content {
+		return false
+	}
+	var metadata struct {
+		Vision VisionRequest `json:"vision"`
+	}
+	if len(existing.Metadata) > 0 {
+		_ = json.Unmarshal(existing.Metadata, &metadata)
+	}
+	if metadata.Vision.Enabled != in.Vision.Enabled {
+		return false
+	}
+	if !in.Vision.Enabled {
+		return true
+	}
+	if metadata.Vision.Range == nil || in.Vision.Range == nil {
+		return metadata.Vision.Range == nil && in.Vision.Range == nil
+	}
+	return *metadata.Vision.Range == *in.Vision.Range
 }
 
 func (r *repository) MarkUserMessageFailed(ctx context.Context, messageID string) {
@@ -105,7 +134,14 @@ func (r *repository) CompleteReply(ctx context.Context, user model.Message, repl
 		AmbiguityReason: reply.Decision.AmbiguityReason, Notice: reply.Route.Notice, Action: reply.Route.Action,
 		SummaryState: reply.Capabilities.Summary, RAGState: reply.Capabilities.RAG,
 		IntentPromptVersion: reply.IntentPromptVersion, AnswerPromptVersion: reply.AnswerPromptVersion,
-		LatencyMS: durationMilliseconds(reply.Latency),
+		LatencyMS:       durationMilliseconds(reply.Latency),
+		VisionRequested: reply.VisionRequested, VisionUsed: reply.VisionUsed,
+		VisionStatus: reply.VisionStatus, VisionModel: reply.VisionModel,
+		VisionPromptVersion: reply.VisionPromptVersion, VisionToolCalls: reply.VisionToolCalls,
+		VisionFrameTimestampsMS: reply.VisionFrameTimestampsMS,
+	}
+	if reply.VisionRange != nil {
+		metadata.VisionStartMS, metadata.VisionEndMS = reply.VisionRange.StartMS, reply.VisionRange.EndMS
 	}
 	userID := user.ID
 	assistant := model.Message{
@@ -116,6 +152,16 @@ func (r *repository) CompleteReply(ctx context.Context, user model.Message, repl
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&assistant).Error; err != nil {
 			return err
+		}
+		if reply.VisionObservation != nil {
+			observation := *reply.VisionObservation
+			observation.ID = uuid.NewString()
+			observation.UserMessageID = user.ID
+			observation.CreatedAt = assistant.CreatedAt
+			// Assistant 与画面观察在同一事务中提交，避免后续记忆引用孤立结果。
+			if err := tx.Create(&observation).Error; err != nil {
+				return fmt.Errorf("persist vision observation: %w", err)
+			}
 		}
 		result := tx.Model(&model.Message{}).
 			Where("id = ? AND generation_status = ?", user.ID, "generating").
@@ -130,6 +176,14 @@ func (r *repository) CompleteReply(ctx context.Context, user model.Message, repl
 			Update("updated_at", assistant.CreatedAt).Error
 	})
 	return assistant, err
+}
+
+func (r *repository) LoadVideoDuration(ctx context.Context, tenantID, videoID string) (int64, error) {
+	var video model.Video
+	if err := r.db.WithContext(ctx).Select("duration_ms").Where("id = ? AND tenant_id = ?", videoID, tenantID).First(&video).Error; err != nil {
+		return 0, err
+	}
+	return video.DurationMS, nil
 }
 
 func durationMilliseconds(values map[string]time.Duration) map[string]int {

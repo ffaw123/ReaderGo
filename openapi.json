@@ -18,7 +18,8 @@
     { "name": "Health", "description": "健康检查" },
     { "name": "Auth", "description": "注册与登录" },
     { "name": "Videos", "description": "视频提交与查询" },
-    { "name": "Conversations", "description": "AI 对话与消息" }
+    { "name": "Conversations", "description": "AI 对话与消息" },
+    { "name": "System", "description": "服务能力查询" }
   ],
   "components": {
     "securitySchemes": {
@@ -32,7 +33,8 @@
       "Error": {
         "type": "object",
         "properties": {
-          "error": { "type": "string", "description": "人类可读的错误描述" }
+          "error": { "type": "string", "description": "人类可读的错误描述" },
+          "code": { "type": "string", "description": "可供客户端稳定判断的错误码" }
         }
       },
       "User": {
@@ -236,7 +238,8 @@
           "segment_id": { "type": "string", "format": "uuid" },
           "start_ms":   { "type": "integer", "format": "int64" },
           "end_ms":     { "type": "integer", "format": "int64" },
-          "label":      { "type": "string", "example": "12:40" }
+          "label":      { "type": "string", "example": "12:40" },
+          "source_type": { "type": "string", "enum": ["vision_frame"], "description": "省略时为原有 RAG 片段引用" }
         }
       },
       "RouteAction": {
@@ -249,14 +252,40 @@
       "MessageMetadata": {
         "type": "object",
         "properties": {
-          "mode": { "type": "string", "enum": ["preset","general","general_unaware","summary","rag","clarify","capability_pending","capability_failed"] },
+          "mode": { "type": "string", "enum": ["preset","general","general_unaware","summary","rag","vision_agent","clarify","capability_pending","capability_failed"] },
           "intent": { "type": "string", "enum": ["GENERAL_CHAT","VIDEO_OVERVIEW","VIDEO_DETAIL","AMBIGUOUS"] },
           "intent_confidence": { "type": "number", "format": "double" },
           "ambiguity_reason": { "type": "string" },
           "notice": { "type": "string" },
           "action": { "$ref": "#/components/schemas/RouteAction" },
           "summary_state": { "type": "string", "enum": ["unknown","processing","ready","failed"] },
-          "rag_state": { "type": "string", "enum": ["unknown","processing","ready","failed"] }
+          "rag_state": { "type": "string", "enum": ["unknown","processing","ready","failed"] },
+          "vision_requested": { "type": "boolean" },
+          "vision_used": { "type": "boolean" },
+          "vision_start_ms": { "type": "integer", "format": "int64" },
+          "vision_end_ms": { "type": "integer", "format": "int64" },
+          "vision_status": { "type": "string", "enum": ["grounded","no_evidence"] },
+          "vision_model": { "type": "string" },
+          "vision_prompt_version": { "type": "string" },
+          "vision_tool_calls": { "type": "integer" },
+          "vision_frame_timestamps_ms": { "type": "array", "items": { "type": "integer", "format": "int64" } }
+        }
+      },
+      "VisionRange": {
+        "type": "object",
+        "required": ["start_ms", "end_ms"],
+        "properties": {
+          "start_ms": { "type": "integer", "format": "int64", "minimum": 0 },
+          "end_ms": { "type": "integer", "format": "int64", "minimum": 1 }
+        },
+        "description": "左闭右开的视频时间区间，长度不能超过30000毫秒"
+      },
+      "VisionRequest": {
+        "type": "object",
+        "required": ["enabled"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "range": { "$ref": "#/components/schemas/VisionRange" }
         }
       },
       "CreateMessageRequest": {
@@ -264,7 +293,8 @@
         "required": ["client_message_id", "content"],
         "properties": {
           "client_message_id": { "type": "string", "format": "uuid", "description": "客户端为每次逻辑发送生成的幂等 UUID，重试时保持不变" },
-          "content": { "type": "string", "maxLength": 4000, "description": "用户问题内容，默认最长 4000 字符" }
+          "content": { "type": "string", "maxLength": 4000, "description": "用户问题内容，默认最长 4000 字符" },
+          "vision": { "$ref": "#/components/schemas/VisionRequest" }
         }
       },
       "ChatRoute": {
@@ -779,6 +809,32 @@
         }
       }
     },
+    "/api/capabilities": {
+      "get": {
+        "tags": ["System"],
+        "summary": "获取可选产品能力",
+        "operationId": "getCapabilities",
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "当前服务可用能力",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "vision": {
+                      "type": "object",
+                      "properties": { "enabled": { "type": "boolean" } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/conversations/{id}/messages": {
       "get": {
         "tags": ["Conversations"],
@@ -813,7 +869,7 @@
       "post": {
         "tags": ["Conversations"],
         "summary": "发送用户消息并流式接收回答",
-        "description": "以 SSE 流执行快捷匹配、意图路由和单路径回答。delta 事件携带回答增量，done 事件携带已持久化的完整 ChatReplyResponse，error 事件表示流开始后的生成错误。意图识别仍使用非流式模型调用；具体视频问题使用语义、精确、BM25 三路召回与 RRF，并返回经过校验的引用。",
+        "description": "以 SSE 流执行快捷匹配、意图路由和单路径回答。画面理解关闭时保持原有 Chat/Summary/RAG；开启时必须提供不超过30秒的手动时间区间，且仅 VIDEO_DETAIL 进入有界画面 Agent。progress 事件携带画面处理阶段，delta 事件携带回答增量，done 事件携带已持久化结果。",
         "operationId": "createMessage",
         "security": [{ "BearerAuth": [] }],
         "parameters": [
@@ -830,7 +886,7 @@
           "content": {
             "application/json": {
               "schema": { "$ref": "#/components/schemas/CreateMessageRequest" },
-              "example": { "client_message_id": "0198a080-0200-7000-8000-000000000001", "content": "这个视频讲的是什么？" }
+              "example": { "client_message_id": "0198a080-0200-7000-8000-000000000001", "content": "01:20到01:30画面里的人在做什么？", "vision": { "enabled": true, "range": { "start_ms": 80000, "end_ms": 90000 } } }
             }
           }
         },
@@ -840,12 +896,12 @@
             "content": {
               "text/event-stream": {
                 "schema": { "type": "string" },
-                "example": "event: delta\ndata: {\"content\":\"你好\"}\n\nevent: done\ndata: {\"user_message\":{},\"assistant_message\":{},\"route\":{},\"capabilities\":{}}\n\n"
+                "example": "event: progress\ndata: {\"stage\":\"initial_sampling\",\"message\":\"正在查看所选时间段的画面\"}\n\nevent: delta\ndata: {\"content\":\"你好\"}\n\nevent: done\ndata: {\"user_message\":{},\"assistant_message\":{},\"route\":{},\"capabilities\":{}}\n\n"
               }
             }
           },
           "400": {
-            "description": "client_message_id 无效，或 content 为空/超过服务端限制",
+            "description": "client_message_id、content 或画面时间区间无效",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "404": {
@@ -853,7 +909,15 @@
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           },
           "409": {
-            "description": "同一会话已有回答正在生成",
+            "description": "同一会话已有回答正在生成、幂等载荷冲突或画面内容未就绪",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "429": {
+            "description": "租户画面理解并发数或调用频率达到上限",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": {
+            "description": "画面理解服务未配置或暂时不可用",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
         }

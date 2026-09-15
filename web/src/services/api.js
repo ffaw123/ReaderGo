@@ -36,7 +36,7 @@ async function request(path, options = {}) {
   return payload
 }
 
-async function streamRequest(path, options, onDelta) {
+async function streamRequest(path, options, onDelta, onProgress) {
   const session = getSession()
   const headers = new Headers(options.headers || {})
   headers.set('Content-Type', 'application/json')
@@ -69,6 +69,7 @@ async function streamRequest(path, options, onDelta) {
     if (!data.length) return
     const payload = JSON.parse(data.join('\n'))
     if (event === 'delta') onDelta?.(payload.content || '')
+    if (event === 'progress') onProgress?.(payload)
     if (event === 'done') result = payload
     if (event === 'error') throw new Error(payload.error || '回答生成失败，请重试')
   }
@@ -120,20 +121,22 @@ export const api = {
   pauseVideo: (id) => request(`/api/videos/${id}/pause`, { method: 'POST' }),
   resumeVideo: (id) => request(`/api/videos/${id}/resume`, { method: 'POST' }),
   getSummary: (id) => request(`/api/videos/${id}/summary`),
+  getCapabilities: () => request('/api/capabilities'),
   createConversation: (videoId, title) =>
     request(`/api/videos/${videoId}/conversations`, {
       method: 'POST',
       body: JSON.stringify({ title }),
     }),
   listMessages: (conversationId) => request(`/api/conversations/${conversationId}/messages`),
-  sendMessage: (conversationId, content, clientMessageId, onDelta) =>
+  sendMessage: (conversationId, content, clientMessageId, vision, onDelta, onProgress) =>
     streamRequest(
       `/api/conversations/${conversationId}/messages`,
       {
         method: 'POST',
-        body: JSON.stringify({ content, client_message_id: clientMessageId }),
+        body: JSON.stringify({ content, client_message_id: clientMessageId, vision }),
       },
       onDelta,
+      onProgress,
     ),
   createUpload: (file, title, identity, contentSHA256) =>
     request('/api/uploads', {

@@ -59,6 +59,9 @@ type Config struct {
 	IntentConfidenceThreshold                float64
 	ChatRAGMinSimilarity                     float64
 	ChatMaxInputRunes, ChatHistoryTurns      int
+	// Vision 使用独立的 vLLM OpenAI 兼容服务；关闭功能时不要求配置服务参数。
+	VisionAPIKey, VisionBaseURL, VisionModel string
+	VisionRequestTimeout, VisionTotalTimeout time.Duration
 	// UploadPartSizeMiB 限制为 16-64 MiB，以平衡重试成本和请求数量。
 	UploadPartSizeMiB, UploadURLTTLMinutes int
 	// Prepare 下载限制由 Worker 强制执行，避免外部地址长期占用连接、内存或磁盘。
@@ -99,6 +102,8 @@ const (
 	internalChatRAGMinSimilarity         = 0.25
 	internalIntentRequestTimeout         = 20 * time.Second
 	internalIntentConfidenceThreshold    = 0.75
+	internalVisionRequestTimeout         = 90 * time.Second
+	internalVisionTotalTimeout           = 5 * time.Minute
 	internalUploadPartSizeMiB            = 32
 	internalUploadURLTTLMinutes          = 15
 	internalPrepareConnectTimeout        = 10 * time.Second
@@ -183,6 +188,12 @@ func Load() (Config, error) {
 		IntentRequestTimeout:      internalIntentRequestTimeout,
 		IntentConfidenceThreshold: internalIntentConfidenceThreshold,
 
+		VisionAPIKey:         os.Getenv("VISION_API_KEY"),
+		VisionBaseURL:        os.Getenv("VISION_BASE_URL"),
+		VisionModel:          os.Getenv("VISION_MODEL"),
+		VisionRequestTimeout: internalVisionRequestTimeout,
+		VisionTotalTimeout:   internalVisionTotalTimeout,
+
 		UploadPartSizeMiB:   internalUploadPartSizeMiB,
 		UploadURLTTLMinutes: internalUploadURLTTLMinutes,
 
@@ -223,10 +234,30 @@ func Load() (Config, error) {
 	if strings.TrimSpace(c.YTDLPPath) == "" {
 		return Config{}, fmt.Errorf("YT_DLP_PATH must not be empty")
 	}
+	visionConfiguredValues := 0
+	for _, configuredValue := range []string{c.VisionAPIKey, c.VisionBaseURL, c.VisionModel} {
+		if strings.TrimSpace(configuredValue) != "" {
+			visionConfiguredValues++
+		}
+	}
+	if visionConfiguredValues != 0 && visionConfiguredValues != 3 {
+		return Config{}, fmt.Errorf("VISION_API_KEY, VISION_BASE_URL and VISION_MODEL must be configured together")
+	}
+	if c.VisionConfigured() {
+		visionURL, err := url.ParseRequestURI(strings.TrimSpace(c.VisionBaseURL))
+		if err != nil || visionURL.Host == "" || (visionURL.Scheme != "http" && visionURL.Scheme != "https") {
+			return Config{}, fmt.Errorf("VISION_BASE_URL must be an absolute HTTP(S) URL when Vision is configured")
+		}
+	}
 	if c.YTDLPMaxHeight < 144 || c.YTDLPMaxHeight > 4320 {
 		return Config{}, fmt.Errorf("YT_DLP_MAX_HEIGHT must be between 144 and 4320")
 	}
 	return c, nil
+}
+
+// VisionConfigured 只表示服务端模型依赖可用；是否发起画面理解由每次前端请求决定。
+func (c Config) VisionConfigured() bool {
+	return strings.TrimSpace(c.VisionAPIKey) != "" && strings.TrimSpace(c.VisionBaseURL) != "" && strings.TrimSpace(c.VisionModel) != ""
 }
 
 func boolValue(k string, fallback bool) bool {

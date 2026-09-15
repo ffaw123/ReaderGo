@@ -280,6 +280,23 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .typing i:nth-child(2) { animation-delay: 120ms; }
 .typing i:nth-child(3) { animation-delay: 240ms; }
 .composer-wrap { width: 100%; max-width: 850px; margin: 0 auto; padding: 0 38px 20px; }
+.vision-controls { display: flex; min-height: 34px; margin: 0 2px 8px; padding: 7px 10px; align-items: center; gap: 12px; flex-wrap: wrap; border: 1px solid #e3e5ed; border-radius: 10px; color: #747b8c; background: rgba(255, 255, 255, .78); font-size: 11px; }
+.vision-controls--active { border-color: #c8c7eb; background: #f8f7ff; }
+.vision-controls > small { color: #a0a5b1; }
+.vision-controls > p { display: flex; width: 100%; margin: 0; align-items: center; gap: 5px; color: #777d8d; }
+.vision-toggle { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
+.vision-toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.vision-toggle > span { position: relative; width: 30px; height: 17px; border-radius: 999px; background: #c9ccd5; transition: 160ms ease; }
+.vision-toggle > span::after { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: white; box-shadow: 0 1px 3px rgba(20, 25, 40, .22); content: ''; transition: 160ms ease; }
+.vision-toggle input:checked + span { background: var(--accent); }
+.vision-toggle input:checked + span::after { transform: translateX(13px); }
+.vision-toggle input:disabled + span { opacity: .45; }
+.vision-toggle:has(input:disabled) { cursor: not-allowed; }
+.vision-range-inputs { display: flex; margin-left: auto; align-items: center; gap: 8px; }
+.vision-range-inputs label { display: flex; align-items: center; gap: 5px; }
+.vision-range-inputs input { width: 78px; padding: 5px 7px; border: 1px solid #d8dae5; border-radius: 7px; outline: 0; color: #3b4051; background: white; font: inherit; }
+.vision-range-inputs input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .08); }
+.vision-progress { display: block; margin-top: 6px; color: #858b9a; font-size: 10px; }
 .composer { padding: 13px 14px 10px 17px; border: 1px solid #dce0e9; border-radius: 14px; background: white; box-shadow: 0 10px 30px rgba(23, 24, 46, .06); transition: 160ms ease; }
 .composer:focus-within, .composer--active { border-color: #aaa9dc; box-shadow: 0 10px 32px rgba(23, 24, 46, .08), 0 0 0 3px rgba(var(--accent-rgb), .08); }
 /* 保留舒适输入空间，同时适度收紧默认高度，避免输入区纵向占用过大。 */
@@ -399,6 +416,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .chat-header { padding: 0 17px; }
   .messages { padding: 24px 18px 15px; }
   .composer-wrap { padding: 0 14px 14px; }
+  .vision-range-inputs { width: 100%; margin-left: 0; justify-content: flex-start; }
   .context-indicator { display: none; }
   .modal-layer { padding: 10px; align-items: end; }
   .upload-modal { max-height: calc(100vh - 20px); overflow-y: auto; border-radius: 18px; }

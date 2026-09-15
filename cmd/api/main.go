@@ -11,10 +11,12 @@ import (
 	"readergo/internal/chat"
 	"readergo/internal/config"
 	"readergo/internal/db"
+	"readergo/internal/media"
 	"readergo/internal/outbox"
 	"readergo/internal/storage"
 	"readergo/internal/uploaddedupe"
 	"readergo/internal/uploadratelimit"
+	"readergo/internal/visionagent"
 	"syscall"
 	"time"
 )
@@ -44,6 +46,34 @@ func main() {
 	if e = uploads.EnsureBucket(context.Background()); e != nil {
 		log.Fatal(e)
 	}
+	var visionRunner visionagent.Runner
+	if c.VisionConfigured() {
+		// 服务端参数完整时提供能力；是否使用由用户每次在前端手动开启。
+		ffmpeg, visionErr := media.NewFFmpeg(c.FFmpegPath)
+		if visionErr != nil {
+			log.Fatal(visionErr)
+		}
+		if visionErr = ffmpeg.Validate(context.Background()); visionErr != nil {
+			log.Fatal(visionErr)
+		}
+		source, visionErr := visionagent.NewMinIOVideoSource(c.MinIOEndpoint, c.MinIOAccessKey, c.MinIOSecretKey, c.MinIOSecure, c.MinIOBucket)
+		if visionErr != nil {
+			log.Fatal(visionErr)
+		}
+		// 同时限制缓存条目和总磁盘占用，避免长视频耗尽 API 节点空间。
+		cachedSource, visionErr := visionagent.NewCachedVideoSource(source, 4, 8<<30, 30*time.Minute)
+		if visionErr != nil {
+			log.Fatal(visionErr)
+		}
+		defer cachedSource.Close()
+		visionRunner, visionErr = visionagent.New(d, cachedSource, ffmpeg, visionagent.Options{
+			BaseURL: c.VisionBaseURL, APIKey: c.VisionAPIKey, Model: c.VisionModel,
+			RequestTimeout: c.VisionRequestTimeout, TotalTimeout: c.VisionTotalTimeout,
+		})
+		if visionErr != nil {
+			log.Fatal(visionErr)
+		}
+	}
 	// 用户回答模型、内部意图模型与 RAG 查询向量服务分别使用独立配置。
 	chatService, e := chat.NewService(d, chat.ServiceConfig{
 		ChatAPIKey: c.ChatAPIKey, ChatBaseURL: c.ChatBaseURL, ChatModel: c.ChatModel, ChatRequestTimeout: c.ChatRequestTimeout,
@@ -51,6 +81,7 @@ func main() {
 		IntentConfidenceThreshold: c.IntentConfidenceThreshold,
 		EmbeddingAPIKey:           c.RAGAPIKey, EmbeddingBaseURL: c.RAGBaseURL, EmbeddingModel: c.RAGEmbeddingModel, EmbeddingRequestTimeout: c.RAGRequestTimeout,
 		RAGMinSimilarity: c.ChatRAGMinSimilarity, MaxInputRunes: c.ChatMaxInputRunes, HistoryTurns: c.ChatHistoryTurns,
+		VisionRunner: visionRunner,
 	})
 	if e != nil {
 		log.Fatal(e)

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"readergo/internal/model"
+	"readergo/internal/visionagent"
 )
 
 const (
@@ -31,6 +32,7 @@ const (
 	ModeClarify           = "clarify"
 	ModeCapabilityPending = "capability_pending"
 	ModeCapabilityFailed  = "capability_failed"
+	ModeVisionAgent       = "vision_agent"
 
 	CapabilityStateUnknown    = "unknown"
 	CapabilityStateProcessing = "processing"
@@ -39,6 +41,16 @@ const (
 )
 
 var ErrConversationBusy = errors.New("conversation already has a generating message")
+var ErrIdempotencyPayloadMismatch = errors.New("idempotency payload does not match the original request")
+
+var (
+	ErrVisionRangeRequired    = visionagent.ErrRangeRequired
+	ErrVisionRangeInvalid     = visionagent.ErrRangeInvalid
+	ErrVisionRangeTooLong     = visionagent.ErrRangeTooLong
+	ErrVisionRangeOutOfBounds = visionagent.ErrRangeOutOfBounds
+	ErrVisionNotReady         = visionagent.ErrNotReady
+	ErrVisionUnavailable      = visionagent.ErrUnavailable
+)
 
 type HistoryTurn struct {
 	User      string `json:"user"`
@@ -86,6 +98,8 @@ type Citation struct {
 	StartMS   int64  `json:"start_ms"`
 	EndMS     int64  `json:"end_ms"`
 	Label     string `json:"label"`
+	// 旧消息省略该字段时仍按原有 RAG 片段引用展示。
+	SourceType string `json:"source_type,omitempty"`
 }
 
 type RouteAction struct {
@@ -105,6 +119,18 @@ type ReplyInput struct {
 	Conversation    model.Conversation
 	ClientMessageID string
 	Content         string
+	Vision          VisionRequest
+	OnProgress      visionagent.ProgressFunc
+}
+
+type VisionRange struct {
+	StartMS int64 `json:"start_ms"`
+	EndMS   int64 `json:"end_ms"`
+}
+
+type VisionRequest struct {
+	Enabled bool         `json:"enabled"`
+	Range   *VisionRange `json:"range,omitempty"`
 }
 
 type ReplyResult struct {
@@ -115,26 +141,44 @@ type ReplyResult struct {
 }
 
 type MessageMetadata struct {
-	Mode                string         `json:"mode"`
-	Intent              string         `json:"intent"`
-	IntentConfidence    float64        `json:"intent_confidence"`
-	AmbiguityReason     string         `json:"ambiguity_reason"`
-	Notice              string         `json:"notice"`
-	Action              *RouteAction   `json:"action,omitempty"`
-	SummaryState        string         `json:"summary_state"`
-	RAGState            string         `json:"rag_state"`
-	IntentPromptVersion string         `json:"intent_prompt_version,omitempty"`
-	AnswerPromptVersion string         `json:"answer_prompt_version,omitempty"`
-	LatencyMS           map[string]int `json:"latency_ms,omitempty"`
+	Mode                    string         `json:"mode"`
+	Intent                  string         `json:"intent"`
+	IntentConfidence        float64        `json:"intent_confidence"`
+	AmbiguityReason         string         `json:"ambiguity_reason"`
+	Notice                  string         `json:"notice"`
+	Action                  *RouteAction   `json:"action,omitempty"`
+	SummaryState            string         `json:"summary_state"`
+	RAGState                string         `json:"rag_state"`
+	IntentPromptVersion     string         `json:"intent_prompt_version,omitempty"`
+	AnswerPromptVersion     string         `json:"answer_prompt_version,omitempty"`
+	LatencyMS               map[string]int `json:"latency_ms,omitempty"`
+	VisionRequested         bool           `json:"vision_requested,omitempty"`
+	VisionUsed              bool           `json:"vision_used,omitempty"`
+	VisionStartMS           int64          `json:"vision_start_ms,omitempty"`
+	VisionEndMS             int64          `json:"vision_end_ms,omitempty"`
+	VisionStatus            string         `json:"vision_status,omitempty"`
+	VisionModel             string         `json:"vision_model,omitempty"`
+	VisionPromptVersion     string         `json:"vision_prompt_version,omitempty"`
+	VisionToolCalls         int            `json:"vision_tool_calls,omitempty"`
+	VisionFrameTimestampsMS []int64        `json:"vision_frame_timestamps_ms,omitempty"`
 }
 
 type generatedReply struct {
-	Content             string
-	Citations           []Citation
-	Route               RouteInfo
-	Decision            IntentDecision
-	Capabilities        CapabilityView
-	IntentPromptVersion string
-	AnswerPromptVersion string
-	Latency             map[string]time.Duration
+	Content                 string
+	Citations               []Citation
+	Route                   RouteInfo
+	Decision                IntentDecision
+	Capabilities            CapabilityView
+	IntentPromptVersion     string
+	AnswerPromptVersion     string
+	Latency                 map[string]time.Duration
+	VisionRequested         bool
+	VisionUsed              bool
+	VisionRange             *VisionRange
+	VisionStatus            string
+	VisionModel             string
+	VisionPromptVersion     string
+	VisionToolCalls         int
+	VisionFrameTimestampsMS []int64
+	VisionObservation       *model.VisionObservation
 }

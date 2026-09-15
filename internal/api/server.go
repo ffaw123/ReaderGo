@@ -22,6 +22,7 @@ import (
 	"readergo/internal/storage"
 	"readergo/internal/uploaddedupe"
 	"readergo/internal/uploadratelimit"
+	"readergo/internal/visionagent"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -595,10 +596,15 @@ func (s *Server) Router() *gin.Engine {
 	p.POST("/videos/:id/pause", s.pauseVideo)
 	p.POST("/videos/:id/resume", s.resumeVideo)
 	p.GET("/videos/:id/summary", s.summary)
+	p.GET("/capabilities", s.capabilities)
 	p.POST("/videos/:id/conversations", s.createConversation)
 	p.POST("/conversations/:id/messages", s.createMessage) // 这里的id是会话id
 	p.GET("/conversations/:id/messages", s.messages)
 	return r
+}
+
+func (s *Server) capabilities(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"vision": gin.H{"enabled": s.chat.VisionAvailable()}})
 }
 
 // credentials 是注册和登录共用的请求体；密码长度在进入业务逻辑前校验。
@@ -1035,8 +1041,9 @@ func (s *Server) createMessage(c *gin.Context) {
 		return
 	}
 	var in struct {
-		ClientMessageID string `json:"client_message_id" binding:"required"`
-		Content         string `json:"content" binding:"required"`
+		ClientMessageID string                    `json:"client_message_id" binding:"required"`
+		Content         string                    `json:"content" binding:"required"`
+		Vision          chatservice.VisionRequest `json:"vision"`
 	}
 	if c.ShouldBindJSON(&in) != nil {
 		bad(c, "client_message_id and content are required")
@@ -1049,6 +1056,10 @@ func (s *Server) createMessage(c *gin.Context) {
 	content, err := s.chat.ValidateContent(in.Content)
 	if err != nil {
 		bad(c, err.Error())
+		return
+	}
+	if err := s.chat.ValidateVisionRequest(c.Request.Context(), auth.UserID(c), x.VideoID, in.Vision); err != nil {
+		writeVisionRequestError(c, err)
 		return
 	}
 	streamStarted := false
@@ -1077,13 +1088,17 @@ func (s *Server) createMessage(c *gin.Context) {
 	}
 
 	result, err := s.chat.ReplyStream(c.Request.Context(), chatservice.ReplyInput{
-		TenantID: auth.UserID(c), Conversation: x, ClientMessageID: in.ClientMessageID, Content: content,
+		TenantID: auth.UserID(c), Conversation: x, ClientMessageID: in.ClientMessageID, Content: content, Vision: in.Vision,
+		OnProgress: func(progress visionagent.Progress) error {
+			return writeEvent("progress", progress)
+		},
 	}, func(delta string) error {
 		return writeEvent("delta", gin.H{"content": delta})
 	})
 	if err != nil {
 		if streamStarted {
-			log.Printf("stream chat reply failed: %v", err)
+			// 流式错误只记录安全类别，避免本地路径、对象键或上游响应进入日志。
+			log.Printf("stream chat reply failed: %T", err)
 			_ = writeEvent("error", gin.H{"error": "回答生成失败，请重试"})
 			return
 		}
@@ -1091,11 +1106,44 @@ func (s *Server) createMessage(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "conversation is generating another reply"})
 			return
 		}
+		if errors.Is(err, chatservice.ErrIdempotencyPayloadMismatch) {
+			c.JSON(http.StatusConflict, gin.H{"error": "client_message_id payload does not match the original request", "code": "IDEMPOTENCY_PAYLOAD_MISMATCH"})
+			return
+		}
+		if errors.Is(err, chatservice.ErrVisionNotReady) {
+			c.JSON(http.StatusConflict, gin.H{"error": "画面理解所需的视频内容尚未准备好", "code": "VISION_NOT_READY"})
+			return
+		}
+		if errors.Is(err, chatservice.ErrVisionUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "画面理解服务暂时不可用", "code": "VISION_UNAVAILABLE"})
+			return
+		}
+		if errors.Is(err, visionagent.ErrConcurrentLimit) || errors.Is(err, visionagent.ErrRateLimit) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "画面理解请求过于频繁，请稍后重试", "code": "VISION_RATE_LIMITED"})
+			return
+		}
 		fail(c, err)
 		return
 	}
 	if err := writeEvent("done", result); err != nil {
 		log.Printf("write completed chat stream failed: %v", err)
+	}
+}
+
+func writeVisionRequestError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, chatservice.ErrVisionRangeRequired):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "开启画面理解后必须填写视频时间区间", "code": "VISION_RANGE_REQUIRED"})
+	case errors.Is(err, chatservice.ErrVisionRangeInvalid):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "画面理解时间区间无效", "code": "VISION_RANGE_INVALID"})
+	case errors.Is(err, chatservice.ErrVisionRangeTooLong):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "画面理解时间区间不能超过30秒", "code": "VISION_RANGE_TOO_LONG"})
+	case errors.Is(err, chatservice.ErrVisionRangeOutOfBounds):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "画面理解时间区间超过视频时长", "code": "VISION_RANGE_OUT_OF_BOUNDS"})
+	case errors.Is(err, chatservice.ErrVisionUnavailable):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "画面理解服务暂时不可用", "code": "VISION_UNAVAILABLE"})
+	default:
+		fail(c, err)
 	}
 }
 
