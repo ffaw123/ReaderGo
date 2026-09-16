@@ -121,6 +121,7 @@ type ReplyInput struct {
 	Content         string
 	Vision          VisionRequest
 	OnProgress      visionagent.ProgressFunc
+	OnTrace         visionagent.TraceFunc
 }
 
 type VisionRange struct {
@@ -141,26 +142,27 @@ type ReplyResult struct {
 }
 
 type MessageMetadata struct {
-	Mode                    string         `json:"mode"`
-	Intent                  string         `json:"intent"`
-	IntentConfidence        float64        `json:"intent_confidence"`
-	AmbiguityReason         string         `json:"ambiguity_reason"`
-	Notice                  string         `json:"notice"`
-	Action                  *RouteAction   `json:"action,omitempty"`
-	SummaryState            string         `json:"summary_state"`
-	RAGState                string         `json:"rag_state"`
-	IntentPromptVersion     string         `json:"intent_prompt_version,omitempty"`
-	AnswerPromptVersion     string         `json:"answer_prompt_version,omitempty"`
-	LatencyMS               map[string]int `json:"latency_ms,omitempty"`
-	VisionRequested         bool           `json:"vision_requested,omitempty"`
-	VisionUsed              bool           `json:"vision_used,omitempty"`
-	VisionStartMS           int64          `json:"vision_start_ms,omitempty"`
-	VisionEndMS             int64          `json:"vision_end_ms,omitempty"`
-	VisionStatus            string         `json:"vision_status,omitempty"`
-	VisionModel             string         `json:"vision_model,omitempty"`
-	VisionPromptVersion     string         `json:"vision_prompt_version,omitempty"`
-	VisionToolCalls         int            `json:"vision_tool_calls,omitempty"`
-	VisionFrameTimestampsMS []int64        `json:"vision_frame_timestamps_ms,omitempty"`
+	Mode                    string                   `json:"mode"`
+	Intent                  string                   `json:"intent"`
+	IntentConfidence        float64                  `json:"intent_confidence"`
+	AmbiguityReason         string                   `json:"ambiguity_reason"`
+	Notice                  string                   `json:"notice"`
+	Action                  *RouteAction             `json:"action,omitempty"`
+	SummaryState            string                   `json:"summary_state"`
+	RAGState                string                   `json:"rag_state"`
+	IntentPromptVersion     string                   `json:"intent_prompt_version,omitempty"`
+	AnswerPromptVersion     string                   `json:"answer_prompt_version,omitempty"`
+	LatencyMS               map[string]int           `json:"latency_ms,omitempty"`
+	VisionRequested         bool                     `json:"vision_requested,omitempty"`
+	VisionUsed              bool                     `json:"vision_used,omitempty"`
+	VisionStartMS           int64                    `json:"vision_start_ms,omitempty"`
+	VisionEndMS             int64                    `json:"vision_end_ms,omitempty"`
+	VisionStatus            string                   `json:"vision_status,omitempty"`
+	VisionModel             string                   `json:"vision_model,omitempty"`
+	VisionPromptVersion     string                   `json:"vision_prompt_version,omitempty"`
+	VisionToolCalls         int                      `json:"vision_tool_calls,omitempty"`
+	VisionFrameTimestampsMS []int64                  `json:"vision_frame_timestamps_ms,omitempty"`
+	VisionTrace             []visionagent.AgentTrace `json:"vision_trace,omitempty"`
 }
 
 type generatedReply struct {
@@ -181,4 +183,5 @@ type generatedReply struct {
 	VisionToolCalls         int
 	VisionFrameTimestampsMS []int64
 	VisionObservation       *model.VisionObservation
+	VisionTrace             []visionagent.AgentTrace
 }

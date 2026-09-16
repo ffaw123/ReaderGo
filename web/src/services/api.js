@@ -36,7 +36,7 @@ async function request(path, options = {}) {
   return payload
 }
 
-async function streamRequest(path, options, onDelta, onProgress) {
+async function streamRequest(path, options, onDelta, onProgress, onAgentTrace) {
   const session = getSession()
   const headers = new Headers(options.headers || {})
   headers.set('Content-Type', 'application/json')
@@ -70,6 +70,7 @@ async function streamRequest(path, options, onDelta, onProgress) {
     const payload = JSON.parse(data.join('\n'))
     if (event === 'delta') onDelta?.(payload.content || '')
     if (event === 'progress') onProgress?.(payload)
+    if (event === 'agent_trace') onAgentTrace?.(payload)
     if (event === 'done') result = payload
     if (event === 'error') throw new Error(payload.error || '回答生成失败，请重试')
   }
@@ -128,7 +129,7 @@ export const api = {
       body: JSON.stringify({ title }),
     }),
   listMessages: (conversationId) => request(`/api/conversations/${conversationId}/messages`),
-  sendMessage: (conversationId, content, clientMessageId, vision, onDelta, onProgress) =>
+  sendMessage: (conversationId, content, clientMessageId, vision, onDelta, onProgress, onAgentTrace) =>
     streamRequest(
       `/api/conversations/${conversationId}/messages`,
       {
@@ -137,6 +138,7 @@ export const api = {
       },
       onDelta,
       onProgress,
+      onAgentTrace,
     ),
   createUpload: (file, title, identity, contentSHA256) =>
     request('/api/uploads', {

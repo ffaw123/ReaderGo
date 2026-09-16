@@ -57,6 +57,7 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 	started := time.Now()
 	latency := make(map[string]time.Duration)
 	toolHistory := make([]ToolTrace, 0, MaxToolCalls)
+	traces := make([]AgentTrace, 0, MaxToolCalls+2)
 	ctx, cancel := context.WithTimeout(parent, a.totalTimeout)
 	defer cancel()
 	releaseLimit, err := a.limiter.Acquire(ctx, request.TenantID)
@@ -100,11 +101,28 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 	if err := reportProgress(request.OnProgress, "initial_sampling", "正在查看所选时间段的画面"); err != nil {
 		return Result{}, err
 	}
+	initialArguments := &InspectVideoRangeInput{StartMS: request.Range.StartMS, EndMS: request.Range.EndMS, IntervalMS: InitialIntervalMS}
+	initialTrace := AgentTrace{
+		ID: "initial", Step: 1, Status: "running", Action: TraceInitial,
+		Summary: "正在按默认间隔查看所选时间区间", Arguments: initialArguments,
+		RemainingToolCalls: MaxToolCalls, RemainingFrameBudget: MaxUniqueFrames,
+	}
+	if err := reportTrace(request.OnTrace, initialTrace); err != nil {
+		return Result{}, err
+	}
 	initialSamplingStarted := time.Now()
 	if err := session.InitialSample(); err != nil {
 		return Result{}, fmt.Errorf("initial vision sampling: %w", err)
 	}
 	latency["initial_sampling"] = time.Since(initialSamplingStarted)
+	initialTrace.Status = "completed"
+	initialTrace.Summary = "已完成所选时间区间的初始画面检查"
+	initialTrace.NewFrameTimestampsMS = timestampsOf(session.Frames())
+	initialTrace.RemainingToolCalls, initialTrace.RemainingFrameBudget = session.RemainingToolCalls(), session.RemainingFrames()
+	if err := reportTrace(request.OnTrace, initialTrace); err != nil {
+		return Result{}, err
+	}
+	traces = append(traces, initialTrace)
 
 	for {
 		frames := session.Frames()
@@ -123,9 +141,18 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 		}
 		if decision.Action == ActionCallTool {
 			if session.RemainingToolCalls() == 0 {
-				return a.noEvidenceResult(session, windows, started, latency), nil
+				return a.finishNoEvidence(request, session, windows, started, latency, traces)
 			}
 			if err := reportProgress(request.OnProgress, "refining", "正在细化检查关键画面"); err != nil {
+				return Result{}, err
+			}
+			trace := AgentTrace{
+				ID: fmt.Sprintf("tool-%d", session.toolCalls+1), Step: len(traces) + 1,
+				Status: "running", Action: TraceInspect, Summary: "正在细化检查关键画面",
+				Reason: safeTraceReason(decision.Reason), Arguments: &decision.Tool.Arguments,
+				RemainingToolCalls: session.RemainingToolCalls(), RemainingFrameBudget: session.RemainingFrames(),
+			}
+			if err := reportTrace(request.OnTrace, trace); err != nil {
 				return Result{}, err
 			}
 			toolStarted := time.Now()
@@ -136,32 +163,49 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 			}
 			err := session.ExecuteTool(decision.Tool.Arguments)
 			latency["tool_sampling"] += time.Since(toolStarted)
-			trace := ToolTrace{Reason: decision.Reason, Arguments: decision.Tool.Arguments, OK: err == nil}
+			toolTrace := ToolTrace{Reason: decision.Reason, Arguments: decision.Tool.Arguments, OK: err == nil}
 			for timestamp := range session.frames {
 				if _, exists := beforeTimestamps[timestamp]; !exists {
-					trace.NewFrameTimestampsMS = append(trace.NewFrameTimestampsMS, timestamp)
+					toolTrace.NewFrameTimestampsMS = append(toolTrace.NewFrameTimestampsMS, timestamp)
 				}
 			}
-			slices.Sort(trace.NewFrameTimestampsMS)
-			trace.RemainingToolCalls, trace.RemainingFrameBudget = session.RemainingToolCalls(), session.RemainingFrames()
+			slices.Sort(toolTrace.NewFrameTimestampsMS)
+			toolTrace.RemainingToolCalls, toolTrace.RemainingFrameBudget = session.RemainingToolCalls(), session.RemainingFrames()
+			trace.NewFrameTimestampsMS = append([]int64(nil), toolTrace.NewFrameTimestampsMS...)
+			trace.RemainingToolCalls, trace.RemainingFrameBudget = toolTrace.RemainingToolCalls, toolTrace.RemainingFrameBudget
 			if err != nil {
 				code, message, correctable := safeToolError(err)
 				if !correctable {
+					trace.Status, trace.Summary = "failed", "画面提取失败，本次检查已停止"
+					if traceErr := reportTrace(request.OnTrace, trace); traceErr != nil {
+						return Result{}, traceErr
+					}
 					return Result{}, fmt.Errorf("vision tool sampling failed: %w", err)
 				}
-				trace.ErrorCode, trace.Message = code, message
-				toolHistory = append(toolHistory, trace)
+				toolTrace.ErrorCode, toolTrace.Message = code, message
+				toolHistory = append(toolHistory, toolTrace)
+				trace.Status, trace.Summary = "failed", message
+				if traceErr := reportTrace(request.OnTrace, trace); traceErr != nil {
+					return Result{}, traceErr
+				}
+				traces = append(traces, trace)
 				session.AppendToolError(errors.New(code + ": " + message))
 				if session.RemainingToolCalls() == 0 || errors.Is(err, ErrToolBudget) {
-					return a.noEvidenceResult(session, windows, started, latency), nil
+					return a.finishNoEvidence(request, session, windows, started, latency, traces)
 				}
 			} else {
-				toolHistory = append(toolHistory, trace)
+				toolHistory = append(toolHistory, toolTrace)
+				trace.Status = "completed"
+				trace.Summary = fmt.Sprintf("已完成细化检查，新增 %d 帧", len(trace.NewFrameTimestampsMS))
+				if err := reportTrace(request.OnTrace, trace); err != nil {
+					return Result{}, err
+				}
+				traces = append(traces, trace)
 			}
 			continue
 		}
 		if decision.EvidenceStatus == "NO_EVIDENCE" {
-			return a.noEvidenceResult(session, windows, started, latency), nil
+			return a.finishNoEvidence(request, session, windows, started, latency, traces)
 		}
 
 		if err := reportProgress(request.OnProgress, "synthesizing", "正在结合视频检索内容生成回答"); err != nil {
@@ -184,14 +228,48 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 		latency["answer_synthesis"] = time.Since(answerStarted)
 		used := answer.UsedFrameTimestampsMS
 		latency["vision_total"] = time.Since(started)
+		finalTrace := AgentTrace{
+			ID: "final", Step: len(traces) + 1, Status: "completed", Action: TraceFinal,
+			Summary: "已找到能够回答问题的画面证据", EvidenceStatus: "GROUNDED",
+			UsedFrameTimestampsMS: append([]int64(nil), used...),
+		}
+		if err := reportTrace(request.OnTrace, finalTrace); err != nil {
+			return Result{}, err
+		}
+		traces = append(traces, finalTrace)
 		return Result{
 			Answer: answer.Answer, Status: StatusGrounded, Observation: decision.Observation,
 			SampledFrameTimestampsMS: timestampsOf(session.Frames()), UsedFrameTimestampsMS: used,
 			ToolCalls: session.toolCalls, Model: a.client.Model(), PromptVersion: AgentPromptVersion,
 			AnswerPromptVersion: AnswerPromptVersion, SegmentIDsByTimestamp: segmentIDsForTimestamps(windows, used),
-			Latency: latency,
+			Latency: latency, Trace: traces,
 		}, nil
 	}
+}
+
+func (a *Agent) finishNoEvidence(request Request, session *session, windows []RetrievalWindow, started time.Time, latency map[string]time.Duration, traces []AgentTrace) (Result, error) {
+	finalTrace := AgentTrace{
+		ID: "final", Step: len(traces) + 1, Status: "completed", Action: TraceFinal,
+		Summary: "在允许的检查预算内未找到足以回答问题的画面证据", EvidenceStatus: "NO_EVIDENCE",
+	}
+	if err := reportTrace(request.OnTrace, finalTrace); err != nil {
+		return Result{}, err
+	}
+	traces = append(traces, finalTrace)
+	return a.noEvidenceResult(session, windows, started, latency, traces), nil
+}
+
+func safeTraceReason(reason string) string {
+	value := strings.Join(strings.Fields(reason), " ")
+	lower := strings.ToLower(value)
+	if value == "" || strings.Contains(lower, "://") || strings.Contains(lower, `:\`) || strings.Contains(lower, ":/") || strings.Contains(lower, "/tmp/") || strings.Contains(lower, "/home/") || strings.Contains(lower, "api_key") {
+		return "当前画面不足以确认细节，需要在授权区间内继续检查"
+	}
+	runes := []rune(value)
+	if len(runes) > 200 {
+		value = string(runes[:200])
+	}
+	return value
 }
 
 func safeToolError(err error) (code, message string, correctable bool) {
@@ -233,7 +311,7 @@ func (a *Agent) answerWithValidationRetry(ctx context.Context, input answerInput
 	return FinalAnswer{}, fmt.Errorf("vision answer remains invalid: %w", lastErr)
 }
 
-func (a *Agent) noEvidenceResult(session *session, windows []RetrievalWindow, started time.Time, latency map[string]time.Duration) Result {
+func (a *Agent) noEvidenceResult(session *session, windows []RetrievalWindow, started time.Time, latency map[string]time.Duration, traces []AgentTrace) Result {
 	timestamps := timestampsOf(session.Frames())
 	labels := make([]string, len(timestamps))
 	for index, timestamp := range timestamps {
@@ -246,6 +324,7 @@ func (a *Agent) noEvidenceResult(session *session, windows []RetrievalWindow, st
 		Model: a.client.Model(), PromptVersion: AgentPromptVersion, AnswerPromptVersion: AnswerPromptVersion,
 		SegmentIDsByTimestamp: segmentIDsForTimestamps(windows, timestamps),
 		Latency:               latency,
+		Trace:                 traces,
 	}
 }
 
@@ -254,6 +333,13 @@ func reportProgress(callback ProgressFunc, stage, message string) error {
 		return nil
 	}
 	return callback(Progress{Stage: stage, Message: message})
+}
+
+func reportTrace(callback TraceFunc, trace AgentTrace) error {
+	if callback == nil {
+		return nil
+	}
+	return callback(trace)
 }
 
 func timestampsOf(frames []Frame) []int64 {

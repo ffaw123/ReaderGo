@@ -12,6 +12,9 @@ const (
 	ActionCallTool = "CALL_TOOL"
 	ActionFinal    = "FINAL"
 	ToolName       = "inspect_video_range"
+	TraceInitial   = "INSPECT_INITIAL_RANGE"
+	TraceInspect   = "INSPECT_VIDEO_RANGE"
+	TraceFinal     = "FINAL"
 
 	InitialIntervalMS       int64 = 5_000
 	MinIntervalMS           int64 = 500
@@ -47,6 +50,7 @@ type Request struct {
 	Range          Range
 	History        []HistoryTurn
 	OnProgress     ProgressFunc
+	OnTrace        TraceFunc
 }
 
 type Progress struct {
@@ -55,6 +59,24 @@ type Progress struct {
 }
 
 type ProgressFunc func(Progress) error
+
+// AgentTrace 是允许展示给用户的结构化操作记录，不包含原始模型响应或内部路径。
+type AgentTrace struct {
+	ID                    string                  `json:"id"`
+	Step                  int                     `json:"step"`
+	Status                string                  `json:"status"`
+	Action                string                  `json:"action"`
+	Summary               string                  `json:"summary"`
+	Reason                string                  `json:"reason,omitempty"`
+	Arguments             *InspectVideoRangeInput `json:"arguments,omitempty"`
+	NewFrameTimestampsMS  []int64                 `json:"new_frame_timestamps_ms,omitempty"`
+	UsedFrameTimestampsMS []int64                 `json:"used_frame_timestamps_ms,omitempty"`
+	RemainingToolCalls    int                     `json:"remaining_tool_calls"`
+	RemainingFrameBudget  int                     `json:"remaining_frame_budget"`
+	EvidenceStatus        string                  `json:"evidence_status,omitempty"`
+}
+
+type TraceFunc func(AgentTrace) error
 
 type Result struct {
 	Answer                   string
@@ -68,6 +90,7 @@ type Result struct {
 	AnswerPromptVersion      string
 	SegmentIDsByTimestamp    map[int64]string
 	Latency                  map[string]time.Duration
+	Trace                    []AgentTrace
 }
 
 type Runner interface {

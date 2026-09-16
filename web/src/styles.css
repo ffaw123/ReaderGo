@@ -275,6 +275,22 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .message p { margin: 9px 0 0; color: #454b5f; font-size: 14px; line-height: 1.8; white-space: pre-wrap; }
 .citations { display: flex; margin-top: 12px; flex-wrap: wrap; gap: 7px; }
 .citations button { display: inline-flex; min-height: 31px; padding: 5px 10px; align-items: center; gap: 5px; border: 1px solid #d4d6f0; border-radius: 8px; color: var(--accent-strong); background: var(--accent-soft); font-size: 10px; cursor: pointer; }
+.agent-trace { max-width: 660px; margin-top: 12px; overflow: hidden; border: 1px solid #e0e2ec; border-radius: 10px; color: #555d70; background: #fafafe; font-size: 10px; }
+.agent-trace summary { display: flex; min-height: 34px; padding: 8px 11px; align-items: center; justify-content: space-between; cursor: pointer; list-style: none; font-weight: 700; }
+.agent-trace summary::-webkit-details-marker { display: none; }
+.agent-trace summary span, .agent-trace__live-title { display: flex; align-items: center; gap: 6px; }
+.agent-trace summary > svg { transition: transform 160ms ease; }
+.agent-trace[open] summary > svg { transform: rotate(180deg); }
+.agent-trace ol { display: grid; margin: 0; padding: 4px 11px 10px; gap: 8px; list-style: none; }
+.agent-trace li { display: grid; grid-template-columns: 20px 1fr; gap: 7px; }
+.agent-trace__marker { display: grid; width: 18px; height: 18px; place-items: center; border-radius: 50%; color: #6564a8; background: #ececff; }
+.agent-trace__step--failed .agent-trace__marker { color: #a85656; background: #fcecec; }
+.agent-trace li strong { color: #3c4254; font-size: 10px; }
+.message .agent-trace li p { margin: 2px 0 0; color: #687083; font-size: 10px; line-height: 1.55; }
+.agent-trace li small { display: block; margin-top: 2px; color: #858c9c; line-height: 1.5; }
+.message .agent-trace__note { margin: 0; padding: 0 11px 10px; color: #969cab; font-size: 9px; line-height: 1.5; }
+.agent-trace--live { padding-top: 9px; background: #f8f8ff; }
+.agent-trace__live-title { padding: 0 11px 6px; color: #4f4e91; }
 .typing { display: flex; height: 30px; align-items: center; gap: 4px; }
 .typing i { width: 5px; height: 5px; border-radius: 50%; background: #8887ba; animation: typing 1s infinite ease-in-out; }
 .typing i:nth-child(2) { animation-delay: 120ms; }

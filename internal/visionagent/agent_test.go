@@ -96,9 +96,14 @@ func TestAgentGroundedAnswerCombinesRetrievalAndVisualMemory(t *testing.T) {
 		StartMS: 0, EndMS: 10_000, Status: StatusGrounded, Observation: "人物此前坐在桌旁",
 	}}}, client)
 
+	var streamedTraces []AgentTrace
 	result, err := agent.Run(context.Background(), Request{
 		TenantID: "tenant-1", VideoID: "video-1", ConversationID: "conversation-1",
 		Question: "这个人在做什么？", RewrittenQuery: "人物动作", Range: Range{StartMS: 0, EndMS: 10_000},
+		OnTrace: func(trace AgentTrace) error {
+			streamedTraces = append(streamedTraces, trace)
+			return nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -110,6 +115,22 @@ func TestAgentGroundedAnswerCombinesRetrievalAndVisualMemory(t *testing.T) {
 		if !strings.Contains(client.input.CombinedRetrievalText, want) {
 			t.Fatalf("combined retrieval text missing %q: %s", want, client.input.CombinedRetrievalText)
 		}
+	}
+	if len(streamedTraces) != 3 || len(result.Trace) != 2 {
+		t.Fatalf("streamed/persisted traces = %d/%d, want 3/2", len(streamedTraces), len(result.Trace))
+	}
+	if result.Trace[0].Action != TraceInitial || result.Trace[1].EvidenceStatus != "GROUNDED" {
+		t.Fatalf("unexpected persisted trace: %#v", result.Trace)
+	}
+}
+
+func TestSafeTraceReasonRedactsSensitiveAndLongContent(t *testing.T) {
+	fallback := safeTraceReason(`读取 C:\private\video.mp4 并访问 https://internal.example`)
+	if strings.Contains(fallback, "private") || strings.Contains(fallback, "http") {
+		t.Fatalf("sensitive reason was not replaced: %q", fallback)
+	}
+	if got := []rune(safeTraceReason(strings.Repeat("理由", 150))); len(got) != 200 {
+		t.Fatalf("safe reason length = %d, want 200", len(got))
 	}
 }
 

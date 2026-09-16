@@ -249,6 +249,31 @@
           "label": { "type": "string" }
         }
       },
+      "AgentTrace": {
+        "type": "object",
+        "required": ["id", "step", "status", "action", "summary"],
+        "properties": {
+          "id": { "type": "string", "description": "同一步骤的实时更新使用相同 ID" },
+          "step": { "type": "integer", "minimum": 1 },
+          "status": { "type": "string", "enum": ["running", "completed", "failed"] },
+          "action": { "type": "string", "enum": ["INSPECT_INITIAL_RANGE", "INSPECT_VIDEO_RANGE", "FINAL"] },
+          "summary": { "type": "string", "description": "经过服务端裁剪的用户可见状态说明" },
+          "reason": { "type": "string", "description": "经过服务端安全处理的简短采样理由" },
+          "arguments": {
+            "type": "object",
+            "properties": {
+              "start_ms": { "type": "integer", "format": "int64" },
+              "end_ms": { "type": "integer", "format": "int64" },
+              "interval_ms": { "type": "integer", "format": "int64" }
+            }
+          },
+          "new_frame_timestamps_ms": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "used_frame_timestamps_ms": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "remaining_tool_calls": { "type": "integer" },
+          "remaining_frame_budget": { "type": "integer" },
+          "evidence_status": { "type": "string", "enum": ["GROUNDED", "NO_EVIDENCE"] }
+        }
+      },
       "MessageMetadata": {
         "type": "object",
         "properties": {
@@ -268,7 +293,8 @@
           "vision_model": { "type": "string" },
           "vision_prompt_version": { "type": "string" },
           "vision_tool_calls": { "type": "integer" },
-          "vision_frame_timestamps_ms": { "type": "array", "items": { "type": "integer", "format": "int64" } }
+          "vision_frame_timestamps_ms": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "vision_trace": { "type": "array", "items": { "$ref": "#/components/schemas/AgentTrace" } }
         }
       },
       "VisionRange": {
@@ -896,7 +922,7 @@
             "content": {
               "text/event-stream": {
                 "schema": { "type": "string" },
-                "example": "event: progress\ndata: {\"stage\":\"initial_sampling\",\"message\":\"正在查看所选时间段的画面\"}\n\nevent: delta\ndata: {\"content\":\"你好\"}\n\nevent: done\ndata: {\"user_message\":{},\"assistant_message\":{},\"route\":{},\"capabilities\":{}}\n\n"
+                "example": "event: progress\ndata: {\"stage\":\"initial_sampling\",\"message\":\"正在查看所选时间段的画面\"}\n\nevent: agent_trace\ndata: {\"id\":\"initial\",\"step\":1,\"status\":\"completed\",\"action\":\"INSPECT_INITIAL_RANGE\",\"summary\":\"已完成所选时间区间的初始画面检查\"}\n\nevent: delta\ndata: {\"content\":\"你好\"}\n\nevent: done\ndata: {\"user_message\":{},\"assistant_message\":{},\"route\":{},\"capabilities\":{}}\n\n"
               }
             }
           },

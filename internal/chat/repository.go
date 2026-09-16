@@ -139,6 +139,7 @@ func (r *repository) CompleteReply(ctx context.Context, user model.Message, repl
 		VisionStatus: reply.VisionStatus, VisionModel: reply.VisionModel,
 		VisionPromptVersion: reply.VisionPromptVersion, VisionToolCalls: reply.VisionToolCalls,
 		VisionFrameTimestampsMS: reply.VisionFrameTimestampsMS,
+		VisionTrace:             reply.VisionTrace,
 	}
 	if reply.VisionRange != nil {
 		metadata.VisionStartMS, metadata.VisionEndMS = reply.VisionRange.StartMS, reply.VisionRange.EndMS

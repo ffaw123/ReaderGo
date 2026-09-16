@@ -1092,6 +1092,9 @@ func (s *Server) createMessage(c *gin.Context) {
 		OnProgress: func(progress visionagent.Progress) error {
 			return writeEvent("progress", progress)
 		},
+		OnTrace: func(trace visionagent.AgentTrace) error {
+			return writeEvent("agent_trace", trace)
+		},
 	}, func(delta string) error {
 		return writeEvent("delta", gin.H{"content": delta})
 	})

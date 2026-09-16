@@ -61,6 +61,7 @@ const visionStart = ref('')
 const visionEnd = ref('')
 const visionAvailable = ref(false)
 const visionProgress = ref('')
+const visionTrace = ref([])
 const toast = ref(null)
 const chatScroll = ref(null)
 const fileInput = ref(null)
@@ -320,6 +321,45 @@ function currentVisionRequest() {
   return { enabled: true, range: { start_ms: startMS, end_ms: endMS } }
 }
 
+function upsertVisionTrace(trace) {
+  if (!trace?.id) return
+  const next = visionTrace.value.slice()
+  const index = next.findIndex((item) => item.id === trace.id)
+  if (index >= 0) next[index] = trace
+  else next.push(trace)
+  next.sort((left, right) => Number(left.step || 0) - Number(right.step || 0))
+  visionTrace.value = next
+
+  // 回答正文开始流式输出后，继续把轨迹更新到临时助手消息中。
+  const assistant = messages.value.find((message) => message.streaming)
+  if (assistant) {
+    assistant.metadata = { ...(assistant.metadata || {}), vision_trace: next.map((item) => ({ ...item })) }
+  }
+}
+
+function formatTraceTime(milliseconds) {
+  const value = Math.max(0, Number(milliseconds) || 0)
+  const hours = Math.floor(value / 3_600_000)
+  const minutes = Math.floor((value % 3_600_000) / 60_000)
+  const seconds = Math.floor((value % 60_000) / 1000)
+  const millis = value % 1000
+  const prefix = hours > 0 ? `${String(hours).padStart(2, '0')}:` : ''
+  return `${prefix}${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(millis).padStart(3, '0')}`
+}
+
+function traceArgumentsLabel(argumentsValue) {
+  if (!argumentsValue) return ''
+  return `${formatTraceTime(argumentsValue.start_ms)}–${formatTraceTime(argumentsValue.end_ms)}，间隔 ${argumentsValue.interval_ms}ms`
+}
+
+function traceActionLabel(action) {
+  return {
+    INSPECT_INITIAL_RANGE: '初始查看',
+    INSPECT_VIDEO_RANGE: '细化查看',
+    FINAL: '完成检查',
+  }[action] || '画面检查'
+}
+
 async function loadCapabilities() {
   if (previewMode.value) return
   try {
@@ -501,6 +541,7 @@ async function sendMessage() {
   draft.value = ''
   sending.value = true
   visionProgress.value = vision.enabled ? '正在准备画面理解' : ''
+  visionTrace.value = []
   const clientMessageId = retryMessage.value?.content === content
     ? retryMessage.value.id
     : crypto.randomUUID()
@@ -539,7 +580,7 @@ async function sendMessage() {
             role: 'assistant',
             content: '',
             citations: [],
-            metadata: {},
+            metadata: { vision_trace: visionTrace.value.map((item) => ({ ...item })) },
             streaming: true,
             created_at: new Date().toISOString(),
           }
@@ -549,6 +590,9 @@ async function sendMessage() {
         nextTick().then(scrollChat)
       }, (progress) => {
         visionProgress.value = progress?.message || ''
+      }, (trace) => {
+        upsertVisionTrace(trace)
+        nextTick().then(scrollChat)
       })
       messages.value = messages.value.map((message) =>
         message.id === optimistic.id ? response.user_message : message,
@@ -569,6 +613,7 @@ async function sendMessage() {
   } finally {
     sending.value = false
     visionProgress.value = ''
+    visionTrace.value = []
     await nextTick()
     scrollChat()
   }
@@ -1225,6 +1270,30 @@ onBeforeUnmount(() => {
                     </button>
                   </div>
                   <p>{{ message.content }}</p>
+                  <details v-if="message.role === 'assistant' && message.metadata?.vision_trace?.length" class="agent-trace">
+                    <summary>
+                      <span><Eye :size="13" /> 画面检查记录（{{ message.metadata.vision_trace.length }} 步）</span>
+                      <ChevronDown :size="14" />
+                    </summary>
+                    <ol>
+                      <li v-for="trace in message.metadata.vision_trace" :key="trace.id" :class="`agent-trace__step--${trace.status}`">
+                        <span class="agent-trace__marker">
+                          <LoaderCircle v-if="trace.status === 'running'" :size="12" class="spin" />
+                          <Check v-else-if="trace.status === 'completed'" :size="12" />
+                          <X v-else :size="12" />
+                        </span>
+                        <div>
+                          <strong>{{ traceActionLabel(trace.action) }}</strong>
+                          <p>{{ trace.summary }}</p>
+                          <small v-if="trace.reason">动作说明：{{ trace.reason }}</small>
+                          <small v-if="trace.arguments">参数：{{ traceArgumentsLabel(trace.arguments) }}</small>
+                          <small v-if="trace.new_frame_timestamps_ms?.length">新增画面：{{ trace.new_frame_timestamps_ms.length }} 帧</small>
+                          <small v-if="trace.action !== 'FINAL'">剩余预算：可细化 {{ trace.remaining_tool_calls }} 次，最多 {{ trace.remaining_frame_budget }} 帧</small>
+                        </div>
+                      </li>
+                    </ol>
+                    <p class="agent-trace__note">操作记录用于说明系统检查了哪些画面；画面结论仍请结合原片判断。</p>
+                  </details>
                   <div v-if="message.citations?.length" class="citations">
                     <button v-for="citation in message.citations" :key="`${citation.segment_id}-${citation.start_ms}`" :title="`视频片段 ${citation.label}`">
                       <Play :size="11" fill="currentColor" /> {{ citation.label }} · {{ citation.source_type === 'vision_frame' ? '查看画面' : '相关片段' }}
@@ -1237,6 +1306,25 @@ onBeforeUnmount(() => {
                 <div>
                   <div class="typing"><i></i><i></i><i></i></div>
                   <small v-if="visionProgress" class="vision-progress">{{ visionProgress }}</small>
+                  <div v-if="visionTrace.length" class="agent-trace agent-trace--live">
+                    <strong class="agent-trace__live-title"><Eye :size="13" /> 正在检查画面</strong>
+                    <ol>
+                      <li v-for="trace in visionTrace" :key="trace.id" :class="`agent-trace__step--${trace.status}`">
+                        <span class="agent-trace__marker">
+                          <LoaderCircle v-if="trace.status === 'running'" :size="12" class="spin" />
+                          <Check v-else-if="trace.status === 'completed'" :size="12" />
+                          <X v-else :size="12" />
+                        </span>
+                        <div>
+                          <strong>{{ traceActionLabel(trace.action) }}</strong>
+                          <p>{{ trace.summary }}</p>
+                          <small v-if="trace.reason">动作说明：{{ trace.reason }}</small>
+                          <small v-if="trace.arguments">参数：{{ traceArgumentsLabel(trace.arguments) }}</small>
+                          <small v-if="trace.action !== 'FINAL'">剩余预算：可细化 {{ trace.remaining_tool_calls }} 次，最多 {{ trace.remaining_frame_budget }} 帧</small>
+                        </div>
+                      </li>
+                    </ol>
+                  </div>
                 </div>
               </article>
             </template>

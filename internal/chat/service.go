@@ -391,7 +391,7 @@ func (s *Service) generateAgentReply(ctx context.Context, in ReplyInput, onDelta
 			TenantID: in.TenantID, VideoID: in.Conversation.VideoID, ConversationID: in.Conversation.ID,
 			Question: in.Content, RewrittenQuery: decision.RewrittenQuery,
 			Range:   visionagent.Range{StartMS: visionRange.StartMS, EndMS: visionRange.EndMS},
-			History: visionHistory, OnProgress: in.OnProgress,
+			History: visionHistory, OnProgress: in.OnProgress, OnTrace: in.OnTrace,
 		})
 		if err != nil {
 			return generatedReply{}, err
@@ -424,6 +424,7 @@ func (s *Service) generateAgentReply(ctx context.Context, in ReplyInput, onDelta
 			VisionUsed: true, VisionStatus: visionResult.Status, VisionModel: visionResult.Model,
 			VisionPromptVersion: visionResult.PromptVersion, VisionToolCalls: visionResult.ToolCalls,
 			VisionFrameTimestampsMS: visionResult.SampledFrameTimestampsMS, VisionObservation: observation,
+			VisionTrace: visionResult.Trace,
 		})
 		return reply, emitReplyContent(reply, onDelta)
 	default:
