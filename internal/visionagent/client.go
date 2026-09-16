@@ -43,9 +43,12 @@ var inspectVideoRangeTool = openai.ChatCompletionToolParam{
 		Parameters: shared.FunctionParameters{
 			"type": "object",
 			"properties": map[string]any{
-				"start_ms":    map[string]any{"type": "integer", "minimum": 0},
-				"end_ms":      map[string]any{"type": "integer", "minimum": 1},
-				"interval_ms": map[string]any{"type": "integer", "minimum": MinIntervalMS},
+				"start_ms": map[string]any{"type": "integer", "minimum": 0},
+				"end_ms":   map[string]any{"type": "integer", "minimum": 1},
+				"interval_ms": map[string]any{
+					"type": "integer", "minimum": MinIntervalMS, "maximum": MaxIntervalMS,
+					"description": "采样间隔。服务端会按区间长度自动收紧，确保每次返回 4 到 18 帧。",
+				},
 			},
 			"required":             []string{"start_ms", "end_ms", "interval_ms"},
 			"additionalProperties": false,
@@ -212,6 +215,12 @@ func (c *mimoOrchestratorClient) Next(ctx context.Context, input OrchestratorInp
 }
 
 func (c *qwenObserverClient) Observe(ctx context.Context, input ObserverInput, frames []Frame) (Observation, error) {
+	if len(frames) < MinObservationFrames || len(frames) > MaxUniqueFrames {
+		return Observation{}, fmt.Errorf("vision observer requires %d to %d frames, got %d: %w", MinObservationFrames, MaxUniqueFrames, len(frames), ErrInvalidOutput)
+	}
+	if input.IntervalMS < MinIntervalMS || input.IntervalMS > MaxIntervalMS {
+		return Observation{}, fmt.Errorf("vision observer interval_ms must be between %d and %d: %w", MinIntervalMS, MaxIntervalMS, ErrInvalidOutput)
+	}
 	payload, err := json.Marshal(input)
 	if err != nil {
 		return Observation{}, fmt.Errorf("encode observer input: %w", err)

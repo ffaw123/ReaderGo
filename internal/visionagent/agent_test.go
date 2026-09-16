@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -108,10 +109,10 @@ func TestAgentUsesMiMoToolCallThenQwenObservation(t *testing.T) {
 	if result.Status != StatusGrounded || result.Answer != "人物举起了杯子。" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	if len(result.UsedFrameTimestampsMS) != 2 || result.UsedFrameTimestampsMS[0] != 0 || result.UsedFrameTimestampsMS[1] != 5_000 {
+	if !slices.Equal(result.UsedFrameTimestampsMS, []int64{0, 3_333, 6_666, 9_999}) {
 		t.Fatalf("used source frames = %v, want all sampled frames from obs-1", result.UsedFrameTimestampsMS)
 	}
-	if result.OrchestratorModel != "mimo-v2.5-pro" || result.VisionModel != "qwen3-vl-flash" {
+	if result.OrchestratorModel != "mimo-v2.5-pro" || result.ObserverModel != "qwen3-vl-flash" {
 		t.Fatalf("model audit fields missing: %#v", result)
 	}
 	if len(orchestrator.histories) != 2 || len(orchestrator.histories[1]) != 2 {
@@ -125,8 +126,11 @@ func TestAgentUsesMiMoToolCallThenQwenObservation(t *testing.T) {
 		strings.Contains(orchestrator.histories[1][1].Content, "used_frame_timestamps_ms") {
 		t.Fatalf("observer-owned evidence fields leaked into tool result: %s", orchestrator.histories[1][1].Content)
 	}
-	if len(observer.inputs) != 1 || observer.inputs[0].Question != "这个人在做什么？" || observer.inputs[0].IntervalMS != 5_000 {
-		t.Fatalf("observer input = %#v, want question with the tool call interval", observer.inputs)
+	if !strings.Contains(orchestrator.histories[1][1].Content, `"interval_ms":3333`) {
+		t.Fatalf("tool result did not report the effective interval: %s", orchestrator.histories[1][1].Content)
+	}
+	if len(observer.inputs) != 1 || observer.inputs[0].Question != "这个人在做什么？" || observer.inputs[0].IntervalMS != 3_333 {
+		t.Fatalf("observer input = %#v, want question with the effective sampling interval", observer.inputs)
 	}
 }
 
@@ -223,10 +227,10 @@ func TestAgentRejectsForgedObservationID(t *testing.T) {
 
 func TestAgentStopsAtThreeCallBudget(t *testing.T) {
 	orchestrator := &fakeOrchestrator{turns: []OrchestratorTurn{
-		toolTurn("call-1", 0, 1_000, 500),
-		toolTurn("call-2", 1_000, 2_000, 500),
-		toolTurn("call-3", 2_000, 3_000, 500),
-		toolTurn("call-4", 3_000, 4_000, 500),
+		toolTurn("call-1", 0, 2_000, 500),
+		toolTurn("call-2", 2_000, 4_000, 500),
+		toolTurn("call-3", 4_000, 6_000, 500),
+		toolTurn("call-4", 6_000, 8_000, 500),
 	}}
 	observer := &fakeObserver{values: []Observation{
 		{Observation: "未观察到与问题相关的可见内容。"},

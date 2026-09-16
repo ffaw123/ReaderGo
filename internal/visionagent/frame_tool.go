@@ -44,26 +44,34 @@ func (s *session) Close() {
 	}
 }
 
-func (s *session) InitialSample() error {
-	return s.sample(InspectVideoRangeInput{StartMS: s.allowed.StartMS, EndMS: s.allowed.EndMS, IntervalMS: InitialIntervalMS})
+func (s *session) ConfirmRange(value Range) {
+	// 中文注释：确认只更新授权边界；真正抽帧仍属于原来的 tool_call，不能偷偷执行额外采样。
+	s.allowed = value
 }
 
-func (s *session) ExecuteTool(input InspectVideoRangeInput) error {
+func (s *session) ExecuteTool(input InspectVideoRangeInput) ([]Frame, error) {
 	// 无效调用同样消耗次数，避免模型通过反复提交错误参数形成无限循环。
 	s.toolCalls++
 	if s.toolCalls > MaxToolCalls {
-		return ErrToolBudget
+		return nil, ErrToolBudget
 	}
 	if !within(s.allowed, input) {
-		return fmt.Errorf("requested range is outside the user-authorized range: %w", ErrRangeOutOfBounds)
+		return nil, fmt.Errorf("requested range is outside the user-authorized range: %w", ErrRangeOutOfBounds)
 	}
 	return s.sample(input)
 }
 
-func (s *session) sample(input InspectVideoRangeInput) error {
+func (s *session) ExecuteConfirmedTool(input InspectVideoRangeInput) ([]Frame, error) {
+	if !within(s.allowed, input) {
+		return nil, fmt.Errorf("confirmed range does not authorize tool arguments: %w", ErrRangeOutOfBounds)
+	}
+	return s.sample(input)
+}
+
+func (s *session) sample(input InspectVideoRangeInput) ([]Frame, error) {
 	timestamps, err := frameTimestamps(input)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	newTimestamps := make([]int64, 0, len(timestamps))
 	for _, timestamp := range timestamps {
@@ -72,25 +80,41 @@ func (s *session) sample(input InspectVideoRangeInput) error {
 		}
 	}
 	if len(s.frames)+len(newTimestamps) > MaxUniqueFrames {
-		return fmt.Errorf("tool would add %d frames with %d remaining: %w", len(newTimestamps), MaxUniqueFrames-len(s.frames), ErrFrameBudget)
+		return nil, fmt.Errorf("tool would add %d frames with %d remaining: %w", len(newTimestamps), MaxUniqueFrames-len(s.frames), ErrFrameBudget)
 	}
 	for _, timestamp := range newTimestamps {
 		if err := s.ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		path := filepath.Join(s.workDir, fmt.Sprintf("frame-%012d.jpg", timestamp))
 		if err := s.ffmpeg.ExtractFrameAt(s.ctx, s.videoPath, path, time.Duration(timestamp)*time.Millisecond); err != nil {
-			return err
+			return nil, err
 		}
 		s.frames[timestamp] = Frame{TimestampMS: timestamp, DisplayTime: formatTimestamp(timestamp), Path: path}
 	}
-	return nil
+	frames := make([]Frame, len(timestamps))
+	for index, timestamp := range timestamps {
+		frames[index] = s.frames[timestamp]
+	}
+	return frames, nil
 }
 
 func (s *session) Frames() []Frame {
+	return s.framesMatching(func(int64) bool { return true })
+}
+
+func (s *session) AllowedFrames() []Frame {
+	return s.framesMatching(func(timestamp int64) bool {
+		return timestamp >= s.allowed.StartMS && timestamp < s.allowed.EndMS
+	})
+}
+
+func (s *session) framesMatching(include func(int64) bool) []Frame {
 	timestamps := make([]int64, 0, len(s.frames))
 	for timestamp := range s.frames {
-		timestamps = append(timestamps, timestamp)
+		if include(timestamp) {
+			timestamps = append(timestamps, timestamp)
+		}
 	}
 	slices.Sort(timestamps)
 	frames := make([]Frame, len(timestamps))

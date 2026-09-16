@@ -140,6 +140,11 @@ export const api = {
       onProgress,
       onAgentTrace,
     ),
+  confirmVisionRange: (conversationId, confirmationId, range) =>
+    request(`/api/conversations/${conversationId}/vision-range-confirmations/${confirmationId}`, {
+      method: 'POST',
+      body: JSON.stringify(range),
+    }),
   createUpload: (file, title, identity, contentSHA256) =>
     request('/api/uploads', {
       method: 'POST',

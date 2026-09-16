@@ -67,8 +67,11 @@ func main() {
 		}
 		defer cachedSource.Close()
 		visionRunner, visionErr = visionagent.New(d, cachedSource, ffmpeg, visionagent.Options{
-			BaseURL: c.VisionBaseURL, APIKey: c.VisionAPIKey, Model: c.VisionModel,
-			RequestTimeout: c.VisionRequestTimeout, TotalTimeout: c.VisionTotalTimeout,
+			// 中文注释：主 Agent 复用 CHAT_*，视觉观察器继续使用独立的 VISION_* 配置。
+			OrchestratorBaseURL: c.ChatBaseURL, OrchestratorAPIKey: c.ChatAPIKey, OrchestratorModel: c.ChatModel,
+			OrchestratorRequestTimeout: c.ChatRequestTimeout,
+			VisionBaseURL:              c.VisionBaseURL, VisionAPIKey: c.VisionAPIKey, VisionModel: c.VisionModel,
+			VisionRequestTimeout: c.VisionRequestTimeout, TotalTimeout: c.VisionTotalTimeout,
 		})
 		if visionErr != nil {
 			log.Fatal(visionErr)

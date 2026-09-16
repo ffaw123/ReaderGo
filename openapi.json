@@ -256,9 +256,10 @@
           "id": { "type": "string", "description": "同一步骤的实时更新使用相同 ID" },
           "step": { "type": "integer", "minimum": 1 },
           "status": { "type": "string", "enum": ["running", "completed", "failed"] },
-          "action": { "type": "string", "enum": ["INSPECT_INITIAL_RANGE", "INSPECT_VIDEO_RANGE", "FINAL"] },
+          "action": { "type": "string", "enum": ["INSPECT_INITIAL_RANGE", "AGENT_DECIDING", "INSPECT_VIDEO_RANGE", "VISION_OBSERVING", "REQUEST_RANGE_CONFIRMATION", "VISION_RESULT", "FINAL"] },
           "summary": { "type": "string", "description": "经过服务端裁剪的用户可见状态说明" },
           "reason": { "type": "string", "description": "经过服务端安全处理的简短采样理由" },
+          "observation": { "type": "string", "description": "视觉观察器返回的简短结构化观察" },
           "arguments": {
             "type": "object",
             "properties": {
@@ -271,7 +272,8 @@
           "used_frame_timestamps_ms": { "type": "array", "items": { "type": "integer", "format": "int64" } },
           "remaining_tool_calls": { "type": "integer" },
           "remaining_frame_budget": { "type": "integer" },
-          "evidence_status": { "type": "string", "enum": ["GROUNDED", "NO_EVIDENCE"] }
+          "evidence_status": { "type": "string", "enum": ["GROUNDED", "NO_EVIDENCE"] },
+          "confirmation_id": { "type": "string", "format": "uuid", "description": "仅等待用户确认新区间时返回；用于恢复当前 Agent loop" }
         }
       },
       "MessageMetadata": {
@@ -292,6 +294,8 @@
           "vision_status": { "type": "string", "enum": ["grounded","no_evidence"] },
           "vision_model": { "type": "string" },
           "vision_prompt_version": { "type": "string" },
+          "vision_agent_model": { "type": "string" },
+          "vision_agent_prompt_version": { "type": "string" },
           "vision_tool_calls": { "type": "integer" },
           "vision_frame_timestamps_ms": { "type": "array", "items": { "type": "integer", "format": "int64" } },
           "vision_trace": { "type": "array", "items": { "$ref": "#/components/schemas/AgentTrace" } }
@@ -946,6 +950,28 @@
             "description": "画面理解服务未配置或暂时不可用",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
+        }
+      }
+    },
+    "/api/conversations/{id}/vision-range-confirmations/{confirmation_id}": {
+      "post": {
+        "tags": ["Conversations"],
+        "summary": "确认 Agent 建议的新画面时间区间",
+        "description": "唤醒仍在运行的原 Agent loop；不会创建新消息，也不会重新执行意图分类。确认区间必须与 SSE agent_trace 事件中的建议完全一致。",
+        "operationId": "confirmVisionRange",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "confirmation_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VisionRange" } } }
+        },
+        "responses": {
+          "200": { "description": "已确认，原 SSE 流将继续输出" },
+          "404": { "description": "对话不存在、确认项已失效或不属于当前用户", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "409": { "description": "提交区间与 Agent 建议不一致", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     }

@@ -2,29 +2,49 @@ package visionagent
 
 import (
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 )
 
 func TestValidateRange(t *testing.T) {
 	tests := []struct {
-		name     string
 		value    Range
 		duration int64
-		wantErr  error
+		want     error
 	}{
-		{name: "valid maximum", value: Range{StartMS: 0, EndMS: 30_000}, duration: 30_000},
-		{name: "negative start", value: Range{StartMS: -1, EndMS: 1_000}, duration: 30_000, wantErr: ErrRangeInvalid},
-		{name: "empty", value: Range{StartMS: 1_000, EndMS: 1_000}, duration: 30_000, wantErr: ErrRangeInvalid},
-		{name: "too long", value: Range{StartMS: 0, EndMS: 30_001}, duration: 60_000, wantErr: ErrRangeTooLong},
-		{name: "out of video", value: Range{StartMS: 20_000, EndMS: 30_000}, duration: 29_999, wantErr: ErrRangeOutOfBounds},
+		{Range{StartMS: 0, EndMS: 30_000}, 30_000, nil},
+		{Range{StartMS: 0, EndMS: 1_500}, 30_000, ErrRangeTooShort},
+		{Range{StartMS: 0, EndMS: 1_501}, 30_000, nil},
+		{Range{StartMS: -1, EndMS: 1_000}, 30_000, ErrRangeInvalid},
+		{Range{StartMS: 0, EndMS: 30_001}, 60_000, ErrRangeTooLong},
+		{Range{StartMS: 20_000, EndMS: 30_000}, 29_999, ErrRangeOutOfBounds},
 	}
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			err := ValidateRange(test.value, test.duration)
-			if !errors.Is(err, test.wantErr) {
-				t.Fatalf("ValidateRange() error = %v, want %v", err, test.wantErr)
-			}
-		})
+		if err := ValidateRange(test.value, test.duration); !errors.Is(err, test.want) {
+			t.Fatalf("ValidateRange(%#v) = %v, want %v", test.value, err, test.want)
+		}
+	}
+}
+
+func TestFrameTimestampsAdjustIntervalToAtLeastFourFrames(t *testing.T) {
+	got, err := frameTimestamps(InspectVideoRangeInput{StartMS: 13_000, EndMS: 20_000, IntervalMS: 5_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{13_000, 15_333, 17_666, 19_999}
+	if !slices.Equal(got, want) {
+		t.Fatalf("timestamps = %v, want %v", got, want)
+	}
+}
+
+func TestFrameTimestampsAdjustIntervalToFrameBudget(t *testing.T) {
+	got, err := frameTimestamps(InspectVideoRangeInput{StartMS: 0, EndMS: 30_000, IntervalMS: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != MaxUniqueFrames {
+		t.Fatalf("frame count = %d, want %d", len(got), MaxUniqueFrames)
 	}
 }
 
@@ -44,43 +64,63 @@ func TestFrameTimestampsUseHalfOpenRange(t *testing.T) {
 	}
 }
 
-func TestDecodeDecisionRejectsUnsampledCitation(t *testing.T) {
-	sampled := map[int64]Frame{5_000: {TimestampMS: 5_000}}
-	_, err := decodeDecision(`{"action":"FINAL","evidence_status":"GROUNDED","observation":"人物出现","used_frame_timestamps_ms":[6000]}`, sampled)
-	if !errors.Is(err, ErrInvalidOutput) {
-		t.Fatalf("decodeDecision() error = %v, want ErrInvalidOutput", err)
-	}
-}
-
-func TestDecodeDecisionAcceptsToolCall(t *testing.T) {
-	decision, err := decodeDecision(`{"action":"CALL_TOOL","reason":"需要细看","tool":{"name":"inspect_video_range","arguments":{"start_ms":1000,"end_ms":2000,"interval_ms":500}}}`, nil)
+func TestDecodeObservationAcceptsPlainText(t *testing.T) {
+	observation, err := decodeObservation("  人物举起杯子。  ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Tool == nil || decision.Tool.Arguments.IntervalMS != 500 {
-		t.Fatalf("unexpected decision: %#v", decision)
+	if observation.Observation != "人物举起杯子。" {
+		t.Fatalf("observation = %#v", observation)
 	}
 }
 
-func TestDecodeDecisionAcceptsGroundedAndNoEvidence(t *testing.T) {
-	sampled := map[int64]Frame{5_000: {TimestampMS: 5_000}}
-	grounded, err := decodeDecision(`{"action":"FINAL","evidence_status":"GROUNDED","observation":"人物出现","used_frame_timestamps_ms":[5000]}`, sampled)
-	if err != nil || grounded.Observation != "人物出现" {
-		t.Fatalf("grounded decision = %#v, error = %v", grounded, err)
+func TestDecodeFinalDecisionRejectsForgedObservationID(t *testing.T) {
+	observations := map[string]ToolResult{
+		"obs-1": {OK: true, Observation: "人物出现"},
 	}
-	noEvidence, err := decodeDecision(`{"action":"FINAL","evidence_status":"NO_EVIDENCE","observation":"","used_frame_timestamps_ms":[]}`, sampled)
-	if err != nil || noEvidence.EvidenceStatus != "NO_EVIDENCE" {
-		t.Fatalf("no-evidence decision = %#v, error = %v", noEvidence, err)
+	_, err := decodeFinalDecision(`{"action":"FINAL","evidence_status":"GROUNDED","answer":"回答","used_observation_ids":["obs-2"]}`, observations)
+	if !errors.Is(err, ErrInvalidOutput) {
+		t.Fatalf("error = %v, want ErrInvalidOutput", err)
 	}
 }
 
-func TestDecodeDecisionRejectsExtraAndTrailingContent(t *testing.T) {
-	for _, content := range []string{
-		`{"action":"FINAL","evidence_status":"NO_EVIDENCE","observation":"","used_frame_timestamps_ms":[],"extra":true}`,
-		`{"action":"FINAL","evidence_status":"NO_EVIDENCE","observation":"","used_frame_timestamps_ms":[]} trailing`,
-	} {
-		if _, err := decodeDecision(content, nil); err == nil {
-			t.Fatalf("decodeDecision(%q) accepted invalid output", content)
+func TestDecodeFinalDecisionRejectsGroundedWithoutObservation(t *testing.T) {
+	_, err := decodeFinalDecision(`{"action":"FINAL","evidence_status":"GROUNDED","answer":"回答","used_observation_ids":[]}`, map[string]ToolResult{})
+	if !errors.Is(err, ErrInvalidOutput) {
+		t.Fatalf("error = %v, want ErrInvalidOutput", err)
+	}
+}
+
+func TestDecodeFinalDecisionRejectsEmptyObservation(t *testing.T) {
+	observations := map[string]ToolResult{"obs-1": {OK: true}}
+	_, err := decodeFinalDecision(`{"action":"FINAL","evidence_status":"GROUNDED","answer":"回答","used_observation_ids":["obs-1"]}`, observations)
+	if !errors.Is(err, ErrInvalidOutput) {
+		t.Fatalf("error = %v, want ErrInvalidOutput", err)
+	}
+}
+
+func TestDecodeObservationRejectsStructuredOrInvalidText(t *testing.T) {
+	values := []string{
+		`{"observation":"人物出现"}`,
+		"```text\n人物出现\n```",
+		"",
+		strings.Repeat("观察", MaxObservationRunes),
+	}
+	for _, value := range values {
+		if _, err := decodeObservation(value); err == nil {
+			t.Fatalf("accepted invalid observer output: %s", value)
+		}
+	}
+}
+
+func TestSafeObserverErrorClassifiesValidationFailures(t *testing.T) {
+	tests := []struct {
+		err  error
+		code string
+	}{{ErrInvalidOutput, "VISION_INVALID_OUTPUT"}, {ErrOutputTruncated, "VISION_OUTPUT_TRUNCATED"}}
+	for _, test := range tests {
+		if code, _ := safeObserverError(test.err); code != test.code {
+			t.Fatalf("safeObserverError(%v) = %s, want %s", test.err, code, test.code)
 		}
 	}
 }

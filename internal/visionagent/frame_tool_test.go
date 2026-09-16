@@ -30,20 +30,20 @@ func TestSessionReusesFramesAndEnforcesAuthorizedRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.InitialSample(); err != nil {
+	if _, err := s.ExecuteTool(InspectVideoRangeInput{StartMS: 0, EndMS: 30_000, IntervalMS: 5_000}); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.frames) != 6 || len(extractor.calls) != 6 {
 		t.Fatalf("initial frames/calls = %d/%d, want 6/6", len(s.frames), len(extractor.calls))
 	}
 	// 第二次包含旧时间点时只提取新增帧，预算也只计算唯一帧。
-	if err := s.ExecuteTool(InspectVideoRangeInput{StartMS: 0, EndMS: 2_000, IntervalMS: 500}); err != nil {
+	if _, err := s.ExecuteTool(InspectVideoRangeInput{StartMS: 0, EndMS: 2_000, IntervalMS: 500}); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.frames) != 9 || len(extractor.calls) != 9 {
 		t.Fatalf("deduplicated frames/calls = %d/%d, want 9/9", len(s.frames), len(extractor.calls))
 	}
-	if err := s.ExecuteTool(InspectVideoRangeInput{StartMS: 29_000, EndMS: 31_000, IntervalMS: 500}); !errorsIs(err, ErrRangeOutOfBounds) {
+	if _, err := s.ExecuteTool(InspectVideoRangeInput{StartMS: 29_000, EndMS: 31_000, IntervalMS: 500}); !errorsIs(err, ErrRangeOutOfBounds) {
 		t.Fatalf("out-of-range error = %v", err)
 	}
 }
@@ -55,7 +55,7 @@ func TestInvalidToolCallConsumesBudget(t *testing.T) {
 	}
 	defer s.Close()
 	for attempt := 0; attempt < MaxToolCalls; attempt++ {
-		_ = s.ExecuteTool(InspectVideoRangeInput{StartMS: -1, EndMS: 1, IntervalMS: 500})
+		_, _ = s.ExecuteTool(InspectVideoRangeInput{StartMS: -1, EndMS: 1, IntervalMS: 500})
 	}
 	if s.RemainingToolCalls() != 0 {
 		t.Fatalf("remaining calls = %d, want 0", s.RemainingToolCalls())
@@ -70,8 +70,8 @@ func TestCancelledSessionStopsAndCleansTemporaryFrames(t *testing.T) {
 	}
 	workDir := s.workDir
 	cancel()
-	if err := s.InitialSample(); !errors.Is(err, context.Canceled) {
-		t.Fatalf("InitialSample() error = %v, want context.Canceled", err)
+	if _, err := s.ExecuteTool(InspectVideoRangeInput{StartMS: 0, EndMS: 10_000, IntervalMS: 5_000}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ExecuteTool() error = %v, want context.Canceled", err)
 	}
 	s.Close()
 	if _, err := os.Stat(workDir); !errors.Is(err, os.ErrNotExist) {

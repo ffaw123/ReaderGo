@@ -137,7 +137,8 @@ func (r *repository) CompleteReply(ctx context.Context, user model.Message, repl
 		LatencyMS:       durationMilliseconds(reply.Latency),
 		VisionRequested: reply.VisionRequested, VisionUsed: reply.VisionUsed,
 		VisionStatus: reply.VisionStatus, VisionModel: reply.VisionModel,
-		VisionPromptVersion: reply.VisionPromptVersion, VisionToolCalls: reply.VisionToolCalls,
+		VisionPromptVersion: reply.VisionPromptVersion, VisionAgentModel: reply.VisionAgentModel,
+		VisionAgentPromptVersion: reply.VisionAgentPromptVersion, VisionToolCalls: reply.VisionToolCalls,
 		VisionFrameTimestampsMS: reply.VisionFrameTimestampsMS,
 		VisionTrace:             reply.VisionTrace,
 	}

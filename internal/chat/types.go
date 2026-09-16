@@ -46,6 +46,7 @@ var ErrIdempotencyPayloadMismatch = errors.New("idempotency payload does not mat
 var (
 	ErrVisionRangeRequired    = visionagent.ErrRangeRequired
 	ErrVisionRangeInvalid     = visionagent.ErrRangeInvalid
+	ErrVisionRangeTooShort    = visionagent.ErrRangeTooShort
 	ErrVisionRangeTooLong     = visionagent.ErrRangeTooLong
 	ErrVisionRangeOutOfBounds = visionagent.ErrRangeOutOfBounds
 	ErrVisionNotReady         = visionagent.ErrNotReady
@@ -115,13 +116,14 @@ type RouteInfo struct {
 }
 
 type ReplyInput struct {
-	TenantID        string
-	Conversation    model.Conversation
-	ClientMessageID string
-	Content         string
-	Vision          VisionRequest
-	OnProgress      visionagent.ProgressFunc
-	OnTrace         visionagent.TraceFunc
+	TenantID            string
+	Conversation        model.Conversation
+	ClientMessageID     string
+	Content             string
+	Vision              VisionRequest
+	OnProgress          visionagent.ProgressFunc
+	OnTrace             visionagent.TraceFunc
+	OnRangeConfirmation visionagent.PrepareRangeConfirmationFunc
 }
 
 type VisionRange struct {
@@ -142,46 +144,50 @@ type ReplyResult struct {
 }
 
 type MessageMetadata struct {
-	Mode                    string                   `json:"mode"`
-	Intent                  string                   `json:"intent"`
-	IntentConfidence        float64                  `json:"intent_confidence"`
-	AmbiguityReason         string                   `json:"ambiguity_reason"`
-	Notice                  string                   `json:"notice"`
-	Action                  *RouteAction             `json:"action,omitempty"`
-	SummaryState            string                   `json:"summary_state"`
-	RAGState                string                   `json:"rag_state"`
-	IntentPromptVersion     string                   `json:"intent_prompt_version,omitempty"`
-	AnswerPromptVersion     string                   `json:"answer_prompt_version,omitempty"`
-	LatencyMS               map[string]int           `json:"latency_ms,omitempty"`
-	VisionRequested         bool                     `json:"vision_requested,omitempty"`
-	VisionUsed              bool                     `json:"vision_used,omitempty"`
-	VisionStartMS           int64                    `json:"vision_start_ms,omitempty"`
-	VisionEndMS             int64                    `json:"vision_end_ms,omitempty"`
-	VisionStatus            string                   `json:"vision_status,omitempty"`
-	VisionModel             string                   `json:"vision_model,omitempty"`
-	VisionPromptVersion     string                   `json:"vision_prompt_version,omitempty"`
-	VisionToolCalls         int                      `json:"vision_tool_calls,omitempty"`
-	VisionFrameTimestampsMS []int64                  `json:"vision_frame_timestamps_ms,omitempty"`
-	VisionTrace             []visionagent.AgentTrace `json:"vision_trace,omitempty"`
+	Mode                     string                   `json:"mode"`
+	Intent                   string                   `json:"intent"`
+	IntentConfidence         float64                  `json:"intent_confidence"`
+	AmbiguityReason          string                   `json:"ambiguity_reason"`
+	Notice                   string                   `json:"notice"`
+	Action                   *RouteAction             `json:"action,omitempty"`
+	SummaryState             string                   `json:"summary_state"`
+	RAGState                 string                   `json:"rag_state"`
+	IntentPromptVersion      string                   `json:"intent_prompt_version,omitempty"`
+	AnswerPromptVersion      string                   `json:"answer_prompt_version,omitempty"`
+	LatencyMS                map[string]int           `json:"latency_ms,omitempty"`
+	VisionRequested          bool                     `json:"vision_requested,omitempty"`
+	VisionUsed               bool                     `json:"vision_used,omitempty"`
+	VisionStartMS            int64                    `json:"vision_start_ms,omitempty"`
+	VisionEndMS              int64                    `json:"vision_end_ms,omitempty"`
+	VisionStatus             string                   `json:"vision_status,omitempty"`
+	VisionModel              string                   `json:"vision_model,omitempty"`
+	VisionPromptVersion      string                   `json:"vision_prompt_version,omitempty"`
+	VisionAgentModel         string                   `json:"vision_agent_model,omitempty"`
+	VisionAgentPromptVersion string                   `json:"vision_agent_prompt_version,omitempty"`
+	VisionToolCalls          int                      `json:"vision_tool_calls,omitempty"`
+	VisionFrameTimestampsMS  []int64                  `json:"vision_frame_timestamps_ms,omitempty"`
+	VisionTrace              []visionagent.AgentTrace `json:"vision_trace,omitempty"`
 }
 
 type generatedReply struct {
-	Content                 string
-	Citations               []Citation
-	Route                   RouteInfo
-	Decision                IntentDecision
-	Capabilities            CapabilityView
-	IntentPromptVersion     string
-	AnswerPromptVersion     string
-	Latency                 map[string]time.Duration
-	VisionRequested         bool
-	VisionUsed              bool
-	VisionRange             *VisionRange
-	VisionStatus            string
-	VisionModel             string
-	VisionPromptVersion     string
-	VisionToolCalls         int
-	VisionFrameTimestampsMS []int64
-	VisionObservation       *model.VisionObservation
-	VisionTrace             []visionagent.AgentTrace
+	Content                  string
+	Citations                []Citation
+	Route                    RouteInfo
+	Decision                 IntentDecision
+	Capabilities             CapabilityView
+	IntentPromptVersion      string
+	AnswerPromptVersion      string
+	Latency                  map[string]time.Duration
+	VisionRequested          bool
+	VisionUsed               bool
+	VisionRange              *VisionRange
+	VisionStatus             string
+	VisionModel              string
+	VisionPromptVersion      string
+	VisionAgentModel         string
+	VisionAgentPromptVersion string
+	VisionToolCalls          int
+	VisionFrameTimestampsMS  []int64
+	VisionObservation        *model.VisionObservation
+	VisionTrace              []visionagent.AgentTrace
 }

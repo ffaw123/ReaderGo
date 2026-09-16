@@ -42,6 +42,7 @@ type Server struct {
 	uploadLimiter       uploadLimiter
 	uploadLimitCapacity int
 	partSize            int64
+	rangeConfirmations  *rangeConfirmationBroker
 }
 
 type uploadLimiter interface {
@@ -570,6 +571,7 @@ func New(db *gorm.DB, authService *auth.Service, chatService *chatservice.Servic
 	return &Server{
 		db: db, auth: authService, chat: chatService, outbox: outboxWriter, uploads: uploads,
 		deduper: deduper, uploadLimiter: limiter, uploadLimitCapacity: uploadLimitCapacity, partSize: partSize,
+		rangeConfirmations: newRangeConfirmationBroker(),
 	}
 }
 
@@ -599,6 +601,7 @@ func (s *Server) Router() *gin.Engine {
 	p.GET("/capabilities", s.capabilities)
 	p.POST("/videos/:id/conversations", s.createConversation)
 	p.POST("/conversations/:id/messages", s.createMessage) // 这里的id是会话id
+	p.POST("/conversations/:id/vision-range-confirmations/:confirmation_id", s.confirmVisionRange)
 	p.GET("/conversations/:id/messages", s.messages)
 	return r
 }
@@ -1095,6 +1098,20 @@ func (s *Server) createMessage(c *gin.Context) {
 		OnTrace: func(trace visionagent.AgentTrace) error {
 			return writeEvent("agent_trace", trace)
 		},
+		OnRangeConfirmation: func(request visionagent.RangeConfirmationRequest) (visionagent.RangeConfirmationHandle, error) {
+			if s.rangeConfirmations == nil {
+				return visionagent.RangeConfirmationHandle{}, visionagent.ErrRangeConfirmationUnavailable
+			}
+			// 先把确认项登记到 broker，Agent 随后才会通过 SSE 暴露 confirmation_id。
+			pending := s.rangeConfirmations.register(auth.UserID(c), x.ID, request.SuggestedRange)
+			return visionagent.RangeConfirmationHandle{
+				ID: pending.id,
+				Wait: func(waitCtx context.Context) (visionagent.Range, error) {
+					return s.rangeConfirmations.wait(waitCtx, pending)
+				},
+				Cancel: func() { s.rangeConfirmations.cancel(pending.id) },
+			}, nil
+		},
 	}, func(delta string) error {
 		return writeEvent("delta", gin.H{"content": delta})
 	})
@@ -1133,12 +1150,50 @@ func (s *Server) createMessage(c *gin.Context) {
 	}
 }
 
+// confirmVisionRange 只唤醒现有 Agent 请求，不创建新消息，也不重新执行意图分类。
+func (s *Server) confirmVisionRange(c *gin.Context) {
+	x, ok := s.ownedConversation(c)
+	if !ok {
+		return
+	}
+	confirmationID := c.Param("confirmation_id")
+	if _, err := uuid.Parse(confirmationID); err != nil {
+		bad(c, "confirmation_id must be a UUID")
+		return
+	}
+	var in struct {
+		StartMS *int64 `json:"start_ms"`
+		EndMS   *int64 `json:"end_ms"`
+	}
+	if c.ShouldBindJSON(&in) != nil || in.StartMS == nil || in.EndMS == nil {
+		bad(c, "start_ms and end_ms are required")
+		return
+	}
+	if s.rangeConfirmations == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "画面区间确认已失效", "code": "VISION_RANGE_CONFIRMATION_NOT_FOUND"})
+		return
+	}
+	err := s.rangeConfirmations.confirm(confirmationID, auth.UserID(c), x.ID, visionagent.Range{StartMS: *in.StartMS, EndMS: *in.EndMS})
+	switch {
+	case errors.Is(err, errRangeConfirmationNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "画面区间确认已失效", "code": "VISION_RANGE_CONFIRMATION_NOT_FOUND"})
+	case errors.Is(err, errRangeConfirmationMismatch):
+		c.JSON(http.StatusConflict, gin.H{"error": "确认区间与 Agent 建议不一致", "code": "VISION_RANGE_CONFIRMATION_MISMATCH"})
+	case err != nil:
+		fail(c, err)
+	default:
+		c.JSON(http.StatusOK, gin.H{"status": "confirmed"})
+	}
+}
+
 func writeVisionRequestError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, chatservice.ErrVisionRangeRequired):
 		c.JSON(http.StatusBadRequest, gin.H{"error": "开启画面理解后必须填写视频时间区间", "code": "VISION_RANGE_REQUIRED"})
 	case errors.Is(err, chatservice.ErrVisionRangeInvalid):
 		c.JSON(http.StatusBadRequest, gin.H{"error": "画面理解时间区间无效", "code": "VISION_RANGE_INVALID"})
+	case errors.Is(err, chatservice.ErrVisionRangeTooShort):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "画面理解时间区间至少需要1501毫秒", "code": "VISION_RANGE_TOO_SHORT"})
 	case errors.Is(err, chatservice.ErrVisionRangeTooLong):
 		c.JSON(http.StatusBadRequest, gin.H{"error": "画面理解时间区间不能超过30秒", "code": "VISION_RANGE_TOO_LONG"})
 	case errors.Is(err, chatservice.ErrVisionRangeOutOfBounds):

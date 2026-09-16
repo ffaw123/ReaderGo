@@ -232,6 +232,8 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 			}
 			continue
 		}
+		// 中文注释：采样器可能按区间长度收紧模型给出的间隔；后续 fps、工具结果和审计记录必须使用实际采样间隔。
+		arguments.IntervalMS = frames[1].TimestampMS - frames[0].TimestampMS
 
 		trace.Status, trace.Summary = "completed", fmt.Sprintf("已提取 %d 帧画面", len(frames))
 		trace.NewFrameTimestampsMS = timestampsOf(frames)
@@ -406,7 +408,7 @@ func (a *Agent) finish(request Request, session *session, windows []RetrievalWin
 		Answer: decision.Answer, Status: status, Observation: strings.Join(observationTexts, "\n"),
 		SampledFrameTimestampsMS: timestampsOf(session.Frames()), UsedFrameTimestampsMS: usedFrames,
 		UsedObservationIDs: append([]string(nil), decision.UsedObservationIDs...), ToolCalls: session.toolCalls,
-		OrchestratorModel: a.orchestrator.Model(), VisionModel: a.observer.Model(),
+		OrchestratorModel: a.orchestrator.Model(), ObserverModel: a.observer.Model(),
 		OrchestratorPromptVersion: OrchestratorPromptVersion, ObserverPromptVersion: ObserverPromptVersion,
 		SegmentIDsByTimestamp: segmentIDsForTimestamps(windows, usedFrames),
 		Latency:               latency, Trace: traces, Range: session.allowed,
@@ -427,7 +429,7 @@ func (a *Agent) finishNoEvidence(request Request, session *session, windows []Re
 	return Result{
 		Answer: "在允许的检查次数和帧预算内，没有观察到足以确认该问题的画面证据。",
 		Status: StatusNoEvidence, SampledFrameTimestampsMS: timestampsOf(session.Frames()),
-		ToolCalls: session.toolCalls, OrchestratorModel: a.orchestrator.Model(), VisionModel: a.observer.Model(),
+		ToolCalls: session.toolCalls, OrchestratorModel: a.orchestrator.Model(), ObserverModel: a.observer.Model(),
 		OrchestratorPromptVersion: OrchestratorPromptVersion, ObserverPromptVersion: ObserverPromptVersion,
 		SegmentIDsByTimestamp: segmentIDsForTimestamps(windows, nil), Latency: latency, Trace: traces, Range: session.allowed,
 	}, nil
@@ -478,6 +480,8 @@ func safeToolError(err error) (string, string, bool) {
 		return "TOOL_BUDGET_EXHAUSTED", "画面检查次数已用尽", true
 	case errors.Is(err, ErrFrameBudget):
 		return "FRAME_BUDGET_EXCEEDED", "该次检查会超过画面帧预算", true
+	case errors.Is(err, ErrRangeTooShort):
+		return "RANGE_TOO_SHORT", "检查区间过短，无法提取至少 4 帧画面", true
 	case errors.Is(err, ErrRangeInvalid):
 		return "INVALID_RANGE", "主 Agent 给出的检查区间或间隔无效", true
 	case errors.Is(err, ErrRangeOutOfBounds):

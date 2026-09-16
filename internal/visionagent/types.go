@@ -19,18 +19,20 @@ const (
 	TraceVisionResult  = "VISION_RESULT"
 	TraceFinal         = "FINAL"
 
-	InitialIntervalMS   int64 = 5_000
-	MinIntervalMS       int64 = 500
-	MaxRangeMS          int64 = 30_000
-	MaxToolCalls              = 3
-	MaxUniqueFrames           = 18
-	MaxMemoryTurns            = 4
-	MaxMemoryRunes            = 6_000
-	MaxObservationRunes       = 4_000
-	MaxToolReasonRunes        = 200
-	MaxFinalAnswerRunes       = 4_000
+	InitialIntervalMS    int64 = 5_000
+	MinIntervalMS        int64 = 500
+	MaxIntervalMS        int64 = 10_000
+	MaxRangeMS           int64 = 30_000
+	MaxToolCalls               = 3
+	MaxUniqueFrames            = 18
+	MinObservationFrames       = 4
+	MaxMemoryTurns             = 4
+	MaxMemoryRunes             = 6_000
+	MaxObservationRunes        = 4_000
+	MaxToolReasonRunes         = 200
+	MaxFinalAnswerRunes        = 4_000
 
-	OrchestratorPromptVersion = "vision-orchestrator-v2"
+	OrchestratorPromptVersion = "vision-orchestrator-v3"
 	ObserverPromptVersion     = "vision-observer-v3"
 )
 
@@ -108,7 +110,7 @@ type Result struct {
 	UsedObservationIDs        []string
 	ToolCalls                 int
 	OrchestratorModel         string
-	VisionModel               string
+	ObserverModel             string
 	OrchestratorPromptVersion string
 	ObserverPromptVersion     string
 	SegmentIDsByTimestamp     map[int64]string

@@ -392,6 +392,7 @@ func (s *Service) generateAgentReply(ctx context.Context, in ReplyInput, onDelta
 			Question: in.Content, RewrittenQuery: decision.RewrittenQuery,
 			Range:   visionagent.Range{StartMS: visionRange.StartMS, EndMS: visionRange.EndMS},
 			History: visionHistory, OnProgress: in.OnProgress, OnTrace: in.OnTrace,
+			OnRangeConfirmation: in.OnRangeConfirmation,
 		})
 		if err != nil {
 			return generatedReply{}, err
@@ -408,24 +409,37 @@ func (s *Service) generateAgentReply(ctx context.Context, in ReplyInput, onDelta
 			latency = make(map[string]time.Duration)
 		}
 		latency["intent"] = intentLatency
-		observation := &model.VisionObservation{
-			TenantID: in.TenantID, VideoID: in.Conversation.VideoID, ConversationID: in.Conversation.ID,
-			StartMS: visionRange.StartMS, EndMS: visionRange.EndMS, Status: visionResult.Status,
-			ObservationText:        visionResult.Observation,
-			SampledFrameTimestamps: model.NewJSONDocument(visionResult.SampledFrameTimestampsMS),
-			UsedFrameTimestamps:    model.NewJSONDocument(visionResult.UsedFrameTimestampsMS),
-			ToolCalls:              visionResult.ToolCalls, Model: visionResult.Model, PromptVersion: visionResult.PromptVersion,
+		effectiveRange := visionRange
+		if visionResult.Range.EndMS > visionResult.Range.StartMS {
+			effectiveRange = &VisionRange{StartMS: visionResult.Range.StartMS, EndMS: visionResult.Range.EndMS}
+		}
+		var observation *model.VisionObservation
+		if visionResult.Status == visionagent.StatusGrounded || visionResult.Status == visionagent.StatusNoEvidence {
+			observation = &model.VisionObservation{
+				TenantID: in.TenantID, VideoID: in.Conversation.VideoID, ConversationID: in.Conversation.ID,
+				StartMS: effectiveRange.StartMS, EndMS: effectiveRange.EndMS, Status: visionResult.Status,
+				ObservationText:        visionResult.Observation,
+				SampledFrameTimestamps: model.NewJSONDocument(visionResult.SampledFrameTimestampsMS),
+				UsedFrameTimestamps:    model.NewJSONDocument(visionResult.UsedFrameTimestampsMS),
+				ToolCalls:              visionResult.ToolCalls, ObserverModel: visionResult.ObserverModel, ObserverPromptVersion: visionResult.ObserverPromptVersion,
+				OrchestratorModel:         visionResult.OrchestratorModel,
+				OrchestratorPromptVersion: visionResult.OrchestratorPromptVersion,
+				UsedObservationIDs:        model.NewJSONDocument(visionResult.UsedObservationIDs),
+			}
 		}
 		reply := decorate(generatedReply{
 			Content: visionResult.Answer, Citations: citations,
 			Route:    RouteInfo{Mode: ModeVisionAgent, Intent: decision.Intent, Notice: "此回答结合了所选时间区间的实际画面与视频检索文本。"},
 			Decision: decision, Capabilities: capabilities.View(), IntentPromptVersion: agentIntentPromptVersion,
-			AnswerPromptVersion: visionResult.AnswerPromptVersion, Latency: latency,
-			VisionUsed: true, VisionStatus: visionResult.Status, VisionModel: visionResult.Model,
-			VisionPromptVersion: visionResult.PromptVersion, VisionToolCalls: visionResult.ToolCalls,
+			AnswerPromptVersion: visionResult.OrchestratorPromptVersion, Latency: latency,
+			VisionUsed: true, VisionStatus: visionResult.Status, VisionModel: visionResult.ObserverModel,
+			VisionPromptVersion: visionResult.ObserverPromptVersion,
+			VisionAgentModel:    visionResult.OrchestratorModel, VisionAgentPromptVersion: visionResult.OrchestratorPromptVersion,
+			VisionToolCalls:         visionResult.ToolCalls,
 			VisionFrameTimestampsMS: visionResult.SampledFrameTimestampsMS, VisionObservation: observation,
 			VisionTrace: visionResult.Trace,
 		})
+		reply.VisionRange = effectiveRange
 		return reply, emitReplyContent(reply, onDelta)
 	default:
 		reply := decorate(ambiguousReply(IntentDecision{Intent: IntentAmbiguous, AmbiguityReason: AmbiguityClassifierError}))

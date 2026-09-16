@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,7 +24,7 @@ func TestOrchestratorUsesNativeToolCallAndDisablesThinking(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"mimo-v2.5-pro","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"需要细看","tool_calls":[{"id":"call-1","type":"function","function":{"name":"inspect_video_range","arguments":"{\"start_ms\":1000,\"end_ms\":2000,\"interval_ms\":500}"}}]}}]}`))
+		_, _ = writer.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"mimo-v2.5-pro","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"需要细看","tool_calls":[{"id":"call-1","type":"function","function":{"name":"inspect_video_range","arguments":"{\"start_ms\":1000,\"end_ms\":3001,\"interval_ms\":500}"}}]}}]}`))
 	}))
 	defer server.Close()
 
@@ -140,7 +141,7 @@ func TestObserverSendsVideoFrameListWithPromptAndQuestion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frames := observerFrameFiles(t, "jpeg-frame-a", "jpeg-frame-b", "jpeg-frame-c")
+	frames := observerFrameFiles(t, "jpeg-frame-a", "jpeg-frame-b", "jpeg-frame-c", "jpeg-frame-d")
 	observation, err := client.Observe(context.Background(), ObserverInput{Question: "画面里发生了什么？", IntervalMS: 1_000}, frames)
 	if err != nil {
 		t.Fatal(err)
@@ -210,6 +211,7 @@ func TestObserverVideoBlockFPSMatchesSamplingInterval(t *testing.T) {
 	}{
 		{name: "1000ms", intervalMS: 1_000, wantFPS: 1},
 		{name: "500ms", intervalMS: 500, wantFPS: 2},
+		{name: "5000ms", intervalMS: 5_000, wantFPS: 0.2},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -227,7 +229,7 @@ func TestObserverVideoBlockFPSMatchesSamplingInterval(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			frames := observerFrameFiles(t, "jpeg-frame-1", "jpeg-frame-2")
+			frames := observerFrameFiles(t, "jpeg-frame-1", "jpeg-frame-2", "jpeg-frame-3", "jpeg-frame-4")
 			if _, err := client.Observe(context.Background(), ObserverInput{Question: "人物在做什么？", IntervalMS: testCase.intervalMS}, frames); err != nil {
 				t.Fatal(err)
 			}
@@ -241,5 +243,15 @@ func TestObserverVideoBlockFPSMatchesSamplingInterval(t *testing.T) {
 				t.Fatalf("fps = %#v, want %v for %dms interval", videoBlock["fps"], testCase.wantFPS, testCase.intervalMS)
 			}
 		})
+	}
+}
+
+func TestObserverRejectsInvalidFrameCountAndInterval(t *testing.T) {
+	client := &qwenObserverClient{}
+	if _, err := client.Observe(context.Background(), ObserverInput{IntervalMS: 1_000}, observerFrameFiles(t, "a", "b", "c")); !errors.Is(err, ErrInvalidOutput) {
+		t.Fatalf("three-frame request error = %v, want ErrInvalidOutput", err)
+	}
+	if _, err := client.Observe(context.Background(), ObserverInput{IntervalMS: MaxIntervalMS + 1}, observerFrameFiles(t, "a", "b", "c", "d")); !errors.Is(err, ErrInvalidOutput) {
+		t.Fatalf("out-of-range interval error = %v, want ErrInvalidOutput", err)
 	}
 }

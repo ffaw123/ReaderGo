@@ -12,9 +12,13 @@ CREATE TABLE vision_observations (
   sampled_frame_timestamps jsonb NOT NULL DEFAULT '[]'::jsonb,
   used_frame_timestamps jsonb NOT NULL DEFAULT '[]'::jsonb,
   tool_calls integer NOT NULL DEFAULT 0,
-  model text NOT NULL,
-  prompt_version text NOT NULL,
+  observer_model text NOT NULL,
+  observer_prompt_version text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
+  -- 双模型画面理解审计字段：新增字段记录主模型与最终采用的观察 ID。
+  orchestrator_model text NOT NULL DEFAULT '',
+  orchestrator_prompt_version text NOT NULL DEFAULT '',
+  used_observation_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
   CHECK (start_ms >= 0 AND end_ms > start_ms),
   CHECK (end_ms - start_ms <= 30000),
   CHECK (

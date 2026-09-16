@@ -212,19 +212,22 @@ type Message struct {
 
 // VisionObservation 保存一次画面 Agent 的最终结构化观察；图片本身只存在于请求临时目录。
 type VisionObservation struct {
-	ID                     string       `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	TenantID               string       `gorm:"type:uuid;not null;index" json:"-"`
-	VideoID                string       `gorm:"type:uuid;not null;index" json:"video_id"`
-	ConversationID         string       `gorm:"type:uuid;not null;index" json:"conversation_id"`
-	UserMessageID          string       `gorm:"type:uuid;not null;uniqueIndex" json:"user_message_id"`
-	StartMS                int64        `gorm:"not null" json:"start_ms"`
-	EndMS                  int64        `gorm:"not null" json:"end_ms"`
-	Status                 string       `gorm:"not null" json:"status"`
-	ObservationText        string       `gorm:"not null" json:"observation_text"`
-	SampledFrameTimestamps JSONDocument `gorm:"type:jsonb;not null" json:"sampled_frame_timestamps"`
-	UsedFrameTimestamps    JSONDocument `gorm:"type:jsonb;not null" json:"used_frame_timestamps"`
-	ToolCalls              int          `gorm:"not null" json:"tool_calls"`
-	Model                  string       `gorm:"not null" json:"model"`
-	PromptVersion          string       `gorm:"not null" json:"prompt_version"`
-	CreatedAt              time.Time    `json:"created_at"`
+	ID                        string       `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID                  string       `gorm:"type:uuid;not null;index" json:"-"`
+	VideoID                   string       `gorm:"type:uuid;not null;index" json:"video_id"`
+	ConversationID            string       `gorm:"type:uuid;not null;index" json:"conversation_id"`
+	UserMessageID             string       `gorm:"type:uuid;not null;uniqueIndex" json:"user_message_id"`
+	StartMS                   int64        `gorm:"not null" json:"start_ms"`
+	EndMS                     int64        `gorm:"not null" json:"end_ms"`
+	Status                    string       `gorm:"not null" json:"status"`
+	ObservationText           string       `gorm:"not null" json:"observation_text"`
+	SampledFrameTimestamps    JSONDocument `gorm:"type:jsonb;not null" json:"sampled_frame_timestamps"`
+	UsedFrameTimestamps       JSONDocument `gorm:"type:jsonb;not null" json:"used_frame_timestamps"`
+	ToolCalls                 int          `gorm:"not null" json:"tool_calls"`
+	ObserverModel             string       `gorm:"not null" json:"observer_model"`
+	ObserverPromptVersion     string       `gorm:"not null" json:"observer_prompt_version"`
+	OrchestratorModel         string       `gorm:"not null" json:"orchestrator_model"`
+	OrchestratorPromptVersion string       `gorm:"not null" json:"orchestrator_prompt_version"`
+	UsedObservationIDs        JSONDocument `gorm:"type:jsonb;not null" json:"used_observation_ids"`
+	CreatedAt                 time.Time    `json:"created_at"`
 }

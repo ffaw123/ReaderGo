@@ -39,6 +39,8 @@ import { demoMessages, demoVideos } from '../lib/demo'
 const router = useRouter()
 // 这里只限制页面进入时的按需请求频率，不会每十秒自动轮询视频列表。
 const videoListRefreshIntervalMs = 10 * 1000
+const minimumVisionRangeMS = 1_500
+const maximumVisionRangeMS = 30_000
 const session = ref(null)
 const previewMode = ref(sessionStorage.getItem('readergo_preview') === 'true')
 const videos = ref([])
@@ -57,11 +59,19 @@ const sidebarOpen = ref(false)
 const search = ref('')
 const draft = ref('')
 const visionEnabled = ref(false)
-const visionStart = ref('')
-const visionEnd = ref('')
+const visionStart = ref('00:00')
+const visionEnd = ref('00:00')
+const visionStartMinutes = ref('00')
+const visionStartSeconds = ref('00')
+const visionEndMinutes = ref('00')
+const visionEndSeconds = ref('00')
+const visionStartMS = ref(0)
+const visionEndMS = ref(0)
 const visionAvailable = ref(false)
 const visionProgress = ref('')
 const visionTrace = ref([])
+const rangeConfirmationBusy = ref('')
+const activeMessageConversationId = ref('')
 const toast = ref(null)
 const chatScroll = ref(null)
 const fileInput = ref(null)
@@ -84,6 +94,7 @@ let uploadAbortController
 let hashAbortController
 
 const selectedVideo = computed(() => videos.value.find((video) => video.id === selectedId.value) || null)
+const visionDurationMS = computed(() => Math.max(0, Math.floor((Number(selectedVideo.value?.duration_ms) || 0) / 1000) * 1000))
 const hasStreamingAssistant = computed(() => messages.value.some((message) => message.streaming))
 const filteredVideos = computed(() => {
   const keyword = search.value.toLowerCase()
@@ -299,15 +310,83 @@ function messageSourceLabel(message) {
 }
 
 function parseVideoTime(value) {
-  const matched = String(value || '').trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?$/)
-  if (!matched) throw new Error('时间格式应为 MM:SS、HH:MM:SS 或带毫秒的形式')
-  const hasHours = matched[1] !== undefined
-  const hours = hasHours ? Number(matched[1]) : 0
-  const minutes = Number(matched[2])
-  const seconds = Number(matched[3])
-  if (seconds >= 60 || (hasHours && minutes >= 60)) throw new Error('分钟或秒数超出有效范围')
-  const milliseconds = Number((matched[4] || '').padEnd(3, '0') || 0)
-  return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
+	const normalized = String(value || '').trim().replaceAll('：', ':')
+	if (!normalized) throw new Error('请输入时间')
+	const parts = normalized.split(':')
+	if (parts.length > 3 || parts.some((part, index) => index < parts.length - 1 && part && !/^\d+$/.test(part))) {
+		throw new Error('时间格式应为 MM:SS，例如 01:02')
+	}
+	const secondMatch = (parts.at(-1) || '0').match(/^\d{1,2}$/)
+	if (!secondMatch) throw new Error('时间格式应为 MM:SS，例如 01:02')
+	const seconds = Number(secondMatch[0])
+	if (seconds >= 60) throw new Error('秒数不能超过 59')
+	let totalMinutes = 0
+	if (parts.length === 2) totalMinutes = Number(parts[0] || 0)
+	if (parts.length === 3) {
+		const hours = Number(parts[0] || 0)
+		const minutes = Number(parts[1] || 0)
+		if (minutes >= 60) throw new Error('小时格式中的分钟数不能超过 59')
+		totalMinutes = hours * 60 + minutes
+	}
+	return (totalMinutes * 60 + seconds) * 1000
+}
+
+function formatVisionInputTime(milliseconds) {
+	const value = Math.max(0, Math.round(Number(milliseconds) || 0))
+	const totalMinutes = Math.floor(value / 60_000)
+	const seconds = Math.floor((value % 60_000) / 1000)
+	return `${String(totalMinutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function syncVisionTimeInputs() {
+	visionStart.value = formatVisionInputTime(visionStartMS.value)
+	visionEnd.value = formatVisionInputTime(visionEndMS.value)
+	;[visionStartMinutes.value, visionStartSeconds.value] = visionStart.value.split(':')
+	;[visionEndMinutes.value, visionEndSeconds.value] = visionEnd.value.split(':')
+}
+
+function updateVisionTimePart(boundary, part, event) {
+	const maxLength = part === 'minutes' ? 4 : 2
+	const value = String(event.target.value || '').replace(/\D/g, '').slice(0, maxLength)
+	event.target.value = value
+	if (boundary === 'start' && part === 'minutes') visionStartMinutes.value = value
+	if (boundary === 'start' && part === 'seconds') visionStartSeconds.value = value
+	if (boundary === 'end' && part === 'minutes') visionEndMinutes.value = value
+	if (boundary === 'end' && part === 'seconds') visionEndSeconds.value = value
+}
+
+function handleVisionTimeFocusOut(boundary, event) {
+	// 中文注释：分钟和秒之间切换焦点时不提交，只有离开整个组合输入框才统一格式化。
+	if (event.currentTarget.contains(event.relatedTarget)) return
+	commitVisionTime(boundary)
+}
+
+function commitVisionTime(boundary) {
+	try {
+		const rawValue = boundary === 'start'
+			? `${visionStartMinutes.value}:${visionStartSeconds.value}`
+			: `${visionEndMinutes.value}:${visionEndSeconds.value}`
+		const parsed = parseVideoTime(rawValue)
+		if (parsed > visionDurationMS.value) throw new Error('时间不能超过视频时长')
+		let nextStart = boundary === 'start' ? parsed : visionStartMS.value
+		let nextEnd = boundary === 'end' ? parsed : visionEndMS.value
+		// 中文注释：只编辑一个端点导致交叉或形成无效短区间时，自动收拢为合法的单帧选择。
+		if (boundary === 'start' && nextStart > nextEnd) nextEnd = nextStart
+		if (boundary === 'end' && nextEnd < nextStart) nextStart = nextEnd
+		let rangeDuration = nextEnd - nextStart
+		if (rangeDuration > 0 && rangeDuration <= minimumVisionRangeMS) {
+			if (boundary === 'start') nextEnd = nextStart
+			else nextStart = nextEnd
+			rangeDuration = 0
+		}
+		if (rangeDuration > maximumVisionRangeMS) throw new Error('画面理解时间区间不能超过 30 秒')
+		visionStartMS.value = nextStart
+		visionEndMS.value = nextEnd
+	} catch (error) {
+		notify(error.message, 'error')
+	} finally {
+		syncVisionTimeInputs()
+	}
 }
 
 function currentVisionRequest() {
@@ -315,8 +394,11 @@ function currentVisionRequest() {
   if (!canUseVision.value) throw new Error('当前视频暂时不能使用画面理解')
   const startMS = parseVideoTime(visionStart.value)
   const endMS = parseVideoTime(visionEnd.value)
-  if (endMS <= startMS) throw new Error('结束时间必须晚于开始时间')
-  if (endMS - startMS > 30_000) throw new Error('画面理解时间区间不能超过30秒')
+	if (endMS < startMS) throw new Error('结束时间不能早于开始时间')
+	if (endMS - startMS > 0 && endMS - startMS <= minimumVisionRangeMS) {
+		throw new Error('请选择同一时间的单帧，或大于 1.5 秒的画面区间')
+	}
+	if (endMS - startMS > maximumVisionRangeMS) throw new Error('画面理解时间区间不能超过30秒')
   if (endMS > Number(selectedVideo.value.duration_ms || 0)) throw new Error('时间区间不能超过视频时长')
   return { enabled: true, range: { start_ms: startMS, end_ms: endMS } }
 }
@@ -354,9 +436,12 @@ function traceArgumentsLabel(argumentsValue) {
 
 function traceActionLabel(action) {
   return {
-    INSPECT_INITIAL_RANGE: '初始查看',
-    INSPECT_VIDEO_RANGE: '细化查看',
-    FINAL: '完成检查',
+    AGENT_DECIDING: '主 Agent 决策',
+    INSPECT_VIDEO_RANGE: '检查画面区间',
+    VISION_OBSERVING: '视觉模型观察',
+    VISION_RESULT: '画面观察结果',
+    REQUEST_RANGE_CONFIRMATION: '等待新区间确认',
+    FINAL: '完成回答',
   }[action] || '画面检查'
 }
 
@@ -373,6 +458,40 @@ async function loadCapabilities() {
 
 function handleMessageAction(action) {
   if (action?.type === 'OPEN_SUMMARY' && summary.value) summaryOpen.value = true
+}
+
+async function confirmVisionRange(trace) {
+  if (!trace?.confirmation_id || rangeConfirmationBusy.value) return
+  const startMS = Number(trace.arguments?.start_ms)
+  const endMS = Number(trace.arguments?.end_ms)
+  if (!Number.isFinite(startMS) || !Number.isFinite(endMS) || startMS < 0 || endMS <= startMS || endMS - startMS > 30_000) {
+    notify('Agent 建议的画面时间区间无效', 'error')
+    return
+  }
+  if (endMS > Number(selectedVideo.value?.duration_ms || 0)) {
+    notify('Agent 建议的画面时间区间超过视频时长', 'error')
+    return
+  }
+  const conversationId = activeMessageConversationId.value || getConversationId(selectedVideo.value)
+  if (!conversationId) {
+    notify('当前对话不存在，无法继续画面检查', 'error')
+    return
+  }
+
+  // 用户确认时立即同步输入框；后端则唤醒同一个 Agent loop，不会新建消息或重新分类。
+	visionEnabled.value = true
+	visionStartMS.value = startMS
+	visionEndMS.value = endMS
+	syncVisionTimeInputs()
+  rangeConfirmationBusy.value = trace.confirmation_id
+  try {
+    await api.confirmVisionRange(conversationId, trace.confirmation_id, { start_ms: startMS, end_ms: endMS })
+    visionProgress.value = '已确认新的时间区间，正在继续检查画面'
+  } catch (error) {
+    notify(error.message, 'error')
+  } finally {
+    rangeConfirmationBusy.value = ''
+  }
 }
 
 async function loadVideos() {
@@ -569,6 +688,7 @@ async function sendMessage() {
       })
     } else {
       const conversationId = await ensureConversation(selectedVideo.value)
+      activeMessageConversationId.value = conversationId
       // client_message_id 让网络重试返回同一组消息，不会重复调用模型。
       const response = await api.sendMessage(conversationId, content, clientMessageId, vision, (delta) => {
         if (!delta) return
@@ -612,6 +732,7 @@ async function sendMessage() {
     notify(error.message, 'error')
   } finally {
     sending.value = false
+    activeMessageConversationId.value = ''
     visionProgress.value = ''
     visionTrace.value = []
     await nextTick()
@@ -985,14 +1106,25 @@ function statusLabel(status) {
 }
 
 watch(
-  selectedId,
+	visionDurationMS,
+	(duration) => {
+		visionStartMS.value = Math.min(visionStartMS.value, duration)
+		visionEndMS.value = Math.min(Math.max(visionEndMS.value, visionStartMS.value), duration)
+		syncVisionTimeInputs()
+	},
+	{ immediate: true },
+)
+
+watch(
+	selectedId,
   async () => {
     pauseSettled.value = true
     summaryOpen.value = false
     processingJobs.value = []
-    visionEnabled.value = false
-    visionStart.value = ''
-    visionEnd.value = ''
+		visionEnabled.value = false
+		visionStartMS.value = 0
+		visionEndMS.value = 0
+		syncVisionTimeInputs()
     // 切换视频时立即清空旧摘要，避免新请求完成前短暂展示上一个视频的内容。
     summary.value = ''
     await loadSelectedContent()
@@ -1255,7 +1387,7 @@ onBeforeUnmount(() => {
                     <Info :size="12" />
                     <span>{{ message.metadata.notice }}</span>
                     <button
-                      v-if="message.metadata.action"
+                      v-if="message.metadata.action?.type === 'OPEN_SUMMARY'"
                       type="button"
                       @click="handleMessageAction(message.metadata.action)"
                     >
@@ -1287,8 +1419,9 @@ onBeforeUnmount(() => {
                           <p>{{ trace.summary }}</p>
                           <small v-if="trace.reason">动作说明：{{ trace.reason }}</small>
                           <small v-if="trace.arguments">参数：{{ traceArgumentsLabel(trace.arguments) }}</small>
+                          <small v-if="trace.observation">观察：{{ trace.observation }}</small>
                           <small v-if="trace.new_frame_timestamps_ms?.length">新增画面：{{ trace.new_frame_timestamps_ms.length }} 帧</small>
-                          <small v-if="trace.action !== 'FINAL'">剩余预算：可细化 {{ trace.remaining_tool_calls }} 次，最多 {{ trace.remaining_frame_budget }} 帧</small>
+                          <small v-if="trace.action !== 'FINAL'">剩余预算：可调用视觉工具 {{ trace.remaining_tool_calls }} 次，最多 {{ trace.remaining_frame_budget }} 帧</small>
                         </div>
                       </li>
                     </ol>
@@ -1320,7 +1453,17 @@ onBeforeUnmount(() => {
                           <p>{{ trace.summary }}</p>
                           <small v-if="trace.reason">动作说明：{{ trace.reason }}</small>
                           <small v-if="trace.arguments">参数：{{ traceArgumentsLabel(trace.arguments) }}</small>
-                          <small v-if="trace.action !== 'FINAL'">剩余预算：可细化 {{ trace.remaining_tool_calls }} 次，最多 {{ trace.remaining_frame_budget }} 帧</small>
+                          <small v-if="trace.observation">观察：{{ trace.observation }}</small>
+                          <small v-if="trace.action !== 'FINAL'">剩余预算：可调用视觉工具 {{ trace.remaining_tool_calls }} 次，最多 {{ trace.remaining_frame_budget }} 帧</small>
+                          <button
+                            v-if="trace.action === 'REQUEST_RANGE_CONFIRMATION' && trace.status === 'running' && trace.confirmation_id"
+                            type="button"
+                            class="agent-trace__confirm"
+                            :disabled="rangeConfirmationBusy === trace.confirmation_id"
+                            @click="confirmVisionRange(trace)"
+                          >
+                            {{ rangeConfirmationBusy === trace.confirmation_id ? '正在继续…' : '同意修改时间区间并继续' }}
+                          </button>
                         </div>
                       </li>
                     </ol>
@@ -1337,15 +1480,29 @@ onBeforeUnmount(() => {
                 <span aria-hidden="true"></span>
                 <strong>画面理解</strong>
               </label>
-              <small v-if="!canUseVision">{{ visionAvailable ? '视频处理完成后可用' : '画面理解服务未启用' }}</small>
-              <template v-if="visionEnabled">
-                <div class="vision-range-inputs">
-                  <label>开始 <input v-model.trim="visionStart" inputmode="decimal" placeholder="01:20" :disabled="sending" /></label>
-                  <span>至</span>
-                  <label>结束 <input v-model.trim="visionEnd" inputmode="decimal" placeholder="01:30" :disabled="sending" /></label>
-                </div>
-                <p><Info :size="12" /> 画面理解已开启。请输入不超过 30 秒的时间区间，例如 01:20 到 01:30。系统首先每 5 秒查看一帧，并可能在该区间内继续细看。</p>
-              </template>
+			  <small v-if="!canUseVision">{{ visionAvailable ? '视频处理完成后可用' : '画面理解服务未启用' }}</small>
+			  <template v-if="visionEnabled">
+				<div class="vision-range-inputs">
+					<div class="vision-time-editor" @focusout="handleVisionTimeFocusOut('start', $event)">
+					  <span>起点</span>
+					  <div class="vision-time-field">
+						<input :value="visionStartMinutes" inputmode="numeric" maxlength="4" aria-label="起点分钟" :disabled="sending" @focus="$event.target.select()" @input="updateVisionTimePart('start', 'minutes', $event)" @keydown.enter.prevent="$event.target.blur()" />
+						<b aria-hidden="true">:</b>
+						<input :value="visionStartSeconds" inputmode="numeric" maxlength="2" aria-label="起点秒数" :disabled="sending" @focus="$event.target.select()" @input="updateVisionTimePart('start', 'seconds', $event)" @keydown.enter.prevent="$event.target.blur()" />
+					  </div>
+					</div>
+					<span>至</span>
+					<div class="vision-time-editor" @focusout="handleVisionTimeFocusOut('end', $event)">
+					  <span>终点</span>
+					  <div class="vision-time-field">
+						<input :value="visionEndMinutes" inputmode="numeric" maxlength="4" aria-label="终点分钟" :disabled="sending" @focus="$event.target.select()" @input="updateVisionTimePart('end', 'minutes', $event)" @keydown.enter.prevent="$event.target.blur()" />
+						<b aria-hidden="true">:</b>
+						<input :value="visionEndSeconds" inputmode="numeric" maxlength="2" aria-label="终点秒数" :disabled="sending" @focus="$event.target.select()" @input="updateVisionTimePart('end', 'seconds', $event)" @keydown.enter.prevent="$event.target.blur()" />
+					  </div>
+					</div>
+				</div>
+				<p><Info :size="12" /> 可选择同一时间理解单帧静止画面，或选择大于 1.5 秒且不超过 30 秒的连续画面。分钟填 1、秒填 2 时会自动整理为 01:02。</p>
+			  </template>
             </div>
             <div class="composer" :class="{ 'composer--active': draft }">
               <textarea
