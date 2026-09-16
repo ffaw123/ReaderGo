@@ -168,7 +168,8 @@ type FinalDecision struct {
 }
 
 type ObserverInput struct {
-	Question string `json:"question"`
+	Question   string `json:"question"`
+	IntervalMS int64  `json:"interval_ms"`
 }
 
 type Observation struct {
