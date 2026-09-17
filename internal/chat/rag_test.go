@@ -1,10 +1,14 @@
 package chat
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"readergo/internal/model"
 )
@@ -128,6 +132,64 @@ func TestDecodeRAGAnswerValidatesCandidateIDs(t *testing.T) {
 	}
 	if _, err := decodeRAGAnswer(`{"answer":"这是一个没有证据的结论。","used_segment_ids":[]}`, windows); err == nil {
 		t.Fatal("expected an unsupported answer without citations to be rejected")
+	}
+}
+
+func TestOverviewRAGCombinesSummaryAndFallsBackWithoutWindows(t *testing.T) {
+	requests := make(chan []map[string]any, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		requests <- request.Messages
+		answer := `{"answer":"摘要介绍了主题，片段说明了细节。","used_segment_ids":["segment-1"]}`
+		if len(request.Messages) > 0 && request.Messages[0]["content"] == summaryAnswerSystemPrompt {
+			answer = "摘要介绍了主题。"
+		}
+		encoded, _ := json.Marshal(answer)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%s}}]}\n\ndata: [DONE]\n\n", encoded)
+	}))
+	defer server.Close()
+	client, err := newStreamingTextClient("CHAT", server.URL+"/v1", "key", "model", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{answerClient: client}
+	summary := &Capabilities{VideoTitle: "标题", Summary: SummaryContext{Overview: "总体摘要", ChapterTitles: []string{"章节"}}}
+	decision := IntentDecision{Intent: IntentVideoOverview, Confidence: 0.8, RewrittenQuery: "完整问题"}
+	windows := []ragWindow{{SegmentID: "segment-1", Evidence: []ragEvidence{{SourceType: "asr", Text: "片段原文"}}}}
+
+	reply, err := service.answerRAGWindows(context.Background(), nil, "问题", decision, summary, windows, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := <-requests
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(messages[1]["content"].(string)), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if messages[0]["content"] != hybridAnswerSystemPrompt || payload["rewritten_query"] != "完整问题" || !strings.Contains(messages[1]["content"].(string), "总体摘要") || !strings.Contains(messages[1]["content"].(string), "片段原文") {
+		t.Fatalf("unexpected hybrid input: %#v", messages)
+	}
+	if reply.Route.Intent != IntentVideoOverview || reply.Route.Mode != ModeRAG || len(reply.Citations) != 1 {
+		t.Fatalf("unexpected hybrid reply: %#v", reply)
+	}
+
+	reply, err = service.answerRAGWindows(context.Background(), nil, "问题", decision, summary, nil, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages = <-requests
+	if messages[0]["content"] != summaryAnswerSystemPrompt || reply.Route.Mode != ModeSummary || !strings.Contains(reply.Route.Notice, "仅基于视频摘要") {
+		t.Fatalf("unexpected summary fallback: %#v, %#v", messages, reply)
+	}
+	if _, err := decodeRAGAnswerWithSummary(`{"answer":"视频摘要介绍了主题。","used_segment_ids":[]}`, windows, true); err != nil {
+		t.Fatalf("summary-only answer should be allowed in hybrid mode: %v", err)
 	}
 }
 

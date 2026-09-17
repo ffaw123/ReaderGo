@@ -46,3 +46,36 @@ func TestDecodeIntentDecisionRejectsUnknownFields(t *testing.T) {
 		t.Fatal("expected unknown field to be rejected")
 	}
 }
+
+func TestOverviewRoutingThresholds(t *testing.T) {
+	tests := []struct {
+		name       string
+		confidence float64
+		query      string
+		ragReady   bool
+		intent     string
+		useRAG     bool
+	}{
+		{"below clarification threshold", 0.749, "问题", true, IntentAmbiguous, false},
+		{"lower bound", 0.75, "问题", true, IntentVideoOverview, true},
+		{"below upper bound", 0.849, "问题", true, IntentVideoOverview, true},
+		{"upper bound", 0.85, "问题", true, IntentVideoOverview, false},
+		{"retrieval unavailable", 0.8, "问题", false, IntentVideoOverview, false},
+		{"missing rewritten query", 0.8, "", true, IntentAmbiguous, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decision := normalizeIntentDecision(IntentDecision{Intent: IntentVideoOverview, Confidence: test.confidence, RewrittenQuery: test.query, AmbiguityReason: AmbiguityNone}, 0.75)
+			capabilities := Capabilities{}
+			if test.ragReady {
+				capabilities.RAGState = CapabilityStateReady
+			}
+			if decision.Intent != test.intent || useOverviewRAG(decision, capabilities) != test.useRAG {
+				t.Fatalf("decision = %#v, useRAG = %v", decision, useOverviewRAG(decision, capabilities))
+			}
+			if test.useRAG && decision.RewrittenQuery != test.query {
+				t.Fatalf("rewritten query = %q", decision.RewrittenQuery)
+			}
+		})
+	}
+}

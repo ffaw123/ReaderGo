@@ -22,7 +22,7 @@ ReaderGo 是一个面向长视频内容的 AI 理解与问答系统。用户上�
 4. **多模态视频理解**：结合 ASR 语音转写与 OCR 画面文字识别，按时间轴融合生成分段内容和章节摘要。
 5. **智能意图识别**：自动判断用户问题类型，并选择快捷回复、通用问答或视频内容检索等合适的回答路径。
 6. **多路 RAG 检索**：融合向量检索和 BM25，提升视频问答的相关性与可追溯性。
-7. **按需画面理解**：通过 Agent Loop 调用视觉模型检查指定时间区间，细致理解动作与画面变化。
+7. **按需画面理解**：通过 Agent Loop 调用视觉模型检查指定时间区间，细致理解动作与画面内容。
 
 ## RAG 检索测评
 
@@ -36,34 +36,32 @@ ReaderGo 是一个面向长视频内容的 AI 理解与问答系统。用户上�
 
 ```text
 ReaderGo/
+├── batch/                       ← Windows 启停与离线评测脚本
 ├── cmd/                         ← 可独立运行的服务入口
-│   ├── api/main.go             ← 启动 HTTP API、鉴权、上传和视频问答服务
-│   ├── outbox/main.go          ← 启动 Outbox 分发器，将数据库消息可靠发布到 RabbitMQ
-│   └── worker/main.go          ← 启动任务消费者，执行视频异步处理流程
+│   ├── api/                     ← HTTP API 和视频问答服务
+│   ├── outbox/                  ← Outbox 消息分发服务
+│   └── worker/                  ← 视频处理任务消费者
+├── docker/                      ← 容器辅助配置
 ├── docs/                        ← 项目说明与离线评测资料
-│   └── evaldata/                ← RAG 调参/正式问题集、数据库快照和完整评测结果
-└── internal/                    ← 后端内部业务实现
-    ├── api/                     ← HTTP 路由与请求处理
-    │   └── server.go           ← 提供用户、视频、分片上传、摘要和对话接口
-    ├── auth/                    ← 用户认证与接口鉴权
-    │   └── auth.go             ← 处理密码哈希、JWT 签发和鉴权中间件
-    ├── chat/                    ← 意图识别、多路检索、回答生成和证据引用
-    ├── config/                  ← 项目配置管理
-    │   └── config.go           ← 加载并校验环境变量
-    ├── db/                      ← 数据库访问基础设施
-    │   └── db.go               ← 创建并维护 PostgreSQL/GORM 连接
-    ├── media/                   ← 视频与音频处理工具
-    │   └── ffmpeg.go           ← 封装媒体探测、音频切片和视频抽帧操作
-    ├── model/                   ← 数据库实体与业务状态定义
-    │   ├── json.go             ← 提供 JSON 字段的数据库读写支持
-    │   └── models.go           ← 定义用户、视频、任务、分段和摘要等模型
-    ├── outbox/                  ← 事务消息的写入与可靠分发
-    │   ├── dispatcher.go       ← 轮询并发布待发送的 Outbox 消息
-    │   └── writer.go           ← 在业务事务中写入任务和死信消息
-    ├── queue/                   ← RabbitMQ 消息契约、队列拓扑、发布与消费
-    ├── storage/                 ← 对象存储访问封装
-    │   └── multipart.go        ← 管理 MinIO 分片查询、签名地址、恢复和分片合并
-    └── worker/                  ← ASR、OCR、RAG、Embedding、摘要及任务编排
+│   └── evaldata/                ← RAG 评测数据、数据库快照和评测结果
+├── internal/                    ← 后端内部业务实现
+│   ├── api/                     ← HTTP 路由与请求处理
+│   ├── auth/                    ← 用户认证与接口鉴权
+│   ├── cache/                   ← Redis 连接与通用缓存操作
+│   ├── chat/                    ← 意图识别、检索、回答生成和证据引用
+│   ├── config/                  ← 环境变量加载与配置校验
+│   ├── db/                      ← PostgreSQL 数据库连接
+│   ├── media/                   ← 音视频探测、切片与抽帧
+│   ├── model/                   ← 数据库实体与业务状态定义
+│   ├── outbox/                  ← 事务消息写入与可靠分发
+│   ├── queue/                   ← RabbitMQ 消息契约、队列与消费
+│   ├── storage/                 ← MinIO 对象存储与分片上传
+│   ├── uploaddedupe/            ← 文件上传去重与缓存
+│   ├── uploadratelimit/         ← 上传任务限流
+│   ├── visionagent/             ← 按需画面理解的 Agent 与视觉模型调用
+│   └── worker/                  ← ASR、OCR、RAG、摘要及任务编排
+├── migrations/                  ← PostgreSQL 数据库初始化与表结构脚本
+└── web/                         ← Vue3 前端应用
 ```
 
 ## 项目流程

@@ -252,6 +252,10 @@ func (s *Service) generateChatReply(ctx context.Context, in ReplyInput, onDelta 
 			Latency:             map[string]time.Duration{"intent": intentLatency, "generation": time.Since(started)},
 		}, nil
 	case IntentVideoOverview:
+		if useOverviewRAG(decision, capabilities) {
+			reply, err := s.answerOverviewWithRAG(ctx, in, history, capabilities, decision, intentLatency, onDelta)
+			return reply, err
+		}
 		if !capabilities.SummaryReady() {
 			reply := capabilityReply(decision, capabilities, intentLatency)
 			return reply, emitReplyContent(reply, onDelta)
@@ -261,9 +265,13 @@ func (s *Service) generateChatReply(ctx context.Context, in ReplyInput, onDelta 
 		if err != nil {
 			return generatedReply{}, err
 		}
+		notice := "此回答基于视频摘要。"
+		if decision.Confidence < overviewRAGThreshold {
+			notice = "详细检索暂不可用，此回答仅基于视频摘要。"
+		}
 		return generatedReply{
 			Content:  answer,
-			Route:    RouteInfo{Mode: ModeSummary, Intent: decision.Intent, Notice: "此回答基于视频摘要。", Action: &RouteAction{Type: "OPEN_SUMMARY", Label: "查看摘要"}},
+			Route:    RouteInfo{Mode: ModeSummary, Intent: decision.Intent, Notice: notice, Action: &RouteAction{Type: "OPEN_SUMMARY", Label: "查看摘要"}},
 			Decision: decision, Capabilities: capabilities.View(), IntentPromptVersion: intentPromptVersion,
 			AnswerPromptVersion: summaryAnswerPromptVersion,
 			Latency:             map[string]time.Duration{"intent": intentLatency, "generation": time.Since(started)},
@@ -273,7 +281,7 @@ func (s *Service) generateChatReply(ctx context.Context, in ReplyInput, onDelta 
 			reply := capabilityReply(decision, capabilities, intentLatency)
 			return reply, emitReplyContent(reply, onDelta)
 		}
-		reply, err := s.answerRAG(ctx, in.TenantID, in.Conversation.VideoID, history, in.Content, decision, onDelta)
+		reply, err := s.answerRAG(ctx, in.TenantID, in.Conversation.VideoID, history, in.Content, decision, nil, onDelta)
 		if err != nil {
 			return generatedReply{}, err
 		}
@@ -285,6 +293,30 @@ func (s *Service) generateChatReply(ctx context.Context, in ReplyInput, onDelta 
 		reply := ambiguousReply(IntentDecision{Intent: IntentAmbiguous, AmbiguityReason: AmbiguityClassifierError})
 		return reply, emitReplyContent(reply, onDelta)
 	}
+}
+
+// 检索可用时，低置信度概览优先补充片段证据。
+func useOverviewRAG(decision IntentDecision, capabilities Capabilities) bool {
+	return decision.Intent == IntentVideoOverview && decision.Confidence < overviewRAGThreshold && capabilities.RAGReady()
+}
+
+// 对低置信度概览使用检索及可用的摘要，保留分类结果以便区分实际回答路径。
+func (s *Service) answerOverviewWithRAG(ctx context.Context, in ReplyInput, history []HistoryTurn, capabilities Capabilities, decision IntentDecision, intentLatency time.Duration, onDelta func(string) error) (generatedReply, error) {
+	var summary *Capabilities
+	if capabilities.SummaryReady() {
+		summary = &capabilities
+	}
+	reply, err := s.answerRAG(ctx, in.TenantID, in.Conversation.VideoID, history, in.Content, decision, summary, onDelta)
+	if err != nil {
+		return generatedReply{}, err
+	}
+	if summary == nil {
+		reply.Route.Notice = "视频摘要暂不可用，此回答仅基于视频片段检索结果。"
+	}
+	reply.Capabilities = capabilities.View()
+	reply.IntentPromptVersion = intentPromptVersion
+	reply.Latency["intent"] = intentLatency
+	return reply, nil
 }
 
 func (s *Service) generateAgentReply(ctx context.Context, in ReplyInput, onDelta func(string) error) (generatedReply, error) {
@@ -360,6 +392,10 @@ func (s *Service) generateAgentReply(ctx context.Context, in ReplyInput, onDelta
 			AnswerPromptVersion: promptVersion, Latency: map[string]time.Duration{"intent": intentLatency, "generation": time.Since(started)},
 		}), nil
 	case IntentVideoOverview:
+		if useOverviewRAG(decision, capabilities) {
+			reply, err := s.answerOverviewWithRAG(ctx, in, history, capabilities, decision, intentLatency, onDelta)
+			return decorate(reply), err
+		}
 		if !capabilities.SummaryReady() {
 			reply := decorate(capabilityReply(decision, capabilities, intentLatency))
 			return reply, emitReplyContent(reply, onDelta)
@@ -369,9 +405,13 @@ func (s *Service) generateAgentReply(ctx context.Context, in ReplyInput, onDelta
 		if err != nil {
 			return generatedReply{}, err
 		}
+		notice := "此回答基于视频摘要，未调用画面理解。概览类问题无需指定时间区间，可以关闭“画面理解”开关。"
+		if decision.Confidence < overviewRAGThreshold {
+			notice = "详细检索暂不可用，此回答仅基于视频摘要，未调用画面理解。"
+		}
 		return decorate(generatedReply{
 			Content:  answer,
-			Route:    RouteInfo{Mode: ModeSummary, Intent: decision.Intent, Notice: "此回答基于视频摘要，未调用画面理解。概览类问题无需指定时间区间，可以关闭“画面理解”开关。", Action: &RouteAction{Type: "OPEN_SUMMARY", Label: "查看摘要"}},
+			Route:    RouteInfo{Mode: ModeSummary, Intent: decision.Intent, Notice: notice, Action: &RouteAction{Type: "OPEN_SUMMARY", Label: "查看摘要"}},
 			Decision: decision, Capabilities: capabilities.View(), IntentPromptVersion: agentIntentPromptVersion,
 			AnswerPromptVersion: summaryAnswerPromptVersion, Latency: map[string]time.Duration{"intent": intentLatency, "generation": time.Since(started)},
 		}), nil

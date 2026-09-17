@@ -9,8 +9,8 @@ CREATE TABLE vision_observations (
   end_ms bigint NOT NULL,
   status text NOT NULL CHECK (status IN ('grounded', 'no_evidence')),
   observation_text text NOT NULL DEFAULT '',
-  sampled_frame_timestamps jsonb NOT NULL DEFAULT '[]'::jsonb,
-  used_frame_timestamps jsonb NOT NULL DEFAULT '[]'::jsonb,
+  sampled_frame_timestamps jsonb NOT NULL DEFAULT '[]'::jsonb, -- 整轮 agent loop 成功被抽取输入给视觉模型的帧
+  used_frame_timestamps jsonb NOT NULL DEFAULT '[]'::jsonb, -- 整轮 agent loop 成功被视觉模型观察的帧，失败时不会加入
   tool_calls integer NOT NULL DEFAULT 0,
   observer_model text NOT NULL,
   observer_prompt_version text NOT NULL,
