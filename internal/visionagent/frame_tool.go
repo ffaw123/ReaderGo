@@ -90,7 +90,7 @@ func (s *session) sample(input InspectVideoRangeInput) ([]Frame, error) {
 		if err := s.ffmpeg.ExtractFrameAt(s.ctx, s.videoPath, path, time.Duration(timestamp)*time.Millisecond); err != nil {
 			return nil, err
 		}
-		s.frames[timestamp] = Frame{TimestampMS: timestamp, DisplayTime: formatTimestamp(timestamp), Path: path}
+		s.frames[timestamp] = Frame{TimestampMS: timestamp, Path: path}
 	}
 	frames := make([]Frame, len(timestamps))
 	for index, timestamp := range timestamps {

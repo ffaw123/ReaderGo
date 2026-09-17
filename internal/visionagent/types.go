@@ -19,20 +19,18 @@ const (
 	TraceVisionResult  = "VISION_RESULT"
 	TraceFinal         = "FINAL"
 
-	InitialIntervalMS    int64 = 5_000
 	MinIntervalMS        int64 = 500
 	MaxIntervalMS        int64 = 10_000
 	MaxRangeMS           int64 = 30_000
 	MaxToolCalls               = 3
 	MaxUniqueFrames            = 18
 	MinObservationFrames       = 4
-	MaxMemoryTurns             = 4
-	MaxMemoryRunes             = 6_000
+	MaxDialogueTurns           = 3
 	MaxObservationRunes        = 4_000
 	MaxToolReasonRunes         = 200
 	MaxFinalAnswerRunes        = 4_000
 
-	OrchestratorPromptVersion = "vision-orchestrator-v3"
+	OrchestratorPromptVersion = "vision-orchestrator-v9"
 	ObserverPromptVersion     = "vision-observer-v3"
 )
 
@@ -50,7 +48,6 @@ type Request struct {
 	TenantID            string
 	VideoID             string
 	ConversationID      string
-	UserMessageID       string
 	Question            string
 	RewrittenQuery      string
 	Range               Range
@@ -143,9 +140,7 @@ type OrchestratorInput struct {
 	AllowedRange        Range             `json:"allowed_range"`
 	ProtocolInstruction string            `json:"protocol_instruction,omitempty"`
 	ForceFinal          bool              `json:"-"`
-	RecentUserQuestions []string          `json:"recent_user_questions,omitempty"`
 	RetrievalWindows    []RetrievalWindow `json:"retrieval_windows"`
-	PriorVisualMemory   []Memory          `json:"prior_visual_memory,omitempty"`
 }
 
 // LoopMessage 仅表示同一 Agent Loop 内需要回传给主模型的标准 assistant/tool 消息。
@@ -163,10 +158,9 @@ type OrchestratorTurn struct {
 }
 
 type FinalDecision struct {
-	Action             string   `json:"action"`
-	EvidenceStatus     string   `json:"evidence_status"`
-	Answer             string   `json:"answer"`
-	UsedObservationIDs []string `json:"used_observation_ids"`
+	Action         string `json:"action"`
+	EvidenceStatus string `json:"evidence_status"`
+	Answer         string `json:"answer"`
 }
 
 type ObserverInput struct {
@@ -179,9 +173,9 @@ type Observation struct {
 }
 
 type ToolResult struct {
-	OK                       bool    `json:"ok"`
-	ObservationID            string  `json:"observation_id,omitempty"`
-	Range                    Range   `json:"range,omitempty"`
+	OK bool `json:"ok"`
+	// Range 使用指针，失败结果不会向主 Agent 暴露无意义的零值区间。
+	Range                    *Range  `json:"range,omitempty"`
 	IntervalMS               int64   `json:"interval_ms,omitempty"`
 	SampledFrameTimestampsMS []int64 `json:"sampled_frame_timestamps_ms,omitempty"`
 	Observation              string  `json:"observation,omitempty"`
@@ -193,16 +187,8 @@ type ToolResult struct {
 
 type Frame struct {
 	TimestampMS int64
-	DisplayTime string
-	Path        string
-}
-
-type Memory struct {
-	StartMS             int64   `json:"start_ms"`
-	EndMS               int64   `json:"end_ms"`
-	Status              string  `json:"status"`
-	Observation         string  `json:"observation"`
-	UsedFrameTimestamps []int64 `json:"used_frame_timestamps_ms"`
+	// Path 仅供后端读取帧文件，禁止进入任何模型输入或 JSON 记录。
+	Path string `json:"-"`
 }
 
 type RetrievalWindow struct {

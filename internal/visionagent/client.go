@@ -19,7 +19,7 @@ import (
 )
 
 type orchestratorClient interface {
-	Next(context.Context, OrchestratorInput, []LoopMessage) (OrchestratorTurn, error)
+	Next(context.Context, OrchestratorInput, []HistoryTurn, []LoopMessage) (OrchestratorTurn, error)
 	Model() string
 }
 
@@ -39,7 +39,7 @@ type qwenObserverClient struct{ openAICompatibleClient }
 var inspectVideoRangeTool = openai.ChatCompletionToolParam{
 	Function: shared.FunctionDefinitionParam{
 		Name:        ToolName,
-		Description: openai.String("检查视频半开区间 [start_ms, end_ms) 的实际画面，并返回受验证的结构化观察；本轮尚无视觉观察时必须先调用此工具，不能直接回答"),
+		Description: openai.String("检查视频半开区间 [start_ms, end_ms) 的实际画面，并返回受验证的结构化观察；需要画面证据或申请新的时间区间时使用"),
 		Parameters: shared.FunctionParameters{
 			"type": "object",
 			"properties": map[string]any{
@@ -118,21 +118,21 @@ func observerFPS(intervalMS int64) float64 {
 	return float64(1000) / float64(intervalMS)
 }
 
-func (c *mimoOrchestratorClient) Next(ctx context.Context, input OrchestratorInput, history []LoopMessage) (OrchestratorTurn, error) {
+func (c *mimoOrchestratorClient) Next(ctx context.Context, input OrchestratorInput, recentDialogue []HistoryTurn, loopMessages []LoopMessage) (OrchestratorTurn, error) {
 	payload, err := json.Marshal(input)
 	if err != nil {
 		return OrchestratorTurn{}, fmt.Errorf("encode orchestrator input: %w", err)
 	}
 	userContent := string(payload)
-	if len(history) == 0 {
-		// 中文注释：MiMo 仅支持 auto，首轮通过清晰的用户层协议要求提升原生 tool_call 的优先级。
-		userContent = "首轮必须调用 inspect_video_range，不要返回文字结论。上下文：\n" + userContent
-	}
 	messages := []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage(orchestratorSystemPrompt),
-		openai.UserMessage(userContent),
 	}
-	for _, message := range history {
+	// 中文注释：跨请求完整对话必须位于当前请求之前，并与本轮工具消息保持独立。
+	for _, turn := range recentDialogue {
+		messages = append(messages, openai.UserMessage(turn.User), openai.AssistantMessage(turn.Assistant))
+	}
+	messages = append(messages, openai.UserMessage(userContent))
+	for _, message := range loopMessages {
 		switch message.Role {
 		case "assistant":
 			if message.Tool == nil {
@@ -162,7 +162,7 @@ func (c *mimoOrchestratorClient) Next(ctx context.Context, input OrchestratorInp
 	if !input.ForceFinal {
 		params.Tools = []openai.ChatCompletionToolParam{inspectVideoRangeTool}
 		params.ParallelToolCalls = openai.Bool(false)
-		// MiMo 当前只支持 auto；其他 tool_choice 会被服务端移除，不能作为首轮强制机制。
+		// MiMo 当前只支持 auto，由主 Agent 根据问题和证据状态自行决定是否调用工具。
 		params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{OfAuto: openai.String("auto")}
 	}
 	started := time.Now()
@@ -204,13 +204,12 @@ func (c *mimoOrchestratorClient) Next(ctx context.Context, input OrchestratorInp
 	if content == "" {
 		return OrchestratorTurn{}, errors.New("vision orchestrator returned empty content")
 	}
-	decision, err := decodeFinalDecision(content, nil)
+	decision, err := decodeFinalDecision(content)
 	if err != nil {
 		code, _ := safeOrchestratorError(err)
 		log.Printf("vision orchestrator output rejected: model=%q code=%s error=%v", c.model, code, err)
 		return OrchestratorTurn{}, fmt.Errorf("decode orchestrator final output: %w", err)
 	}
-	// observation_id 的存在性必须由持有本轮工具结果的 Agent 校验。
 	return OrchestratorTurn{Content: content, Final: &decision}, nil
 }
 

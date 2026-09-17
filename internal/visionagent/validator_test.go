@@ -74,28 +74,21 @@ func TestDecodeObservationAcceptsPlainText(t *testing.T) {
 	}
 }
 
-func TestDecodeFinalDecisionRejectsForgedObservationID(t *testing.T) {
-	observations := map[string]ToolResult{
-		"obs-1": {OK: true, Observation: "人物出现"},
-	}
-	_, err := decodeFinalDecision(`{"action":"FINAL","evidence_status":"GROUNDED","answer":"回答","used_observation_ids":["obs-2"]}`, observations)
+func TestDecodeFinalDecisionRejectsModelSuppliedObservationIDs(t *testing.T) {
+	_, err := decodeFinalDecision(`{"action":"FINAL","evidence_status":"GROUNDED","answer":"回答","used_observation_ids":["obs-1"]}`)
 	if !errors.Is(err, ErrInvalidOutput) {
 		t.Fatalf("error = %v, want ErrInvalidOutput", err)
 	}
 }
 
-func TestDecodeFinalDecisionRejectsGroundedWithoutObservation(t *testing.T) {
-	_, err := decodeFinalDecision(`{"action":"FINAL","evidence_status":"GROUNDED","answer":"回答","used_observation_ids":[]}`, map[string]ToolResult{})
-	if !errors.Is(err, ErrInvalidOutput) {
-		t.Fatalf("error = %v, want ErrInvalidOutput", err)
-	}
-}
-
-func TestDecodeFinalDecisionRejectsEmptyObservation(t *testing.T) {
-	observations := map[string]ToolResult{"obs-1": {OK: true}}
-	_, err := decodeFinalDecision(`{"action":"FINAL","evidence_status":"GROUNDED","answer":"回答","used_observation_ids":["obs-1"]}`, observations)
-	if !errors.Is(err, ErrInvalidOutput) {
-		t.Fatalf("error = %v, want ErrInvalidOutput", err)
+func TestDecodeFinalDecisionAcceptsServerOwnedObservationTracking(t *testing.T) {
+	for _, content := range []string{
+		`{"action":"FINAL","evidence_status":"GROUNDED","answer":"回答"}`,
+		`{"action":"FINAL","evidence_status":"NO_EVIDENCE","answer":"没有足够证据"}`,
+	} {
+		if _, err := decodeFinalDecision(content); err != nil {
+			t.Fatalf("decodeFinalDecision(%s) error = %v", content, err)
+		}
 	}
 }
 

@@ -26,6 +26,12 @@ type beginMessageResult struct {
 	AssistantMessage *model.Message
 }
 
+type userMessageMetadata struct {
+	Vision               VisionRequest  `json:"vision"`
+	RequestedVision      *VisionRequest `json:"requested_vision,omitempty"`
+	VisionRangeInContent bool           `json:"vision_range_in_content,omitempty"`
+}
+
 func (r *repository) BeginUserMessage(ctx context.Context, in ReplyInput) (beginMessageResult, error) {
 	var result beginMessageResult
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -84,10 +90,16 @@ func (r *repository) BeginUserMessage(ctx context.Context, in ReplyInput) (begin
 		clientMessageID := in.ClientMessageID
 		metadata := model.NewJSONDocument(map[string]any{})
 		if in.Vision.Enabled {
-			metadata = model.NewJSONDocument(map[string]any{"vision": in.Vision})
+			// 同时保存初始请求快照；后续确认新区间时只更新 vision，不影响幂等校验。
+			requestedVision := cloneVisionRequest(in.Vision)
+			metadata = model.NewJSONDocument(userMessageMetadata{
+				Vision:               cloneVisionRequest(in.Vision),
+				RequestedVision:      &requestedVision,
+				VisionRangeInContent: true,
+			})
 		}
 		message := model.Message{
-			ID: uuid.NewString(), ConversationID: conversation.ID, Role: "user", Content: in.Content,
+			ID: uuid.NewString(), ConversationID: conversation.ID, Role: "user", Content: persistedUserContent(in),
 			Citations: model.NewJSONDocument([]Citation{}), Metadata: metadata,
 			ClientMessageID: &clientMessageID, GenerationStatus: "generating", GenerationStartedAt: time.Now().UTC(), CreatedAt: time.Now().UTC(),
 		}
@@ -101,25 +113,94 @@ func (r *repository) BeginUserMessage(ctx context.Context, in ReplyInput) (begin
 }
 
 func sameReplyRequest(existing model.Message, in ReplyInput) bool {
-	if existing.Content != in.Content {
-		return false
-	}
-	var metadata struct {
-		Vision VisionRequest `json:"vision"`
-	}
+	var metadata userMessageMetadata
 	if len(existing.Metadata) > 0 {
 		_ = json.Unmarshal(existing.Metadata, &metadata)
 	}
-	if metadata.Vision.Enabled != in.Vision.Enabled {
+	content, ok := originalUserContent(existing.Content, metadata)
+	if !ok || content != in.Content {
+		return false
+	}
+	requestSnapshot := metadata.Vision
+	if metadata.RequestedVision != nil {
+		requestSnapshot = *metadata.RequestedVision
+	}
+	if requestSnapshot.Enabled != in.Vision.Enabled {
 		return false
 	}
 	if !in.Vision.Enabled {
 		return true
 	}
-	if metadata.Vision.Range == nil || in.Vision.Range == nil {
-		return metadata.Vision.Range == nil && in.Vision.Range == nil
+	if requestSnapshot.Range == nil || in.Vision.Range == nil {
+		return requestSnapshot.Range == nil && in.Vision.Range == nil
 	}
-	return *metadata.Vision.Range == *in.Vision.Range
+	return *requestSnapshot.Range == *in.Vision.Range
+}
+
+func persistedUserContent(in ReplyInput) string {
+	if !in.Vision.Enabled || in.Vision.Range == nil {
+		return in.Content
+	}
+	return in.Content + visionRangeContentSuffix(in.Vision.Range)
+}
+
+func visionRangeContentSuffix(visionRange *VisionRange) string {
+	if visionRange == nil {
+		return ""
+	}
+	return fmt.Sprintf(
+		"\n\n[画面理解时间范围：%s-%s]",
+		formatCitationTimestamp(visionRange.StartMS),
+		formatCitationTimestamp(visionRange.EndMS),
+	)
+}
+
+func originalUserContent(content string, metadata userMessageMetadata) (string, bool) {
+	if !metadata.VisionRangeInContent {
+		return content, true
+	}
+	suffix := visionRangeContentSuffix(metadata.Vision.Range)
+	if suffix == "" || !strings.HasSuffix(content, suffix) {
+		return "", false
+	}
+	return strings.TrimSuffix(content, suffix), true
+}
+
+func cloneVisionRequest(request VisionRequest) VisionRequest {
+	cloned := request
+	if request.Range != nil {
+		visionRange := *request.Range
+		cloned.Range = &visionRange
+	}
+	return cloned
+}
+
+func userMessageWithEffectiveVisionRange(user model.Message, effectiveRange *VisionRange) (model.Message, error) {
+	if effectiveRange == nil {
+		return user, nil
+	}
+	var metadata userMessageMetadata
+	if err := json.Unmarshal(user.Metadata, &metadata); err != nil {
+		return model.Message{}, fmt.Errorf("decode user message metadata: %w", err)
+	}
+	if !metadata.Vision.Enabled {
+		return user, nil
+	}
+	content, ok := originalUserContent(user.Content, metadata)
+	if !ok {
+		return model.Message{}, errors.New("user message vision range suffix is invalid")
+	}
+	if metadata.RequestedVision == nil {
+		// 兼容旧记录：首次回写最终范围前，先固化原始请求范围。
+		requestedVision := cloneVisionRequest(metadata.Vision)
+		metadata.RequestedVision = &requestedVision
+	}
+	finalRange := *effectiveRange
+	metadata.Vision.Range = &finalRange
+	metadata.VisionRangeInContent = true
+	user.Content = content + visionRangeContentSuffix(&finalRange)
+	user.Metadata = model.NewJSONDocument(metadata)
+	return user, nil
 }
 
 func (r *repository) MarkUserMessageFailed(ctx context.Context, messageID string) {
@@ -128,7 +209,11 @@ func (r *repository) MarkUserMessageFailed(ctx context.Context, messageID string
 		Update("generation_status", "failed").Error
 }
 
-func (r *repository) CompleteReply(ctx context.Context, user model.Message, reply generatedReply) (model.Message, error) {
+func (r *repository) CompleteReply(ctx context.Context, user *model.Message, reply generatedReply) (model.Message, error) {
+	persistedUser, err := userMessageWithEffectiveVisionRange(*user, reply.VisionRange)
+	if err != nil {
+		return model.Message{}, err
+	}
 	metadata := MessageMetadata{
 		Mode: reply.Route.Mode, Intent: reply.Route.Intent, IntentConfidence: reply.Decision.Confidence,
 		AmbiguityReason: reply.Decision.AmbiguityReason, Notice: reply.Route.Notice, Action: reply.Route.Action,
@@ -151,7 +236,7 @@ func (r *repository) CompleteReply(ctx context.Context, user model.Message, repl
 		Citations: model.NewJSONDocument(reply.Citations), Metadata: model.NewJSONDocument(metadata),
 		ReplyToMessageID: &userID, GenerationStatus: "completed", GenerationStartedAt: time.Now().UTC(), CreatedAt: time.Now().UTC(),
 	}
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&assistant).Error; err != nil {
 			return err
 		}
@@ -165,9 +250,15 @@ func (r *repository) CompleteReply(ctx context.Context, user model.Message, repl
 				return fmt.Errorf("persist vision observation: %w", err)
 			}
 		}
+		updates := map[string]any{"generation_status": "completed"}
+		if reply.VisionRange != nil {
+			// 最终确认范围与回答、观察结果在同一事务中提交，避免历史消息保留旧范围。
+			updates["content"] = persistedUser.Content
+			updates["metadata"] = persistedUser.Metadata
+		}
 		result := tx.Model(&model.Message{}).
 			Where("id = ? AND generation_status = ?", user.ID, "generating").
-			Update("generation_status", "completed")
+			Updates(updates)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -177,6 +268,10 @@ func (r *repository) CompleteReply(ctx context.Context, user model.Message, repl
 		return tx.Model(&model.Conversation{}).Where("id = ?", user.ConversationID).
 			Update("updated_at", assistant.CreatedAt).Error
 	})
+	if err == nil {
+		persistedUser.GenerationStatus = "completed"
+		*user = persistedUser
+	}
 	return assistant, err
 }
 

@@ -2,13 +2,11 @@ package visionagent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"readergo/internal/model"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type repository struct {
@@ -19,7 +17,6 @@ type repository struct {
 type dataRepository interface {
 	loadVideo(context.Context, string, string) (model.Video, error)
 	loadWindows(context.Context, string, string, Range) ([]RetrievalWindow, error)
-	loadMemories(context.Context, Request) ([]Memory, error)
 }
 
 func (r *repository) loadVideo(ctx context.Context, tenantID, videoID string) (model.Video, error) {
@@ -48,27 +45,4 @@ func (r *repository) loadWindows(ctx context.Context, tenantID, videoID string, 
 		windows[index] = RetrievalWindow{SegmentID: segment.ID, StartMS: segment.StartMS, EndMS: segment.EndMS, RetrievalText: segment.RetrievalText}
 	}
 	return windows, nil
-}
-
-func (r *repository) loadMemories(ctx context.Context, request Request) ([]Memory, error) {
-	var rows []model.VisionObservation
-	if err := r.db.WithContext(ctx).
-		Where("tenant_id = ? AND video_id = ? AND conversation_id = ?", request.TenantID, request.VideoID, request.ConversationID).
-		Order(clause.Expr{SQL: "CASE WHEN start_ms < ? AND end_ms > ? THEN 0 ELSE 1 END", Vars: []any{request.Range.EndMS, request.Range.StartMS}}).
-		Order("created_at DESC").
-		Limit(MaxMemoryTurns * 2).Find(&rows).Error; err != nil {
-		return nil, fmt.Errorf("load vision memories: %w", err)
-	}
-	memories := make([]Memory, 0, len(rows))
-	for _, row := range rows {
-		var timestamps []int64
-		if err := json.Unmarshal(row.UsedFrameTimestamps, &timestamps); err != nil {
-			return nil, fmt.Errorf("decode vision memory timestamps: %w", err)
-		}
-		memories = append(memories, Memory{
-			StartMS: row.StartMS, EndMS: row.EndMS, Status: row.Status,
-			Observation: row.ObservationText, UsedFrameTimestamps: timestamps,
-		})
-	}
-	return trimMemories(memories), nil
 }

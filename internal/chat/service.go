@@ -159,7 +159,7 @@ func (s *Service) reply(ctx context.Context, in ReplyInput, onDelta func(string)
 	}
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	assistant, err := s.repository.CompleteReply(persistCtx, begin.UserMessage, reply)
+	assistant, err := s.repository.CompleteReply(persistCtx, &begin.UserMessage, reply)
 	if err != nil {
 		return result, fmt.Errorf("persist assistant reply: %w", err)
 	}

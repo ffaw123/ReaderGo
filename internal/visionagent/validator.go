@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -49,7 +48,7 @@ func frameTimestamps(value InspectVideoRangeInput) ([]int64, error) {
 		return nil, fmt.Errorf("interval_ms must be at least %d: %w", MinIntervalMS, ErrRangeInvalid)
 	}
 	durationMS := value.EndMS - value.StartMS
-	// 中文注释：将模型给出的间隔夹在可生成 4～18 帧的范围内，同时保证发送给视觉模型的 fps 不低于 0.1。
+	// 将模型给出的间隔夹在可生成 4～18 帧的范围内，同时保证发送给视觉模型的 fps 不低于 0.1。
 	minIntervalMS := max(MinIntervalMS, (durationMS+int64(MaxUniqueFrames)-1)/int64(MaxUniqueFrames))
 	maxIntervalMS := min(MaxIntervalMS, (durationMS-1)/int64(MinObservationFrames-1))
 	if minIntervalMS > maxIntervalMS {
@@ -78,7 +77,7 @@ func decodeToolArguments(content string) (InspectVideoRangeInput, error) {
 	return arguments, nil
 }
 
-func decodeFinalDecision(content string, observations map[string]ToolResult) (FinalDecision, error) {
+func decodeFinalDecision(content string) (FinalDecision, error) {
 	var decision FinalDecision
 	if err := decodeStrict(content, &decision, "orchestrator final output"); err != nil {
 		return decision, fmt.Errorf("%v: %w", err, ErrInvalidOutput)
@@ -89,26 +88,6 @@ func decodeFinalDecision(content string, observations map[string]ToolResult) (Fi
 	}
 	if decision.EvidenceStatus != "GROUNDED" && decision.EvidenceStatus != "NO_EVIDENCE" {
 		return decision, ErrInvalidOutput
-	}
-	slices.Sort(decision.UsedObservationIDs)
-	decision.UsedObservationIDs = slices.Compact(decision.UsedObservationIDs)
-	if decision.EvidenceStatus == "NO_EVIDENCE" {
-		if len(decision.UsedObservationIDs) != 0 {
-			return decision, ErrInvalidOutput
-		}
-		return decision, nil
-	}
-	if len(decision.UsedObservationIDs) == 0 {
-		return decision, ErrInvalidOutput
-	}
-	if observations == nil {
-		return decision, nil
-	}
-	for _, id := range decision.UsedObservationIDs {
-		observation, ok := observations[id]
-		if !ok || !observation.OK || strings.TrimSpace(observation.Observation) == "" {
-			return decision, fmt.Errorf("unknown or unusable observation_id %q: %w", id, ErrInvalidOutput)
-		}
 	}
 	return decision, nil
 }
@@ -123,8 +102,6 @@ func safeOrchestratorError(err error) (string, string) {
 	case strings.Contains(message, "invalid character") || strings.Contains(message, "cannot unmarshal") ||
 		strings.Contains(message, "unexpected eof") || strings.Contains(message, "trailing data"):
 		return "ORCHESTRATOR_INVALID_JSON", "主 Agent 最终 JSON 格式无效"
-	case strings.Contains(message, "observation_id"):
-		return "ORCHESTRATOR_INVALID_OBSERVATION_ID", "主 Agent 引用了无效的观察 ID"
 	case errors.Is(err, ErrInvalidOutput):
 		return "ORCHESTRATOR_INVALID_OUTPUT", "主 Agent 最终结果不符合证据约束"
 	default:

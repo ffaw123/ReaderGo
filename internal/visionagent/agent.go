@@ -99,10 +99,8 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	memories, err := a.repository.loadMemories(ctx, request)
-	if err != nil {
-		return Result{}, err
-	}
+	// 中文注释：画面 Agent 固定只接收最后三轮完整问答，不依赖上游历史配置或旧视觉记忆。
+	recentDialogue := lastDialogueTurns(request.History)
 	latency["context_load"] = time.Since(contextStarted)
 
 	if err := reportProgress(request.OnProgress, "agent_deciding", "正在判断需要检查哪些画面"); err != nil {
@@ -122,14 +120,14 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 
 	input := OrchestratorInput{
 		Question: request.Question, RewrittenQuery: request.RewrittenQuery, AllowedRange: request.Range,
-		RecentUserQuestions: recentUserQuestions(request.History), RetrievalWindows: windows, PriorVisualMemory: memories,
+		RetrievalWindows: windows,
 	}
 
 	for {
 		// 视觉预算耗尽后进入专用最终生成，不再向 MiMo 暴露工具。
 		input.ForceFinal = len(messages) > 0 && session.RemainingToolCalls() == 0
 		if input.ForceFinal {
-			input.ProtocolInstruction = "视觉工具预算已用尽。现在必须返回严格 FINAL JSON；只能引用已有且有效的 observation_id，并自行判断 GROUNDED 或 NO_EVIDENCE。"
+			input.ProtocolInstruction = "视觉工具预算已用尽。现在必须返回严格 FINAL JSON，并根据已有视觉观察自行判断 GROUNDED 或 NO_EVIDENCE。不要输出 observation_id 或帧时间戳。"
 		}
 		deciding := AgentTrace{
 			ID: fmt.Sprintf("decide-%d", len(messages)/2+1), Step: len(traces) + 1, Status: "running",
@@ -140,7 +138,7 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 			return Result{}, err
 		}
 		decisionStarted := time.Now()
-		turn, err := a.nextWithValidationRetry(ctx, input, messages, observations)
+		turn, err := a.nextWithValidationRetry(ctx, input, recentDialogue, messages, observations)
 		latency["agent_decision"] += time.Since(decisionStarted)
 		if err != nil {
 			return Result{}, err
@@ -157,10 +155,6 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 		traces = append(traces, deciding)
 
 		if turn.Final != nil {
-			// 中文注释：即使上游模型或兼容接口忽略 tool_choice，服务端也不接受零检查的最终结论。
-			if session.toolCalls == 0 {
-				return Result{}, fmt.Errorf("vision orchestrator finalized before the initial inspection: %w", ErrInvalidOutput)
-			}
 			return a.finish(request, session, windows, started, latency, traces, observations, *turn.Final)
 		}
 		if turn.Tool == nil {
@@ -169,7 +163,7 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 		// 中文注释：先保存主模型原始 tool_call，随后必须用同一个 ID 回传 role=tool 结果。
 		messages = append(messages, LoopMessage{Role: "assistant", Content: turn.Content, Tool: turn.Tool})
 		if session.RemainingToolCalls() == 0 {
-			return a.finishNoEvidence(request, session, windows, started, latency, traces)
+			return a.finishNoEvidence(request, session, windows, started, latency, traces, observations)
 		}
 
 		arguments := turn.Tool.Arguments
@@ -200,7 +194,6 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 				windows, toolErr = a.repository.loadWindows(ctx, request.TenantID, request.VideoID, confirmed)
 				if toolErr == nil {
 					input.RetrievalWindows = windows
-					input.PriorVisualMemory, toolErr = a.repository.loadMemories(ctx, request)
 				}
 				if toolErr == nil {
 					samplingStarted = time.Now()
@@ -228,11 +221,11 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 			}
 			traces = append(traces, trace)
 			if session.RemainingToolCalls() == 0 {
-				return a.finishNoEvidence(request, session, windows, started, latency, traces)
+				return a.finishNoEvidence(request, session, windows, started, latency, traces, observations)
 			}
 			continue
 		}
-		// 中文注释：采样器可能按区间长度收紧模型给出的间隔；后续 fps、工具结果和审计记录必须使用实际采样间隔。
+		// 采样器可能按区间长度收紧模型给出的间隔；后续 fps、工具结果和审计记录必须使用实际采样间隔。
 		arguments.IntervalMS = frames[1].TimestampMS - frames[0].TimestampMS
 
 		trace.Status, trace.Summary = "completed", fmt.Sprintf("已提取 %d 帧画面", len(frames))
@@ -256,7 +249,7 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 			return Result{}, err
 		}
 		observerStarted := time.Now()
-		observation, observeErr := a.observeWithValidationRetry(ctx, ObserverInput{Question: request.Question, IntervalMS: arguments.IntervalMS}, frames)
+		observation, observeErr := a.observeWithValidationRetry(ctx, ObserverInput{Question: request.RewrittenQuery, IntervalMS: arguments.IntervalMS}, frames)
 		latency["vision_observation"] += time.Since(observerStarted)
 		if observeErr != nil {
 			errorCode, errorMessage := safeObserverError(observeErr)
@@ -271,15 +264,16 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 			}
 			traces = append(traces, observing)
 			if session.RemainingToolCalls() == 0 {
-				return a.finishNoEvidence(request, session, windows, started, latency, traces)
+				return a.finishNoEvidence(request, session, windows, started, latency, traces, observations)
 			}
 			continue
 		}
 
+		// 观察 ID 由后端生成并保存，不放进主 Agent 可见的工具结果。
 		observationID := fmt.Sprintf("obs-%d", len(observations)+1)
 		result := ToolResult{
-			OK: true, ObservationID: observationID,
-			Range: Range{StartMS: arguments.StartMS, EndMS: arguments.EndMS}, IntervalMS: arguments.IntervalMS,
+			OK:    true,
+			Range: &Range{StartMS: arguments.StartMS, EndMS: arguments.EndMS}, IntervalMS: arguments.IntervalMS,
 			SampledFrameTimestampsMS: timestampsOf(frames), Observation: observation.Observation,
 			RemainingVisionCalls: session.RemainingToolCalls(), RemainingFrameBudget: session.RemainingFrames(),
 		}
@@ -294,17 +288,17 @@ func (a *Agent) Run(parent context.Context, request Request) (Result, error) {
 	}
 }
 
-func (a *Agent) nextWithValidationRetry(ctx context.Context, input OrchestratorInput, messages []LoopMessage, observations map[string]ToolResult) (OrchestratorTurn, error) {
+func (a *Agent) nextWithValidationRetry(ctx context.Context, input OrchestratorInput, recentDialogue []HistoryTurn, messages []LoopMessage, observations map[string]ToolResult) (OrchestratorTurn, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		turn, err := a.orchestrator.Next(ctx, input, messages)
-		if err == nil && len(messages) == 0 && turn.Final != nil {
-			err = fmt.Errorf("initial orchestrator response must call %s: %w", ToolName, ErrInvalidOutput)
-			// 中文注释：第二次请求显式反馈协议错误，避免温度为零时机械重复同一个 FINAL。
-			input.ProtocolInstruction = "上一响应违反协议：尚未检查任何画面。现在必须调用 inspect_video_range，禁止返回 FINAL 或 NO_EVIDENCE。"
-		}
+		turn, err := a.orchestrator.Next(ctx, input, recentDialogue, messages)
 		if err == nil && turn.Final != nil {
-			_, err = decodeFinalDecision(turn.Content, observations)
+			var decision FinalDecision
+			decision, err = decodeFinalDecision(turn.Content)
+			// 中文注释：证据状态仍由主 Agent 判断，但 GROUNDED 至少必须存在一条后端记录的成功视觉观察。
+			if err == nil && decision.EvidenceStatus == "GROUNDED" && !hasSuccessfulObservation(observations) {
+				err = fmt.Errorf("grounded final requires a successful visual observation: %w", ErrInvalidOutput)
+			}
 		}
 		if err == nil {
 			return turn, nil
@@ -317,7 +311,10 @@ func (a *Agent) nextWithValidationRetry(ctx context.Context, input OrchestratorI
 		log.Printf("vision orchestrator turn rejected: code=%s error=%v", code, err)
 		if len(messages) > 0 {
 			input.ForceFinal = true
-			input.ProtocolInstruction = "上一响应不符合最终输出协议。不要再调用工具；只返回严格 FINAL JSON，并且只能引用已有且有效的 observation_id。"
+			input.ProtocolInstruction = "上一响应不符合最终输出协议。不要再调用工具；只返回包含 action、evidence_status 和 answer 的严格 FINAL JSON。"
+		} else {
+			// 中文注释：首轮不强制调用工具，但无效响应必须显式纠正，避免零温度下重复同一错误输出。
+			input.ProtocolInstruction = "上一响应不符合协议。需要画面证据时调用 inspect_video_range；否则只返回严格 FINAL JSON。没有成功视觉观察时不得返回 GROUNDED。"
 		}
 	}
 	return OrchestratorTurn{}, fmt.Errorf("vision orchestrator output remains invalid: %w", lastErr)
@@ -373,22 +370,11 @@ func (a *Agent) confirmRange(ctx context.Context, request Request, trace AgentTr
 }
 
 func (a *Agent) finish(request Request, session *session, windows []RetrievalWindow, started time.Time, latency map[string]time.Duration, traces []AgentTrace, observations map[string]ToolResult, decision FinalDecision) (Result, error) {
-	decision, err := decodeFinalDecision(mustJSON(decision), observations)
+	decision, err := decodeFinalDecision(mustJSON(decision))
 	if err != nil {
 		return Result{}, err
 	}
-	usedFrames := make([]int64, 0)
-	observationTexts := make([]string, 0, len(decision.UsedObservationIDs))
-	for _, id := range decision.UsedObservationIDs {
-		value := observations[id]
-		// 中文注释：观察器不再自报“使用帧”；主 Agent 选中观察后，以该观察的全部采样帧作为可审计来源范围。
-		usedFrames = append(usedFrames, value.SampledFrameTimestampsMS...)
-		if value.Observation != "" {
-			observationTexts = append(observationTexts, value.Observation)
-		}
-	}
-	slices.Sort(usedFrames)
-	usedFrames = slices.Compact(usedFrames)
+	usedObservationIDs, observationTexts, usedFrames := collectObservationEvidence(observations)
 	status := StatusNoEvidence
 	if decision.EvidenceStatus == "GROUNDED" {
 		status = StatusGrounded
@@ -407,7 +393,7 @@ func (a *Agent) finish(request Request, session *session, windows []RetrievalWin
 	return Result{
 		Answer: decision.Answer, Status: status, Observation: strings.Join(observationTexts, "\n"),
 		SampledFrameTimestampsMS: timestampsOf(session.Frames()), UsedFrameTimestampsMS: usedFrames,
-		UsedObservationIDs: append([]string(nil), decision.UsedObservationIDs...), ToolCalls: session.toolCalls,
+		UsedObservationIDs: usedObservationIDs, ToolCalls: session.toolCalls,
 		OrchestratorModel: a.orchestrator.Model(), ObserverModel: a.observer.Model(),
 		OrchestratorPromptVersion: OrchestratorPromptVersion, ObserverPromptVersion: ObserverPromptVersion,
 		SegmentIDsByTimestamp: segmentIDsForTimestamps(windows, usedFrames),
@@ -415,12 +401,14 @@ func (a *Agent) finish(request Request, session *session, windows []RetrievalWin
 	}, nil
 }
 
-func (a *Agent) finishNoEvidence(request Request, session *session, windows []RetrievalWindow, started time.Time, latency map[string]time.Duration, traces []AgentTrace) (Result, error) {
+func (a *Agent) finishNoEvidence(request Request, session *session, windows []RetrievalWindow, started time.Time, latency map[string]time.Duration, traces []AgentTrace, observations map[string]ToolResult) (Result, error) {
 	latency["vision_total"] = time.Since(started)
+	usedObservationIDs, observationTexts, usedFrames := collectObservationEvidence(observations)
 	trace := AgentTrace{
 		ID: "final", Step: len(traces) + 1, Status: "completed", Action: TraceFinal,
 		Summary: "检查预算已用尽，未找到足够画面证据", EvidenceStatus: "NO_EVIDENCE",
-		RemainingToolCalls: session.RemainingToolCalls(), RemainingFrameBudget: session.RemainingFrames(),
+		UsedFrameTimestampsMS: append([]int64(nil), usedFrames...),
+		RemainingToolCalls:    session.RemainingToolCalls(), RemainingFrameBudget: session.RemainingFrames(),
 	}
 	if err := reportTrace(request.OnTrace, trace); err != nil {
 		return Result{}, err
@@ -428,11 +416,44 @@ func (a *Agent) finishNoEvidence(request Request, session *session, windows []Re
 	traces = append(traces, trace)
 	return Result{
 		Answer: "在允许的检查次数和帧预算内，没有观察到足以确认该问题的画面证据。",
-		Status: StatusNoEvidence, SampledFrameTimestampsMS: timestampsOf(session.Frames()),
-		ToolCalls: session.toolCalls, OrchestratorModel: a.orchestrator.Model(), ObserverModel: a.observer.Model(),
+		Status: StatusNoEvidence, Observation: strings.Join(observationTexts, "\n"),
+		SampledFrameTimestampsMS: timestampsOf(session.Frames()), UsedFrameTimestampsMS: usedFrames,
+		UsedObservationIDs: usedObservationIDs,
+		ToolCalls:          session.toolCalls, OrchestratorModel: a.orchestrator.Model(), ObserverModel: a.observer.Model(),
 		OrchestratorPromptVersion: OrchestratorPromptVersion, ObserverPromptVersion: ObserverPromptVersion,
-		SegmentIDsByTimestamp: segmentIDsForTimestamps(windows, nil), Latency: latency, Trace: traces, Range: session.allowed,
+		SegmentIDsByTimestamp: segmentIDsForTimestamps(windows, usedFrames), Latency: latency, Trace: traces, Range: session.allowed,
 	}, nil
+}
+
+func collectObservationEvidence(observations map[string]ToolResult) ([]string, []string, []int64) {
+	observationIDs := make([]string, 0, len(observations))
+	for id, value := range observations {
+		if value.OK && strings.TrimSpace(value.Observation) != "" {
+			observationIDs = append(observationIDs, id)
+		}
+	}
+	// 观察 ID 由后端按调用顺序生成，排序后再聚合可避免 map 迭代导致审计记录不稳定。
+	slices.Sort(observationIDs)
+	observationTexts := make([]string, 0, len(observationIDs))
+	usedFrames := make([]int64, 0)
+	for _, id := range observationIDs {
+		value := observations[id]
+		observationTexts = append(observationTexts, value.Observation)
+		// 帧来源以后端真实传给视觉模型的采样帧为准，不再接受主 Agent 自报。
+		usedFrames = append(usedFrames, value.SampledFrameTimestampsMS...)
+	}
+	slices.Sort(usedFrames)
+	usedFrames = slices.Compact(usedFrames)
+	return observationIDs, observationTexts, usedFrames
+}
+
+func hasSuccessfulObservation(observations map[string]ToolResult) bool {
+	for _, value := range observations {
+		if value.OK && strings.TrimSpace(value.Observation) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func toolResultMessage(callID string, result ToolResult) LoopMessage {
@@ -440,14 +461,9 @@ func toolResultMessage(callID string, result ToolResult) LoopMessage {
 	return LoopMessage{Role: "tool", ToolCallID: callID, Content: string(encoded)}
 }
 
-func recentUserQuestions(history []HistoryTurn) []string {
-	result := make([]string, 0, len(history))
-	for _, turn := range history {
-		if question := strings.TrimSpace(turn.User); question != "" {
-			result = append(result, question)
-		}
-	}
-	return result
+func lastDialogueTurns(history []HistoryTurn) []HistoryTurn {
+	start := max(0, len(history)-MaxDialogueTurns)
+	return append([]HistoryTurn(nil), history[start:]...)
 }
 
 func buildSuggestedRange(input InspectVideoRangeInput, durationMS int64) (Range, bool) {
@@ -472,6 +488,17 @@ func safeTraceReason(value string) string {
 		return "需要进一步检查关键画面"
 	}
 	return truncateRunes(value, MaxToolReasonRunes)
+}
+
+func truncateRunes(value string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maximum {
+		return value
+	}
+	return string(runes[:maximum])
 }
 
 func safeToolError(err error) (string, string, bool) {

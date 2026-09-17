@@ -32,7 +32,7 @@ func TestOrchestratorUsesNativeToolCallAndDisablesThinking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	turn, err := client.Next(context.Background(), OrchestratorInput{}, nil)
+	turn, err := client.Next(context.Background(), OrchestratorInput{}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +52,21 @@ func TestOrchestratorUsesNativeToolCallAndDisablesThinking(t *testing.T) {
 	if _, exists := request["response_format"]; exists {
 		t.Fatalf("orchestrator request must not combine JSON mode with native tool calls: %#v", request["response_format"])
 	}
+	messages, ok := request["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("messages = %#v, want system and current request", request["messages"])
+	}
+	currentContent, _ := messages[1].(map[string]any)["content"].(string)
+	if strings.Contains(currentContent, "首轮必须调用") {
+		t.Fatalf("current request still forces an initial tool call: %q", currentContent)
+	}
+	toolsJSON, err := json.Marshal(request["tools"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(toolsJSON), "必须先调用") {
+		t.Fatalf("tool description still forces an initial call: %s", toolsJSON)
+	}
 }
 
 func TestOrchestratorForceFinalUsesJSONModeWithoutTools(t *testing.T) {
@@ -61,7 +76,7 @@ func TestOrchestratorForceFinalUsesJSONModeWithoutTools(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"mimo-v2.5-pro","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"{\"action\":\"FINAL\",\"evidence_status\":\"NO_EVIDENCE\",\"answer\":\"没有足够证据。\",\"used_observation_ids\":[]}"}}]}`))
+		_, _ = writer.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"mimo-v2.5-pro","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"{\"action\":\"FINAL\",\"evidence_status\":\"NO_EVIDENCE\",\"answer\":\"没有足够证据。\"}"}}]}`))
 	}))
 	defer server.Close()
 
@@ -69,9 +84,13 @@ func TestOrchestratorForceFinalUsesJSONModeWithoutTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	turn, err := client.Next(context.Background(), OrchestratorInput{ForceFinal: true}, []LoopMessage{
+	dialogue := []HistoryTurn{
+		{User: "普通问题", Assistant: "普通回答"},
+		{User: "视频问题", Assistant: "摘要回答"},
+	}
+	turn, err := client.Next(context.Background(), OrchestratorInput{Question: "当前问题", ForceFinal: true}, dialogue, []LoopMessage{
 		{Role: "assistant", Tool: &ToolCall{ID: "call-1", Name: ToolName, Arguments: InspectVideoRangeInput{StartMS: 0, EndMS: 1_000, IntervalMS: 500}}},
-		{Role: "tool", ToolCallID: "call-1", Content: `{"ok":true,"observation_id":"obs-1","evidence_status":"NO_EVIDENCE"}`},
+		{Role: "tool", ToolCallID: "call-1", Content: `{"ok":true,"observation":"未观察到相关画面"}`},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,6 +105,45 @@ func TestOrchestratorForceFinalUsesJSONModeWithoutTools(t *testing.T) {
 	if !ok || responseFormat["type"] != "json_object" {
 		t.Fatalf("response_format = %#v, want json_object", request["response_format"])
 	}
+	messages, ok := request["messages"].([]any)
+	if !ok || len(messages) != 8 {
+		t.Fatalf("messages = %#v, want system + 2 dialogue turns + current request + loop pair", request["messages"])
+	}
+	wantRoles := []string{"system", "user", "assistant", "user", "assistant", "user", "assistant", "tool"}
+	for index, wantRole := range wantRoles {
+		message, ok := messages[index].(map[string]any)
+		if !ok || message["role"] != wantRole {
+			t.Fatalf("messages[%d] = %#v, want role %q", index, messages[index], wantRole)
+		}
+	}
+	if messages[1].(map[string]any)["content"] != "普通问题" || messages[2].(map[string]any)["content"] != "普通回答" {
+		t.Fatalf("complete dialogue was not placed before current input: %#v", messages)
+	}
+	currentContent, _ := messages[5].(map[string]any)["content"].(string)
+	if !strings.Contains(currentContent, `"question":"当前问题"`) {
+		t.Fatalf("current orchestrator input = %q", currentContent)
+	}
+}
+
+func TestOrchestratorInputOmitsLegacyMemoryFields(t *testing.T) {
+	payload, err := json.Marshal(OrchestratorInput{
+		Question: "当前问题", AllowedRange: Range{StartMS: 0, EndMS: 1_000}, ForceFinal: true,
+		RetrievalWindows: []RetrievalWindow{{SegmentID: "segment-1", StartMS: 0, EndMS: 1_000}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(payload)
+	for _, forbidden := range []string{"recent_user_questions", "prior_visual_memory", "ForceFinal", "force_final"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("orchestrator input leaked %q: %s", forbidden, text)
+		}
+	}
+	for _, required := range []string{`"question"`, `"allowed_range"`, `"retrieval_windows"`} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("orchestrator input misses %q: %s", required, text)
+		}
+	}
 }
 
 func observerFrameFiles(t *testing.T, contents ...string) []Frame {
@@ -98,7 +156,7 @@ func observerFrameFiles(t *testing.T, contents ...string) []Frame {
 			t.Fatal(err)
 		}
 		frames = append(frames, Frame{
-			TimestampMS: int64(1000 * (index + 1)), DisplayTime: fmt.Sprintf("00:00:%02d.000", index+1), Path: path,
+			TimestampMS: int64(1000 * (index + 1)), Path: path,
 		})
 	}
 	return frames
